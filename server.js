@@ -955,12 +955,48 @@ async function getExtensionsDir() {
 }
 
 async function installExtension() {
-  // V2: self-contained extension (no server needed)
+  // When installed from server.js --install, prefer the legacy extension
+  // (built from ytmLocalExtension) because it includes download support
+  // that requires the helper server.  The self-contained version (ytm-local.js)
+  // is installed instead when called manually (e.g. from the Spicetify
+  // Marketplace) so that users get the modern, zero-dependency mode.
+  const installLegacy = process.argv.includes("--install");
+
+  if (installLegacy) {
+    // Legacy extension (built from ytmLocalExtension function) — includes
+    // search AND download (via the helper server).
+    const dir = await getExtensionsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = path.join(dir, EXTENSION_FILE);
+    fs.writeFileSync(dest, buildExtensionSource(), "utf8");
+    console.log(`[extension] written (legacy): ${dest}`);
+
+    try {
+      const cfg = await runCommand("spicetify", ["config", "extensions", EXTENSION_FILE]);
+      if (cfg.code !== 0) throw new Error(cfg.err.trim() || cfg.out.trim());
+      console.log("[extension] registered in spicetify config");
+
+      const apply = await runCommand("spicetify", ["apply"]);
+      if (apply.code !== 0) {
+        throw new Error(
+          (apply.err.trim() || apply.out.trim()) +
+            '\nIf this is the first time, try "spicetify backup apply".'
+        );
+      }
+      console.log("[extension] spicetify apply finished");
+    } catch (e) {
+      console.warn(`[extension] could not finish automatically: ${e.message}`);
+      console.warn(`Run manually:\n  spicetify config extensions ${EXTENSION_FILE}\n  spicetify apply`);
+    }
+    return;
+  }
+
+  // Default (called directly or from Marketplace): install the self-contained
+  // V2 extension (no server, no yt-dlp, no ffmpeg).
   const selfContainedFile = "ytm-local.js";
   const selfContainedPath = __filename.replace(/server\.js$/, selfContainedFile);
 
   if (fs.existsSync(selfContainedPath)) {
-    // Install the self-contained version
     const dir = await getExtensionsDir();
     fs.mkdirSync(dir, { recursive: true });
     const dest = path.join(dir, selfContainedFile);
@@ -987,7 +1023,7 @@ async function installExtension() {
     return;
   }
 
-  // Fallback to legacy extension (built from ytmLocalExtension function)
+  // Fallback: install legacy extension anyway
   const dir = await getExtensionsDir();
   fs.mkdirSync(dir, { recursive: true });
   const dest = path.join(dir, EXTENSION_FILE);
