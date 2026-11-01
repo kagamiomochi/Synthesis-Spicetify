@@ -1,5 +1,7 @@
 # YT Music Local
 
+[![Latest Tag](https://img.shields.io/github/v/tag/kagamiomochi/YT-Music-Local?sort=semver)](https://github.com/kagamiomochi/YT-Music-Local/tags)
+
 Search YouTube Music directly from Spotify and open tracks in YouTube Music — no server, no yt-dlp, no ffmpeg required.
 
 ## Features
