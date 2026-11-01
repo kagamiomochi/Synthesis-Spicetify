@@ -1,9 +1,15 @@
 "use strict";
 
-// YT Music Local: helper server + Spicetify extension in a single file.
+// YT Music Local — LEGACY: helper server + Spicetify extension in a single file.
+//
+// NOTE: Version 2.0+ is self-contained. See ytm-local.js and manifest.json.
+// The self-contained extension searches YouTube Music directly (no server needed)
+// and opens tracks in YouTube Music. No yt-dlp or ffmpeg required.
+//
+// This file is preserved for users who want the legacy download mode.
 //
 //   node server.js              Start the helper server (wraps yt-dlp).
-//   node server.js --install    Install the Spicetify extension and register
+//   node server.js --install    Install the (legacy) Spicetify extension and register
 //                               the server so that it starts automatically:
 //                                 Linux:   systemd user socket unit (started on
 //                                          demand, exits after being idle)
@@ -949,11 +955,44 @@ async function getExtensionsDir() {
 }
 
 async function installExtension() {
+  // V2: self-contained extension (no server needed)
+  const selfContainedFile = "ytm-local.js";
+  const selfContainedPath = __filename.replace(/server\.js$/, selfContainedFile);
+
+  if (fs.existsSync(selfContainedPath)) {
+    // Install the self-contained version
+    const dir = await getExtensionsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = path.join(dir, selfContainedFile);
+    fs.copyFileSync(selfContainedPath, dest);
+    console.log(`[extension] written (self-contained): ${dest}`);
+
+    try {
+      const cfg = await runCommand("spicetify", ["config", "extensions", selfContainedFile]);
+      if (cfg.code !== 0) throw new Error(cfg.err.trim() || cfg.out.trim());
+      console.log("[extension] registered in spicetify config");
+
+      const apply = await runCommand("spicetify", ["apply"]);
+      if (apply.code !== 0) {
+        throw new Error(
+          (apply.err.trim() || apply.out.trim()) +
+            '\nIf this is the first time, try "spicetify backup apply".'
+        );
+      }
+      console.log("[extension] spicetify apply finished");
+    } catch (e) {
+      console.warn(`[extension] could not finish automatically: ${e.message}`);
+      console.warn(`Run manually:\n  spicetify config extensions ${selfContainedFile}\n  spicetify apply`);
+    }
+    return;
+  }
+
+  // Fallback to legacy extension (built from ytmLocalExtension function)
   const dir = await getExtensionsDir();
   fs.mkdirSync(dir, { recursive: true });
   const dest = path.join(dir, EXTENSION_FILE);
   fs.writeFileSync(dest, buildExtensionSource(), "utf8");
-  console.log(`[extension] written: ${dest}`);
+  console.log(`[extension] written (legacy): ${dest}`);
 
   try {
     const cfg = await runCommand("spicetify", ["config", "extensions", EXTENSION_FILE]);
