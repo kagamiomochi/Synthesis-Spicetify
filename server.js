@@ -172,13 +172,13 @@ async function ytmLocalExtension(defaultPort) {
     }
   }
 
-  function renderResults(listEl, items, status) {
+  function renderResults(listEl, items, status, limit = Infinity) {
     listEl.replaceChildren();
     if (!items.length) {
       listEl.append(el("div", { style: { opacity: "0.7" } }, "Nothing was found."));
       return;
     }
-    for (const item of items) {
+    for (const item of items.slice(0, limit)) {
       const button = el(
         "button",
         {
@@ -468,6 +468,168 @@ async function ytmLocalExtension(defaultPort) {
     openModal();
   }
 
+  // -------------------------------------------------------------------------
+  // Integration with Spotify's built-in search page.
+  //
+  // Spotify's search page lives at /search/<query>. We watch the route, run the
+  // same query against the helper server, and inject a "YouTube Music" section
+  // at the top of the search results. The DOM of Spotify's search page is not a
+  // public API, so the container lookup below may need adjusting after a
+  // Spotify update.
+  // -------------------------------------------------------------------------
+  const SEARCH_SECTION_ID = "ytm-local-search-section";
+  const SEARCH_DEBOUNCE_MS = 700;
+  const SEARCH_VISIBLE_ROWS = 5;
+  const searchCache = new Map();
+  const searchState = { query: "", token: 0, timer: null, setupChecked: false };
+  let searchSection = null;
+
+  function getSearchQuery() {
+    const pathname = Spicetify.Platform?.History?.location?.pathname || "";
+    const m = pathname.match(/^\/search\/([^/]+)/);
+    if (!m) return "";
+    try {
+      return decodeURIComponent(m[1]).trim();
+    } catch {
+      return "";
+    }
+  }
+
+  function findSearchContainer() {
+    return (
+      document.querySelector(".main-view-container__scroll-node-child") ||
+      document.querySelector("main")
+    );
+  }
+
+  function createSearchSection() {
+    const title = el(
+      "h2",
+      { style: { fontSize: "24px", fontWeight: "700", margin: "0 0 8px" } },
+      "YouTube Music"
+    );
+    const status = el("div", {
+      style: { minHeight: "18px", fontSize: "12px", margin: "4px 0", opacity: "0.8" },
+    });
+    const list = el("div");
+    const moreButton = el(
+      "button",
+      {
+        className: "main-buttons-button main-button-secondary",
+        style: { padding: "6px 14px", cursor: "pointer", marginTop: "4px", display: "none" },
+      },
+      "Show more"
+    );
+    const root = el(
+      "section",
+      { id: SEARCH_SECTION_ID, style: { padding: "16px 32px 8px", color: "var(--spice-text)" } },
+      title,
+      status,
+      list,
+      moreButton
+    );
+    return { root, status, list, moreButton };
+  }
+
+  function mountSearchSection() {
+    if (!searchSection) searchSection = createSearchSection();
+    if (searchSection.root.isConnected) return true;
+    const container = findSearchContainer();
+    if (!container) return false;
+    container.prepend(searchSection.root);
+    return true;
+  }
+
+  function unmountSearchSection() {
+    if (searchSection && searchSection.root.isConnected) searchSection.root.remove();
+  }
+
+  function showSearchResults(items) {
+    const { list, status, moreButton } = searchSection;
+    renderResults(list, items, status, SEARCH_VISIBLE_ROWS);
+    if (items.length > SEARCH_VISIBLE_ROWS) {
+      moreButton.style.display = "";
+      moreButton.onclick = () => {
+        renderResults(list, items, status);
+        moreButton.style.display = "none";
+      };
+    } else {
+      moreButton.style.display = "none";
+    }
+  }
+
+  // Local file settings are only prompted for through the top bar button, so
+  // point the user to it once instead of failing silently after a download.
+  async function checkSetupHint() {
+    if (searchState.setupChecked) return;
+    searchState.setupChecked = true;
+    const needEnable = (await isLocalFilesEnabled()) === false;
+    const needSource = (await isSourceRegistered(await getDownloadDir())) === false;
+    if (needEnable || needSource) {
+      Spicetify.showNotification(
+        'Local file settings are required. Click the "YT Music Local" button once to set them up.'
+      );
+    }
+  }
+
+  async function runSearchPageQuery(query, token) {
+    try {
+      let items = searchCache.get(query);
+      if (!items) {
+        const data = await api(`/search?q=${encodeURIComponent(query)}`);
+        items = data.results;
+        searchCache.set(query, items);
+      }
+      // Ignore the response if the user has already typed something else.
+      if (token !== searchState.token || !mountSearchSection()) return;
+      searchSection.status.textContent = "";
+      showSearchResults(items);
+      checkSetupHint();
+    } catch (e) {
+      if (token !== searchState.token || !mountSearchSection()) return;
+      searchSection.list.replaceChildren();
+      searchSection.moreButton.style.display = "none";
+      searchSection.status.textContent = `Error: ${e.message}`;
+    }
+  }
+
+  function onSearchRouteChange() {
+    const query = getSearchQuery();
+    if (!query) {
+      clearTimeout(searchState.timer);
+      searchState.query = "";
+      searchState.token++;
+      unmountSearchSection();
+      return;
+    }
+    if (query === searchState.query) {
+      // Same query: only make sure the section survived a re-render.
+      mountSearchSection();
+      return;
+    }
+
+    searchState.query = query;
+    const token = ++searchState.token;
+    clearTimeout(searchState.timer);
+    // The container may not be rendered yet; the search below mounts it again.
+    if (mountSearchSection()) {
+      searchSection.list.replaceChildren();
+      searchSection.moreButton.style.display = "none";
+      searchSection.status.textContent = "Searching...";
+    }
+    // Spotify updates the URL while the user is typing, so debounce to avoid
+    // spawning a yt-dlp process for every keystroke. Cached queries are instant.
+    const delay = searchCache.has(query) ? 0 : SEARCH_DEBOUNCE_MS;
+    searchState.timer = setTimeout(() => runSearchPageQuery(query, token), delay);
+  }
+
+  Spicetify.Platform?.History?.listen?.(onSearchRouteChange);
+  // The search page can be rendered after the route change, and React may
+  // replace the container, so also re-check periodically (cheap: no request is
+  // sent unless the query changed).
+  setInterval(onSearchRouteChange, 1000);
+  onSearchRouteChange();
+
   const ButtonClass = Spicetify.Topbar?.Button || Spicetify.Playbar.Button;
   new ButtonClass("YT Music Local", "download", onButtonClick);
 }
@@ -476,7 +638,7 @@ function buildExtensionSource() {
   return [
     "// NAME: YT Music Local",
     "// AUTHOR: kagamiomochi",
-    "// DESCRIPTION: Search YouTube Music, download via a local yt-dlp server, and play as Spotify local files.",
+    "// DESCRIPTION: Search YouTube Music from the Spotify search page, download via a local yt-dlp server, and play as Spotify local files.",
     "// Generated by server.js --install. Edit server.js instead of this file.",
     "",
     `(${ytmLocalExtension.toString()})(${PORT});`,
