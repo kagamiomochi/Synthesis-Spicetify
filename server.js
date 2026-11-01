@@ -3,10 +3,12 @@
 // YT Music Local: helper server + Spicetify extension in a single file.
 //
 //   node server.js              Start the helper server (wraps yt-dlp).
-//   node server.js --install    Install the Spicetify extension and, on Linux,
-//                               register a systemd user socket unit. The server
-//                               is started on demand by the first request from
-//                               Spotify and exits after being idle.
+//   node server.js --install    Install the Spicetify extension and register
+//                               the server so that it starts automatically:
+//                                 Linux:   systemd user socket unit (started on
+//                                          demand, exits after being idle)
+//                                 macOS:   launchd LaunchAgent (runs at login)
+//                                 Windows: Startup folder script (runs at login)
 //
 // No npm dependencies. Requires: node, yt-dlp, ffmpeg, spicetify.
 
@@ -32,6 +34,15 @@ const ALLOWED_ORIGIN_SUFFIX =
 const EXTENSION_FILE = "ytm-local.js";
 const SERVICE_NAME = "ytm-local.service";
 const SOCKET_NAME = "ytm-local.socket";
+const LAUNCHD_LABEL = "io.github.kagamiomochi.ytm-local";
+const WINDOWS_LAUNCHER = "ytm-local.vbs";
+// Settings that are carried over from the --install environment to the server.
+const PASSTHROUGH_ENV_KEYS = [
+  "YTM_PORT",
+  "YTM_DIR",
+  "YTDLP_PATH",
+  "YTM_ALLOWED_ORIGIN_SUFFIX",
+];
 
 // Socket activation: systemd passes the listening socket as fd 3.
 const SOCKET_ACTIVATED =
@@ -807,8 +818,10 @@ function unitQuote(s) {
 }
 
 async function installService() {
+  if (process.platform === "darwin") return installLaunchAgent();
+  if (process.platform === "win32") return installWindowsStartup();
   if (process.platform !== "linux") {
-    console.log("[service] skipped (systemd user service is Linux only)");
+    console.log(`[service] skipped (unsupported platform: ${process.platform})`);
     return;
   }
   const unitDir = path.join(
@@ -823,7 +836,8 @@ async function installService() {
 
   // User services get a minimal PATH, so pass the current PATH to find yt-dlp / ffmpeg.
   const env = [`PATH=${process.env.PATH || ""}`];
-  for (const key of ["YTM_PORT", "YTM_DIR", "YTDLP_PATH", "YTM_ALLOWED_ORIGIN_SUFFIX", "YTM_IDLE_TIMEOUT"]) {
+  // YTM_IDLE_TIMEOUT only makes sense here, where the socket restarts the server.
+  for (const key of [...PASSTHROUGH_ENV_KEYS, "YTM_IDLE_TIMEOUT"]) {
     if (process.env[key]) env.push(`${key}=${process.env[key]}`);
   }
 
@@ -873,6 +887,127 @@ async function installService() {
   } catch (e) {
     console.warn(`[service] could not finish automatically: ${e.message}`);
     console.warn(`Run manually:\n  systemctl --user daemon-reload\n  systemctl --user enable --now ${SOCKET_NAME}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// macOS: launchd LaunchAgent (starts at login, restarted on failure)
+// ---------------------------------------------------------------------------
+
+function xmlEscape(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+async function installLaunchAgent() {
+  const plistPath = path.join(
+    os.homedir(),
+    "Library",
+    "LaunchAgents",
+    `${LAUNCHD_LABEL}.plist`
+  );
+  const logPath = path.join(os.homedir(), "Library", "Logs", "ytm-local.log");
+
+  // launchd gives agents a minimal PATH, so pass the current PATH to find
+  // yt-dlp / ffmpeg (for example the ones installed by Homebrew).
+  const env = { PATH: process.env.PATH || "" };
+  for (const key of PASSTHROUGH_ENV_KEYS) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
+
+  const str = (v) => `<string>${xmlEscape(v)}</string>`;
+  const plist = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    "<dict>",
+    `  <key>Label</key>${str(LAUNCHD_LABEL)}`,
+    "  <key>ProgramArguments</key>",
+    `  <array>${str(process.execPath)}${str(__filename)}</array>`,
+    "  <key>EnvironmentVariables</key>",
+    "  <dict>",
+    ...Object.entries(env).map(([k, v]) => `    <key>${xmlEscape(k)}</key>${str(v)}`),
+    "  </dict>",
+    "  <key>RunAtLoad</key><true/>",
+    // Restart only when the server crashed (non-zero exit).
+    "  <key>KeepAlive</key>",
+    "  <dict><key>SuccessfulExit</key><false/></dict>",
+    `  <key>StandardOutPath</key>${str(logPath)}`,
+    `  <key>StandardErrorPath</key>${str(logPath)}`,
+    "</dict>",
+    "</plist>",
+    "",
+  ].join("\n");
+
+  fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+  fs.writeFileSync(plistPath, plist, "utf8");
+  console.log(`[service] written: ${plistPath}`);
+
+  const domain = `gui/${process.getuid()}`;
+  try {
+    // Unload a previous version first; failure is fine if it was not loaded.
+    await runCommand("launchctl", ["bootout", `${domain}/${LAUNCHD_LABEL}`]);
+    await new Promise((r) => setTimeout(r, 500));
+    const r = await runCommand("launchctl", ["bootstrap", domain, plistPath]);
+    if (r.code !== 0) throw new Error(r.err.trim() || "launchctl bootstrap failed");
+    console.log(`[service] loaded and started (log: ${logPath})`);
+  } catch (e) {
+    console.warn(`[service] could not finish automatically: ${e.message}`);
+    console.warn(`Run manually:\n  launchctl bootstrap ${domain} ${plistPath}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Windows: script in the Startup folder (starts at login, no console window)
+// ---------------------------------------------------------------------------
+
+async function installWindowsStartup() {
+  const appData =
+    process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  const dir = path.join(
+    appData,
+    "Microsoft",
+    "Windows",
+    "Start Menu",
+    "Programs",
+    "Startup"
+  );
+  const dest = path.join(dir, WINDOWS_LAUNCHER);
+
+  // VBScript string literal: double quotes are escaped by doubling them.
+  const vq = (s) => `"${String(s).replace(/"/g, '""')}"`;
+  const lines = [
+    'Set sh = CreateObject("WScript.Shell")',
+    'Set env = sh.Environment("Process")',
+  ];
+  for (const key of PASSTHROUGH_ENV_KEYS) {
+    if (process.env[key]) lines.push(`env(${vq(key)}) = ${vq(process.env[key])}`);
+  }
+  // Window style 0 = hidden, False = do not wait for the server to exit.
+  lines.push(`sh.Run ${vq(`${vq(process.execPath)} ${vq(__filename)}`)}, 0, False`);
+
+  fs.mkdirSync(dir, { recursive: true });
+  // wscript reads scripts as ANSI unless there is a BOM, which would break
+  // non-ASCII paths (for example a Japanese user name), so write UTF-16LE.
+  fs.writeFileSync(
+    dest,
+    Buffer.concat([
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from(lines.join("\r\n") + "\r\n", "utf16le"),
+    ])
+  );
+  console.log(`[service] written: ${dest}`);
+
+  try {
+    // Start it now as well; the script itself returns immediately.
+    const r = await runCommand("wscript.exe", [dest]);
+    if (r.code !== 0) throw new Error(r.err.trim() || "wscript failed");
+    console.log("[service] started (it will also start at every login)");
+  } catch (e) {
+    console.warn(`[service] could not start it now: ${e.message}`);
+    console.warn(`It will start at the next login, or run:\n  node ${__filename}`);
   }
 }
 
