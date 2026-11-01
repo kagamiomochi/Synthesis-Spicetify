@@ -4,8 +4,9 @@
 //
 //   node server.js              Start the helper server (wraps yt-dlp).
 //   node server.js --install    Install the Spicetify extension and, on Linux,
-//                               register the server as a systemd user service
-//                               so that it starts automatically at login.
+//                               register a systemd user socket unit. The server
+//                               is started on demand by the first request from
+//                               Spotify and exits after being idle.
 //
 // No npm dependencies. Requires: node, yt-dlp, ffmpeg, spicetify.
 
@@ -30,6 +31,17 @@ const ALLOWED_ORIGIN_SUFFIX =
 
 const EXTENSION_FILE = "ytm-local.js";
 const SERVICE_NAME = "ytm-local.service";
+const SOCKET_NAME = "ytm-local.socket";
+
+// Socket activation: systemd passes the listening socket as fd 3.
+const SOCKET_ACTIVATED =
+  Number(process.env.LISTEN_FDS) >= 1 &&
+  process.env.LISTEN_PID === String(process.pid);
+// Exit after this many seconds without any request (0 disables). Defaults to
+// 10 minutes when socket-activated, because systemd restarts the server on the
+// next connection.
+const IDLE_TIMEOUT_SEC =
+  Number(process.env.YTM_IDLE_TIMEOUT ?? (SOCKET_ACTIVATED ? 600 : 0)) || 0;
 
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const URL_ID_RE = /(?:youtube\.com\/watch\?[^#]*\bv=|youtu\.be\/)([A-Za-z0-9_-]{11})/;
@@ -677,6 +689,29 @@ function createServer() {
   });
 }
 
+// Exit when no request has been in flight for IDLE_TIMEOUT_SEC seconds.
+function watchIdle(server) {
+  if (IDLE_TIMEOUT_SEC <= 0) return;
+  let active = 0;
+  let timer = null;
+  const arm = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      console.log(`idle for ${IDLE_TIMEOUT_SEC}s, exiting`);
+      process.exit(0);
+    }, IDLE_TIMEOUT_SEC * 1000);
+  };
+  server.on("request", (req, res) => {
+    active++;
+    clearTimeout(timer);
+    // "close" fires on both normal completion and aborted connections.
+    res.on("close", () => {
+      if (--active === 0) arm();
+    });
+  });
+  arm();
+}
+
 // Warn (but do not exit) when a required external tool is missing.
 async function checkDependencies() {
   const tools = [
@@ -706,10 +741,16 @@ async function startServer() {
     }
     process.exit(1);
   });
-  server.listen(PORT, HOST, () => {
+  watchIdle(server);
+  const onListening = () => {
     console.log(`ytm-local server: http://${HOST}:${PORT}`);
     console.log(`download dir: ${MUSIC_DIR}`);
-  });
+  };
+  if (SOCKET_ACTIVATED) {
+    server.listen({ fd: 3 }, onListening);
+  } else {
+    server.listen(PORT, HOST, onListening);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -776,43 +817,62 @@ async function installService() {
     "user"
   );
 
+  // Migrate from the old always-running service: disable it before the unit
+  // file is overwritten. Failures are ignored (it may not exist).
+  await runCommand("systemctl", ["--user", "disable", "--now", SERVICE_NAME]).catch(() => {});
+
   // User services get a minimal PATH, so pass the current PATH to find yt-dlp / ffmpeg.
   const env = [`PATH=${process.env.PATH || ""}`];
-  for (const key of ["YTM_PORT", "YTM_DIR", "YTDLP_PATH", "YTM_ALLOWED_ORIGIN_SUFFIX"]) {
+  for (const key of ["YTM_PORT", "YTM_DIR", "YTDLP_PATH", "YTM_ALLOWED_ORIGIN_SUFFIX", "YTM_IDLE_TIMEOUT"]) {
     if (process.env[key]) env.push(`${key}=${process.env[key]}`);
   }
 
-  const unit = [
+  // The service has no [Install] section: it is only started by the socket.
+  const service = [
     "[Unit]",
     "Description=YT Music Local helper server",
+    "Requires=" + SOCKET_NAME,
     "",
     "[Service]",
     `ExecStart=${unitQuote(process.execPath)} ${unitQuote(__filename)}`,
     ...env.map((e) => `Environment=${unitQuote(e)}`),
     "Restart=on-failure",
     "",
+  ].join("\n");
+
+  const socket = [
+    "[Unit]",
+    "Description=YT Music Local helper server (socket)",
+    "",
+    "[Socket]",
+    `ListenStream=${HOST}:${PORT}`,
+    "",
     "[Install]",
-    "WantedBy=default.target",
+    "WantedBy=sockets.target",
     "",
   ].join("\n");
 
   fs.mkdirSync(unitDir, { recursive: true });
-  const dest = path.join(unitDir, SERVICE_NAME);
-  fs.writeFileSync(dest, unit, "utf8");
-  console.log(`[service] written: ${dest}`);
+  const serviceDest = path.join(unitDir, SERVICE_NAME);
+  const socketDest = path.join(unitDir, SOCKET_NAME);
+  fs.writeFileSync(serviceDest, service, "utf8");
+  fs.writeFileSync(socketDest, socket, "utf8");
+  console.log(`[service] written: ${serviceDest}`);
+  console.log(`[service] written: ${socketDest}`);
 
   try {
     for (const args of [
       ["--user", "daemon-reload"],
-      ["--user", "enable", "--now", SERVICE_NAME],
+      ["--user", "enable", "--now", SOCKET_NAME],
     ]) {
       const r = await runCommand("systemctl", args);
       if (r.code !== 0) throw new Error(r.err.trim() || `systemctl ${args.join(" ")} failed`);
     }
-    console.log("[service] enabled and started (systemctl --user status ytm-local)");
+    console.log(`[service] socket enabled (systemctl --user status ${SOCKET_NAME})`);
+    console.log("[service] the server starts on the first request and exits when idle");
   } catch (e) {
     console.warn(`[service] could not finish automatically: ${e.message}`);
-    console.warn(`Run manually:\n  systemctl --user daemon-reload\n  systemctl --user enable --now ${SERVICE_NAME}`);
+    console.warn(`Run manually:\n  systemctl --user daemon-reload\n  systemctl --user enable --now ${SOCKET_NAME}`);
   }
 }
 
