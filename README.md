@@ -4,7 +4,7 @@ Search YouTube Music directly from Spotify and open tracks in YouTube Music — 
 
 ## Features
 
-- **Direct search** — queries the YouTube Music web API from within Spotify
+- **Search without a server** — uses the YouTube Data API v3 (with your own free API key, recommended) or public Invidious instances (no key, best effort). The YouTube Music web API itself cannot be called from Spotify because of CORS
 - **One-click playback** — opens the matched track in YouTube Music (in your browser)
 - **Search page integration** — when you type in Spotify's search bar, a YouTube Music results section appears automatically
 - **URL support** — paste a YouTube / YouTube Music URL to open it directly

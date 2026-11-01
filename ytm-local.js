@@ -1,6 +1,6 @@
 // NAME: YT Music Local
 // AUTHOR: kagamiomochi
-// DESCRIPTION: Search YouTube Music directly from Spotify and open tracks in YouTube Music. No server required.
+// DESCRIPTION: Search YouTube from Spotify (YouTube Data API key or public Invidious instances) and open tracks in YouTube Music. No server required.
 // SOURCE: https://github.com/kagamiomochi/YT-Music-Local
 
 (async function () {
@@ -44,245 +44,140 @@
   // YouTube Music Web API
   // ---------------------------------------------------------------------------
 
-  const YTM_SEARCH_URL = "https://music.youtube.com/youtubei/v1/search";
+  // music.youtube.com cannot be reached from Spotify's renderer: fetch() is
+  // blocked by CORS, and Spicetify.CosmosAsync routes external requests through
+  // cors-proxy.spicetify.app, which gets 403 from YouTube. So the search uses
+  // backends that allow cross-origin requests:
+  //   1. YouTube Data API v3 (needs a free API key, most reliable)
+  //   2. Public Invidious instances with CORS enabled (no key, best effort)
+  // Both return normal YouTube videos; the "Music" category is requested where
+  // the API supports it, and tracks are still opened in YouTube Music.
+
+  const API_KEY_STORAGE = "ytmLocalApiKey";
+  const getApiKey = () => (Spicetify.LocalStorage.get(API_KEY_STORAGE) || "").trim();
+
+  function decodeHtml(str) {
+    const t = document.createElement("textarea");
+    t.innerHTML = str;
+    return t.value;
+  }
+
+  // "PT1H2M3S" -> seconds
+  function parseIsoDuration(iso) {
+    const m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso || "");
+    if (!m) return 0;
+    const [, d, h, min, sec] = m.map((x) => Number(x || 0));
+    return ((d * 24 + h) * 60 + min) * 60 + sec;
+  }
+
+  // Auto-generated music channels are named "<Artist> - Topic".
+  const cleanArtist = (name) => String(name || "").replace(/ - Topic$/, "");
+
+  async function searchWithDataApi(query, key) {
+    const params = new URLSearchParams({
+      part: "snippet",
+      type: "video",
+      videoCategoryId: "10",
+      maxResults: "10",
+      q: query,
+      key,
+    });
+    const res = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+
+    const items = (data.items || []).filter((i) => i?.id?.videoId);
+    // Durations need a second (cheap, 1 quota unit) request.
+    const durations = {};
+    if (items.length) {
+      try {
+        const vp = new URLSearchParams({
+          part: "contentDetails",
+          id: items.map((i) => i.id.videoId).join(","),
+          key,
+        });
+        const vr = await fetch(`https://www.googleapis.com/youtube/v3/videos?${vp}`);
+        const vd = await vr.json();
+        for (const v of vd.items || []) {
+          durations[v.id] = parseIsoDuration(v.contentDetails?.duration);
+        }
+      } catch (e) {
+        console.warn("[ytm-local] duration lookup failed", e);
+      }
+    }
+    return items.map((i) => ({
+      type: "song",
+      videoId: i.id.videoId,
+      title: decodeHtml(i.snippet?.title || ""),
+      artist: cleanArtist(decodeHtml(i.snippet?.channelTitle || "")),
+      album: "",
+      duration: durations[i.id.videoId] || 0,
+      thumbnail:
+        i.snippet?.thumbnails?.medium?.url ||
+        `https://i.ytimg.com/vi/${i.id.videoId}/mqdefault.jpg`,
+    }));
+  }
+
+  let invidiousInstances = null;
+
+  async function getInvidiousInstances() {
+    if (invidiousInstances) return invidiousInstances;
+    const res = await fetch("https://api.invidious.io/instances.json?sort_by=health");
+    const list = await res.json();
+    invidiousInstances = list
+      .filter(([, i]) => i?.api === true && i?.cors === true && i?.type === "https")
+      .map(([, i]) => String(i.uri).replace(/\/$/, ""))
+      .slice(0, 5);
+    return invidiousInstances;
+  }
+
+  async function searchWithInvidious(query) {
+    let lastError = null;
+    try {
+      for (const base of await getInvidiousInstances()) {
+        try {
+          const res = await fetch(
+            `${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video`,
+            { signal: AbortSignal.timeout(6000) }
+          );
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          if (!Array.isArray(data)) throw new Error("unexpected response");
+          return data
+            .filter((v) => v?.videoId)
+            .slice(0, 10)
+            .map((v) => ({
+              type: "song",
+              videoId: v.videoId,
+              title: v.title || "",
+              artist: cleanArtist(v.author),
+              album: "",
+              duration: v.lengthSeconds || 0,
+              thumbnail: `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
+            }));
+        } catch (e) {
+          lastError = e;
+        }
+      }
+    } catch (e) {
+      lastError = e;
+    }
+    // Forget the list so that the next search fetches a fresh one.
+    invidiousInstances = null;
+    throw new Error(
+      `No public search instance responded${lastError ? ` (${lastError.message})` : ""}. ` +
+        "Set a YouTube Data API key in the YT Music Local window for reliable results."
+    );
+  }
 
   /**
-   * Search YouTube Music.
+   * Search YouTube.
    * Returns an array of result objects:
    *   { type, videoId, title, artist, album, duration, thumbnail }
    */
   async function ytmSearch(query) {
-    const body = {
-      query: query,
-      context: {
-        client: {
-          clientName: "WEB_REMIX",
-          clientVersion: "1.20240903",
-          platform: "DESKTOP",
-        },
-      },
-    };
-
-    const res = await fetch(YTM_SEARCH_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-      throw new Error(`YouTube Music API error: HTTP ${res.status}`);
-    }
-
-    const data = await res.json();
-    return parseSearchResults(data);
-  }
-
-  /**
-   * Parse YouTube Music search API response.
-   * Navigates the response structure to extract playable items.
-   */
-  function parseSearchResults(data) {
-    const results = [];
-
-    // Navigate to the tabs array
-    const tabs =
-      data?.contents?.tabbedSearchResultsRenderer?.tabs;
-    if (!tabs || !Array.isArray(tabs)) return results;
-
-    for (const tab of tabs) {
-      const tabContent = tab?.tabRenderer?.content;
-      if (!tabContent) continue;
-
-      const sections =
-        tabContent?.sectionListRenderer?.contents;
-      if (!Array.isArray(sections)) continue;
-
-      for (const section of sections) {
-        // musicCardShelfRenderer — featured track at the top
-        const card = section?.musicCardShelfRenderer;
-        if (card) {
-          const parsed = parseMusicCardShelf(card);
-          if (parsed) results.push(parsed);
-        }
-
-        // musicVerticalCardShelfRenderer — newer featured track format
-        const vCard = section?.musicVerticalCardShelfRenderer;
-        if (vCard) {
-          const parsed = parseMusicVerticalCardShelf(vCard);
-          if (parsed) results.push(parsed);
-        }
-
-        // itemSectionRenderer — list of tracks below
-        const itemSection = section?.itemSectionRenderer;
-        if (itemSection) {
-          for (const sub of itemSection.contents || []) {
-            const parsed = parseResponsiveListItem(sub);
-            if (parsed) results.push(parsed);
-          }
-        }
-
-        // reelShelfRenderer — ignore (reels/shorts)
-        // horizontalCard / carouselRenderer — artist/album carousels (not playable directly)
-      }
-    }
-
-    return results;
-  }
-
-  /**
-   * Parse a musicCardShelfRenderer (featured track).
-   */
-  function parseMusicCardShelf(card) {
-    const overlay =
-      card?.overlay
-      ?.musicItemThumbnailOverlayRenderer
-      ?.content?.musicPlayButtonRenderer;
-
-    if (!overlay?.playNavigationEndpoint) return null;
-
-    const nav = overlay.playNavigationEndpoint.watchEndpoint;
-    if (!nav?.videoId) return null;
-
-    const thumb = card?.thumbnailRenderer
-      ?.musicThumbnailRenderer?.thumbnail
-      ?.thumbnails?.[0]?.url;
-
-    // Extract runs (title, artist, etc.)
-    const runs = card?.subtitle?.runs;
-    if (!Array.isArray(runs) || runs.length < 1) return null;
-
-    const titleRun = runs[0];
-    const artistRun = runs.length >= 2 ? runs[1] : null;
-
-    return {
-      type: "song",
-      videoId: nav.videoId,
-      title: titleRun?.text || "",
-      artist: artistRun?.text || "",
-      thumbnail: thumb || "",
-    };
-  }
-
-  /**
-   * Parse a musicVerticalCardShelfRenderer (newer featured track format).
-   */
-  function parseMusicVerticalCardShelf(card) {
-    const overlay =
-      card?.overlay
-      ?.musicItemThumbnailOverlayRenderer
-      ?.content?.musicPlayButtonRenderer;
-
-    if (!overlay?.playNavigationEndpoint) return null;
-
-    const nav = overlay.playNavigationEndpoint.watchEndpoint;
-    if (!nav?.videoId) return null;
-
-    // Thumbnail
-    const thumb = card?.thumbnailRenderer
-      ?.musicThumbnailRenderer?.thumbnail
-      ?.thumbnails?.[0]?.url;
-
-    // Content rows: [title, artist/album, duration]
-    const rows = card?.content?.musicDetailHeaderRenderer?.subtitle?.runs;
-    if (!Array.isArray(rows) || rows.length < 1) return null;
-
-    return {
-      type: "song",
-      videoId: nav.videoId,
-      title: rows[0]?.text || "",
-      artist: rows.length >= 2 ? rows[1]?.text || "" : "",
-      thumbnail: thumb || "",
-    };
-  }
-
-  /**
-   * Parse a musicResponsiveListItemRenderer.
-   */
-  function parseResponsiveListItem(item) {
-    // Only handle musicResponsiveListItemRenderer
-    const flexColumns = item?.flexColumns;
-    if (!Array.isArray(flexColumns)) return null;
-
-    // Get the play endpoint from overlay
-    const overlay =
-      item?.overlay
-      ?.musicItemThumbnailOverlayRenderer
-      ?.content?.musicPlayButtonRenderer;
-
-    const nav = overlay?.playNavigationEndpoint?.watchEndpoint;
-    if (!nav?.videoId) return null;
-
-    // Extract title from first flex column
-    const titleColumn = flexColumns[0];
-    const titleRun = titleColumn?.musicResponsiveListItemFlexColumnRenderer
-      ?.text?.runs?.[0];
-    if (!titleRun?.text) return null;
-
-    // Extract artist from second flex column (if exists)
-    let artist = "";
-    let album = "";
-    let duration = 0;
-
-    if (flexColumns.length >= 2) {
-      const secondCol =
-        flexColumns[1]?.musicResponsiveListItemFlexColumnRenderer;
-      const runs = secondCol?.text?.runs;
-      if (Array.isArray(runs)) {
-        if (runs.length >= 3) {
-          artist = runs[0]?.text || "";
-          album = runs[2]?.text || "";
-        } else if (runs.length === 2) {
-          // Could be "artist · duration" or "artist · album"
-          const r1 = runs[1]?.text || "";
-          if (/^\d{1,2}:\d{2}$/.test(r1)) {
-            artist = runs[0]?.text || "";
-            duration = parseDuration(r1);
-          } else {
-            artist = runs[0]?.text || "";
-            album = r1;
-          }
-        } else if (runs.length === 1) {
-          const r = runs[0]?.text || "";
-          if (/^\d{1,2}:\d{2}$/.test(r)) {
-            duration = parseDuration(r);
-          } else {
-            artist = r;
-          }
-        }
-      }
-    }
-
-    // Thumbnail from overlay or thumbnail column
-    let thumbnail = "";
-    const thumbOverlay =
-      item?.overlay
-      ?.musicItemThumbnailOverlayRenderer
-      ?.content?.musicPlayButtonRenderer;
-
-    if (!thumbOverlay) {
-      const thumbCol =
-        item?.thumbnail?.musicThumbnailRenderer?.thumbnail
-        ?.thumbnails?.[0]?.url;
-      if (thumbCol) thumbnail = thumbCol;
-    }
-
-    return {
-      type: "song",
-      videoId: nav.videoId,
-      title: titleRun.text,
-      artist,
-      album,
-      duration,
-      thumbnail,
-    };
-  }
-
-  function parseDuration(str) {
-    const parts = str.split(":");
-    if (parts.length === 2) {
-      return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
-    }
-    return 0;
+    const key = getApiKey();
+    return key ? searchWithDataApi(query, key) : searchWithInvidious(query);
   }
 
   // ---------------------------------------------------------------------------
@@ -420,12 +315,50 @@
       if (e.key === "Enter") doSearch();
     });
 
+    // Optional YouTube Data API key (stored locally in Spotify).
+    const keyInput = el("input", {
+      type: "password",
+      value: getApiKey(),
+      placeholder: "YouTube Data API v3 key (optional, more reliable)",
+      style: {
+        flex: "1",
+        padding: "4px 8px",
+        borderRadius: "4px",
+        border: "none",
+        background: "var(--spice-card)",
+        color: "var(--spice-text)",
+      },
+    });
+    keyInput.addEventListener("change", () => {
+      Spicetify.LocalStorage.set(API_KEY_STORAGE, keyInput.value.trim());
+      searchCache.clear();
+      status.textContent = keyInput.value.trim()
+        ? "API key saved."
+        : "API key removed. Public instances will be used.";
+    });
+    const keyRow = el(
+      "div",
+      {
+        style: {
+          display: "flex",
+          alignItems: "center",
+          gap: "8px",
+          marginTop: "12px",
+          fontSize: "12px",
+          opacity: "0.8",
+        },
+      },
+      "API key:",
+      keyInput
+    );
+
     const root = el(
       "div",
       { style: { color: "var(--spice-text)" } },
       el("div", { style: { display: "flex", gap: "8px" } }, input, searchButton),
       status,
-      list
+      list,
+      keyRow
     );
 
     Spicetify.PopupModal.display({
