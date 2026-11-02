@@ -1,37 +1,67 @@
 // NAME: YT Music Local
 // AUTHOR: kagamiomochi
+<<<<<<< Updated upstream
 // DESCRIPTION: Search YouTube from Spotify (YouTube Data API key or public Invidious instances) and open tracks in YouTube Music. No server required.
+=======
+// DESCRIPTION: Search YouTube Music from Spotify, save tracks as MP3 local files and play them inside Spotify. No local server required.
+>>>>>>> Stashed changes
 // SOURCE: https://github.com/kagamiomochi/YT-Music-Local
 
 (async function () {
   "use strict";
 
-  // Wait until Spicetify APIs are ready.
-  while (
-    !window.Spicetify ||
-    !Spicetify.PopupModal ||
-    !Spicetify.showNotification ||
-    !(Spicetify.Topbar?.Button || Spicetify.Playbar?.Button)
-  ) {
-    await new Promise((r) => setTimeout(r, 300));
-  }
+  // ===========================================================================
+  // Part 1: Pure helpers (no Spicetify dependency, unit-testable in Node)
+  // ===========================================================================
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // ---------------------------------------------------------------------------
-  // Utility helpers
-  // ---------------------------------------------------------------------------
+  const store = {
+    get(key) {
+      try {
+        return globalThis.Spicetify?.LocalStorage?.get(key) ?? null;
+      } catch {
+        return null;
+      }
+    },
+    set(key, value) {
+      try {
+        globalThis.Spicetify?.LocalStorage?.set(key, value);
+      } catch {
+        // Ignore storage errors.
+      }
+    },
+  };
 
-  function el(tag, props = {}, ...children) {
-    const node = document.createElement(tag);
-    const { style, ...rest } = props;
-    Object.assign(node, rest);
-    if (style) Object.assign(node.style, style);
-    for (const c of children) {
-      node.append(c instanceof Node ? c : document.createTextNode(String(c)));
-    }
-    return node;
+  const API_KEY_STORAGE = "ytmLocalApiKey";
+  const PIPED_URL_STORAGE = "ytmLocalPipedUrl";
+  const PIPED_LAST_GOOD_STORAGE = "ytmLocalPipedLast";
+
+  const MP3_KBPS = 192;
+  const MP3_SAMPLE_RATE = 44100;
+  const MAX_DURATION_SEC = 20 * 60;
+  const DEFAULT_ALBUM = "YouTube Music";
+  const LAME_URLS = [
+    "https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js",
+    "https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js",
+  ];
+
+  const YOUTUBE_ID_RE =
+    /(?:youtube\.com\/watch\?[^#&]*v=|youtu\.be\/|music\.youtube\.com\/watch\?[^#&]*v=)([A-Za-z0-9_-]{11})/;
+
+  function extractVideoId(input) {
+    const m = String(input).match(YOUTUBE_ID_RE);
+    return m ? m[1] : null;
   }
+
+  // Piped returns relative paths such as "/watch?v=XXXXXXXXXXX".
+  function parseVideoIdFromPath(path) {
+    const m = /[?&]v=([A-Za-z0-9_-]{11})/.exec(String(path || ""));
+    return m ? m[1] : null;
+  }
+
+  // Auto-generated music channels are named "<Artist> - Topic".
+  const cleanArtist = (name) => String(name || "").replace(/ - Topic$/, "").trim();
 
   function formatDuration(sec) {
     if (!sec) return "";
@@ -40,26 +70,21 @@
     return `${m}:${s}`;
   }
 
-  // ---------------------------------------------------------------------------
-  // YouTube Music Web API
-  // ---------------------------------------------------------------------------
+  function sanitizeFileName(name) {
+    return (
+      String(name)
+        // eslint-disable-next-line no-control-regex
+        .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
+        .replace(/\s+/g, " ")
+        .replace(/^\.+/, "")
+        .trim()
+        .slice(0, 120) || "track"
+    );
+  }
 
-  // music.youtube.com cannot be reached from Spotify's renderer: fetch() is
-  // blocked by CORS, and Spicetify.CosmosAsync routes external requests through
-  // cors-proxy.spicetify.app, which gets 403 from YouTube. So the search uses
-  // backends that allow cross-origin requests:
-  //   1. YouTube Data API v3 (needs a free API key, most reliable)
-  //   2. Public Invidious instances with CORS enabled (no key, best effort)
-  // Both return normal YouTube videos; the "Music" category is requested where
-  // the API supports it, and tracks are still opened in YouTube Music.
-
-  const API_KEY_STORAGE = "ytmLocalApiKey";
-  const getApiKey = () => (Spicetify.LocalStorage.get(API_KEY_STORAGE) || "").trim();
-
-  function decodeHtml(str) {
-    const t = document.createElement("textarea");
-    t.innerHTML = str;
-    return t.value;
+  function buildFileName(item) {
+    const base = [item.artist, item.title].filter(Boolean).join(" - ") || item.videoId;
+    return `${sanitizeFileName(base)} [${item.videoId}].mp3`;
   }
 
   // "PT1H2M3S" -> seconds
@@ -70,8 +95,268 @@
     return ((d * 24 + h) * 60 + min) * 60 + sec;
   }
 
-  // Auto-generated music channels are named "<Artist> - Topic".
-  const cleanArtist = (name) => String(name || "").replace(/ - Topic$/, "");
+  function decodeHtml(str) {
+    const t = document.createElement("textarea");
+    t.innerHTML = str;
+    return t.value;
+  }
+
+  // ---------------------------------------------------------------------------
+  // ID3v2.3 tag writer (UTF-16 text so that Japanese titles survive)
+  // ---------------------------------------------------------------------------
+
+  function concatBytes(parts) {
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) {
+      out.set(p, off);
+      off += p.length;
+    }
+    return out;
+  }
+
+  function latin1Bytes(str) {
+    const out = new Uint8Array(str.length);
+    for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xff;
+    return out;
+  }
+
+  function utf16leBytes(str) {
+    const out = new Uint8Array(str.length * 2);
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i);
+      out[i * 2] = c & 0xff;
+      out[i * 2 + 1] = c >> 8;
+    }
+    return out;
+  }
+
+  function detectImageMime(bytes) {
+    if (bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
+    if (bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e) return "image/png";
+    return null;
+  }
+
+  function id3Frame(id, payload) {
+    const head = new Uint8Array(10);
+    head.set(latin1Bytes(id), 0);
+    new DataView(head.buffer).setUint32(4, payload.length); // v2.3: plain big-endian size
+    return concatBytes([head, payload]);
+  }
+
+  function buildId3Tag({ title, artist, album, durationMs, cover }) {
+    const frames = [];
+    const text = (id, value) => {
+      if (!value) return;
+      frames.push(id3Frame(id, concatBytes([Uint8Array.of(0x01, 0xff, 0xfe), utf16leBytes(String(value))])));
+    };
+    text("TIT2", title);
+    text("TPE1", artist);
+    text("TPE2", artist);
+    text("TALB", album);
+    if (durationMs > 0) {
+      frames.push(id3Frame("TLEN", concatBytes([Uint8Array.of(0x00), latin1Bytes(String(Math.round(durationMs)))])));
+    }
+    if (cover?.bytes?.length) {
+      const mime = detectImageMime(cover.bytes);
+      if (mime) {
+        frames.push(
+          id3Frame(
+            "APIC",
+            concatBytes([
+              Uint8Array.of(0x00),
+              latin1Bytes(mime),
+              Uint8Array.of(0x00, 0x03, 0x00), // end of mime, picture type 3 (front cover), empty description
+              cover.bytes,
+            ])
+          )
+        );
+      }
+    }
+    const body = concatBytes(frames);
+    const size = body.length;
+    const header = Uint8Array.of(
+      0x49, 0x44, 0x33, // "ID3"
+      0x03, 0x00, // version 2.3.0
+      0x00, // flags
+      (size >> 21) & 0x7f,
+      (size >> 14) & 0x7f,
+      (size >> 7) & 0x7f,
+      size & 0x7f // syncsafe size
+    );
+    return concatBytes([header, body]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // MP3 encoding (lamejs, loaded lazily). Works in slices so the UI stays alive.
+  // ---------------------------------------------------------------------------
+
+  async function encodeMp3(audio, lame, { kbps = MP3_KBPS, onProgress } = {}) {
+    const channels = Math.min(audio.numberOfChannels, 2);
+    const encoder = new lame.Mp3Encoder(channels, audio.sampleRate, kbps);
+    const left = audio.getChannelData(0);
+    const right = channels === 2 ? audio.getChannelData(1) : null;
+    const total = left.length;
+    const SLICE = 1152 * 64;
+    const out = [];
+
+    const toInt16 = (src, start, end) => {
+      const buf = new Int16Array(end - start);
+      for (let i = start, j = 0; i < end; i++, j++) {
+        const s = Math.max(-1, Math.min(1, src[i]));
+        buf[j] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return buf;
+    };
+
+    for (let pos = 0; pos < total; pos += SLICE) {
+      const end = Math.min(total, pos + SLICE);
+      const l = toInt16(left, pos, end);
+      const chunk = right ? encoder.encodeBuffer(l, toInt16(right, pos, end)) : encoder.encodeBuffer(l);
+      if (chunk.length) out.push(new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)));
+      onProgress?.(end / total);
+      await sleep(0);
+    }
+    const tail = encoder.flush();
+    if (tail.length) out.push(new Uint8Array(tail.buffer.slice(tail.byteOffset, tail.byteOffset + tail.byteLength)));
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Piped client (public instances, CORS enabled, no local server needed)
+  // ---------------------------------------------------------------------------
+
+  const PIPED_LIST_URL = "https://piped-instances.kavin.rocks/";
+  const PIPED_FALLBACK = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.nosebs.ru",
+    "https://pipedapi-libre.kavin.rocks",
+    "https://piped-api.privacy.com.de",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.yt",
+    "https://pipedapi.drgns.space",
+    "https://pipedapi.owo.si",
+    "https://pipedapi.ducks.party",
+    "https://piped-api.codespace.cz",
+    "https://pipedapi.reallyaweso.me",
+    "https://api.piped.private.coffee",
+    "https://pipedapi.darkness.services",
+    "https://pipedapi.orangenet.cc",
+  ];
+
+  let pipedList = null;
+
+  function normalizeBase(url) {
+    const u = String(url || "").trim().replace(/\/+$/, "");
+    return /^https:\/\/[A-Za-z0-9.-]+(:\d+)?(\/[^\s]*)?$/.test(u) ? u : null;
+  }
+
+  async function fetchWithTimeout(url, { signal, timeout = 7000 } = {}) {
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort();
+    signal?.addEventListener("abort", onAbort);
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    try {
+      return await fetch(url, { signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  async function fetchJson(url, opts) {
+    const res = await fetchWithTimeout(url, opts);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async function getPipedInstances() {
+    if (pipedList) return pipedList;
+    let dynamic = [];
+    try {
+      const data = await fetchJson(PIPED_LIST_URL, { timeout: 5000 });
+      if (Array.isArray(data)) dynamic = data.map((i) => normalizeBase(i?.api_url)).filter(Boolean);
+    } catch {
+      // The registry is optional; the built-in list is used instead.
+    }
+    const custom = normalizeBase(store.get(PIPED_URL_STORAGE));
+    const lastGood = normalizeBase(store.get(PIPED_LAST_GOOD_STORAGE));
+    pipedList = [...new Set([custom, lastGood, ...dynamic, ...PIPED_FALLBACK].filter(Boolean))];
+    return pipedList;
+  }
+
+  function resetPipedInstances() {
+    pipedList = null;
+  }
+
+  /**
+   * Run fn(base, signal) against Piped instances, three at a time (first success wins).
+   * Instances in `exclude` are skipped. Returns { base, value }.
+   */
+  async function withPiped(fn, { exclude = new Set(), batch = 3, maxTried = 9 } = {}) {
+    const all = (await getPipedInstances()).filter((b) => !exclude.has(b)).slice(0, maxTried);
+    let lastError = null;
+    for (let i = 0; i < all.length; i += batch) {
+      const group = all.slice(i, i + batch);
+      const ctrl = new AbortController();
+      try {
+        const winner = await Promise.any(
+          group.map(async (base) => ({ base, value: await fn(base, ctrl.signal) }))
+        );
+        ctrl.abort();
+        store.set(PIPED_LAST_GOOD_STORAGE, winner.base);
+        return winner;
+      } catch (e) {
+        lastError = e instanceof AggregateError ? e.errors[0] : e;
+      }
+    }
+    throw new Error(`No Piped instance responded${lastError ? ` (${lastError.message})` : ""}`);
+  }
+
+  function mapPipedSearchItem(it) {
+    const videoId = parseVideoIdFromPath(it?.url);
+    if (!videoId || (it.type && it.type !== "stream")) return null;
+    return {
+      type: "song",
+      videoId,
+      title: it.title || "",
+      artist: cleanArtist(it.uploaderName),
+      album: "",
+      duration: it.duration > 0 ? it.duration : 0,
+      thumbnail: it.thumbnail || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+    };
+  }
+
+  async function searchWithPiped(query) {
+    const q = encodeURIComponent(query);
+    const { value } = await withPiped((base, signal) =>
+      fetchJson(`${base}/search?q=${q}&filter=music_songs`, { signal })
+    );
+    const items = (value?.items || []).map(mapPipedSearchItem).filter(Boolean);
+    if (!items.length) throw new Error("no results");
+    return items.slice(0, 15);
+  }
+
+  function rankAudioStreams(data) {
+    const list = (data?.audioStreams || []).filter((s) => s?.url && !s.videoOnly);
+    const score = (s) => {
+      const mime = String(s.mimeType || "").toLowerCase();
+      // Opus/WebM first: it decodes in Spotify's Chromium build without proprietary codecs.
+      let sc = mime.includes("webm") || mime.includes("opus") ? 2_000_000 : 0;
+      const track = String(s.audioTrackType || "").toLowerCase();
+      if (track && !track.includes("original")) sc -= 1_000_000;
+      return sc + (Number(s.bitrate) || 0);
+    };
+    return list.sort((a, b) => score(b) - score(a));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fallback search backends (kept from the previous version)
+  // ---------------------------------------------------------------------------
+
+  const getApiKey = () => (store.get(API_KEY_STORAGE) || "").trim();
 
   async function searchWithDataApi(query, key) {
     const params = new URLSearchParams({
@@ -87,7 +372,6 @@
     if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
 
     const items = (data.items || []).filter((i) => i?.id?.videoId);
-    // Durations need a second (cheap, 1 quota unit) request.
     const durations = {};
     if (items.length) {
       try {
@@ -98,9 +382,7 @@
         });
         const vr = await fetch(`https://www.googleapis.com/youtube/v3/videos?${vp}`);
         const vd = await vr.json();
-        for (const v of vd.items || []) {
-          durations[v.id] = parseIsoDuration(v.contentDetails?.duration);
-        }
+        for (const v of vd.items || []) durations[v.id] = parseIsoDuration(v.contentDetails?.duration);
       } catch (e) {
         console.warn("[ytm-local] duration lookup failed", e);
       }
@@ -113,108 +395,555 @@
       album: "",
       duration: durations[i.id.videoId] || 0,
       thumbnail:
-        i.snippet?.thumbnails?.medium?.url ||
-        `https://i.ytimg.com/vi/${i.id.videoId}/mqdefault.jpg`,
+        i.snippet?.thumbnails?.medium?.url || `https://i.ytimg.com/vi/${i.id.videoId}/mqdefault.jpg`,
     }));
   }
 
   let invidiousInstances = null;
 
-  async function getInvidiousInstances() {
-    if (invidiousInstances) return invidiousInstances;
-    const res = await fetch("https://api.invidious.io/instances.json?sort_by=health");
-    const list = await res.json();
-    invidiousInstances = list
-      .filter(([, i]) => i?.api === true && i?.cors === true && i?.type === "https")
-      .map(([, i]) => String(i.uri).replace(/\/$/, ""))
-      .slice(0, 5);
-    return invidiousInstances;
-  }
-
   async function searchWithInvidious(query) {
-    let lastError = null;
-    try {
-      for (const base of await getInvidiousInstances()) {
-        try {
-          const res = await fetch(
-            `${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video`,
-            { signal: AbortSignal.timeout(6000) }
-          );
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const data = await res.json();
-          if (!Array.isArray(data)) throw new Error("unexpected response");
-          return data
-            .filter((v) => v?.videoId)
-            .slice(0, 10)
-            .map((v) => ({
-              type: "song",
-              videoId: v.videoId,
-              title: v.title || "",
-              artist: cleanArtist(v.author),
-              album: "",
-              duration: v.lengthSeconds || 0,
-              thumbnail: `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
-            }));
-        } catch (e) {
-          lastError = e;
-        }
-      }
-    } catch (e) {
-      lastError = e;
+    if (!invidiousInstances) {
+      const list = await fetchJson("https://api.invidious.io/instances.json?sort_by=health");
+      invidiousInstances = list
+        .filter(([, i]) => i?.api === true && i?.cors === true && i?.type === "https")
+        .map(([, i]) => String(i.uri).replace(/\/$/, ""))
+        .slice(0, 3);
     }
-    // Forget the list so that the next search fetches a fresh one.
+    let lastError = null;
+    for (const base of invidiousInstances) {
+      try {
+        const data = await fetchJson(`${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video`, {
+          timeout: 6000,
+        });
+        if (!Array.isArray(data)) throw new Error("unexpected response");
+        return data
+          .filter((v) => v?.videoId)
+          .slice(0, 10)
+          .map((v) => ({
+            type: "song",
+            videoId: v.videoId,
+            title: v.title || "",
+            artist: cleanArtist(v.author),
+            album: "",
+            duration: v.lengthSeconds || 0,
+            thumbnail: `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
+          }));
+      } catch (e) {
+        lastError = e;
+      }
+    }
     invidiousInstances = null;
-    throw new Error(
-      `No public search instance responded${lastError ? ` (${lastError.message})` : ""}. ` +
-        "Set a YouTube Data API key in the YT Music Local window for reliable results."
-    );
+    throw lastError || new Error("no Invidious instance responded");
   }
 
   /**
-   * Search YouTube.
-   * Returns an array of result objects:
-   *   { type, videoId, title, artist, album, duration, thumbnail }
+   * Search YouTube. Order: Piped (YouTube Music songs filter) -> Data API (if key) -> Invidious.
+   * Returns { type, videoId, title, artist, album, duration, thumbnail }[]
    */
   async function ytmSearch(query) {
+    const errors = [];
+    try {
+      return await searchWithPiped(query);
+    } catch (e) {
+      errors.push(`Piped: ${e.message}`);
+    }
     const key = getApiKey();
-    return key ? searchWithDataApi(query, key) : searchWithInvidious(query);
+    if (key) {
+      try {
+        return await searchWithDataApi(query, key);
+      } catch (e) {
+        errors.push(`YouTube API: ${e.message}`);
+      }
+    }
+    try {
+      return await searchWithInvidious(query);
+    } catch (e) {
+      errors.push(`Invidious: ${e.message}`);
+    }
+    throw new Error(`Search failed. ${errors.join(" / ")}`);
   }
 
   // ---------------------------------------------------------------------------
-  // UI: Popup Modal
+  // Spotify local file URI helpers
   // ---------------------------------------------------------------------------
 
-  function renderResultRow(item, onOpen) {
-    const button = el(
+  const normText = (s) => String(s || "").normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+
+  // spotify:local:<artist>:<album>:<title>:<duration>
+  function parseLocalUri(uri) {
+    const parts = String(uri || "").split(":");
+    if (parts[0] !== "spotify" || parts[1] !== "local" || parts.length < 6) return null;
+    const dec = (s) => {
+      try {
+        return decodeURIComponent(s.replace(/\+/g, " "));
+      } catch {
+        return s;
+      }
+    };
+    return {
+      artist: dec(parts[2]),
+      album: dec(parts[3]),
+      title: dec(parts.slice(4, -1).join(":")),
+      duration: Number(parts[parts.length - 1]) || 0,
+    };
+  }
+
+  function matchLocalTrack(tracks, { title, artist }) {
+    const t = normText(title);
+    const a = normText(artist);
+    const titleHits = [];
+    for (const tr of tracks || []) {
+      const p = parseLocalUri(tr?.uri);
+      if (!p || normText(p.title) !== t) continue;
+      if (!a || normText(p.artist) === a) return tr;
+      titleHits.push(tr);
+    }
+    // Same title but a different artist string: accept only if it is unambiguous.
+    return titleHits.length === 1 ? titleHits[0] : null;
+  }
+
+  // Test hook: expose pure helpers and stop before touching Spicetify.
+  if (globalThis.__YTM_LOCAL_TEST__) {
+    globalThis.__YTM_LOCAL_TEST__.exports = {
+      extractVideoId,
+      parseVideoIdFromPath,
+      sanitizeFileName,
+      buildFileName,
+      buildId3Tag,
+      encodeMp3,
+      withPiped,
+      mapPipedSearchItem,
+      rankAudioStreams,
+      parseLocalUri,
+      matchLocalTrack,
+      resetPipedInstances,
+      normalizeBase,
+    };
+    return;
+  }
+
+  // ===========================================================================
+  // Part 2: Spicetify-dependent code
+  // ===========================================================================
+
+  while (
+    !window.Spicetify ||
+    !Spicetify.PopupModal ||
+    !Spicetify.showNotification ||
+    !Spicetify.LocalStorage ||
+    !(Spicetify.Topbar?.Button || Spicetify.Playbar?.Button)
+  ) {
+    await sleep(300);
+  }
+
+  function el(tag, props = {}, ...children) {
+    const node = document.createElement(tag);
+    const { style, ...rest } = props;
+    Object.assign(node, rest);
+    if (style) Object.assign(node.style, style);
+    for (const c of children) {
+      node.append(c instanceof Node ? c : document.createTextNode(String(c)));
+    }
+    return node;
+  }
+
+  const notify = (text, isError = false) => Spicetify.showNotification(text, isError);
+
+  // ---------------------------------------------------------------------------
+  // Download folder (File System Access API, handle persisted in IndexedDB)
+  // ---------------------------------------------------------------------------
+
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open("ytm-local", 1);
+      req.onupgradeneeded = () => req.result.createObjectStore("kv");
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbGet(key) {
+    try {
+      const db = await idbOpen();
+      return await new Promise((resolve, reject) => {
+        const req = db.transaction("kv").objectStore("kv").get(key);
+        req.onsuccess = () => resolve(req.result ?? null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  async function idbSet(key, value) {
+    try {
+      const db = await idbOpen();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("kv", "readwrite");
+        tx.objectStore("kv").put(value, key);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (e) {
+      console.warn("[ytm-local] could not persist folder handle", e);
+    }
+  }
+
+  /**
+   * Resolve the folder to save into. Must be called directly from a click handler
+   * (before any long await) because permission prompts and pickers need a user gesture.
+   * Returns a FileSystemDirectoryHandle, or null when the picker API is unavailable
+   * (the caller then falls back to a plain browser download).
+   */
+  async function prepareFolder({ forcePick = false } = {}) {
+    if (typeof window.showDirectoryPicker !== "function") return null;
+
+    if (!forcePick) {
+      const saved = await idbGet("dir");
+      if (saved) {
+        try {
+          let perm = await saved.queryPermission({ mode: "readwrite" });
+          if (perm !== "granted") perm = await saved.requestPermission({ mode: "readwrite" });
+          if (perm === "granted") return saved;
+        } catch (e) {
+          console.warn("[ytm-local] saved folder is not usable, asking again", e);
+        }
+      }
+    }
+
+    const handle = await window.showDirectoryPicker({ id: "ytm-local", mode: "readwrite", startIn: "music" });
+    await idbSet("dir", handle);
+    return handle;
+  }
+
+  async function fileExists(dir, name) {
+    try {
+      await dir.getFileHandle(name);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function writeToFolder(dir, name, blob) {
+    const handle = await dir.getFileHandle(name, { create: true });
+    const writable = await handle.createWritable();
+    try {
+      await writable.write(blob);
+      await writable.close();
+    } catch (e) {
+      try {
+        await writable.abort();
+      } catch {
+        // Ignore.
+      }
+      throw e;
+    }
+  }
+
+  function saveViaAnchor(blob, name) {
+    const a = el("a", { href: URL.createObjectURL(blob), download: name, style: { display: "none" } });
+    document.body.append(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 15000);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Download pipeline: Piped stream -> decode (WebAudio) -> MP3 (lamejs) -> file
+  // ---------------------------------------------------------------------------
+
+  let lamePromise = null;
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error(`could not load ${src}`));
+      document.head.append(s);
+    });
+  }
+
+  function loadLame() {
+    if (window.lamejs?.Mp3Encoder) return Promise.resolve(window.lamejs);
+    if (!lamePromise) {
+      lamePromise = (async () => {
+        let lastError = null;
+        for (const url of LAME_URLS) {
+          try {
+            await loadScript(url);
+            if (window.lamejs?.Mp3Encoder) return window.lamejs;
+          } catch (e) {
+            lastError = e;
+          }
+        }
+        throw lastError || new Error("MP3 encoder is unavailable");
+      })().catch((e) => {
+        lamePromise = null;
+        throw e;
+      });
+    }
+    return lamePromise;
+  }
+
+  async function downloadBytes(url, { expected = 0, onProgress } = {}) {
+    const ctrl = new AbortController();
+    let timer = setTimeout(() => ctrl.abort(), 20000);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal });
+      if (!res.ok) throw new Error(`stream HTTP ${res.status}`);
+      const total = Number(res.headers.get("content-length")) || expected || 0;
+      if (!res.body?.getReader) return new Uint8Array(await res.arrayBuffer());
+      const reader = res.body.getReader();
+      const chunks = [];
+      let got = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        got += value.length;
+        clearTimeout(timer);
+        timer = setTimeout(() => ctrl.abort(), 20000);
+        if (total) onProgress?.(Math.min(1, got / total));
+      }
+      return concatBytes(chunks);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function decodeAudio(bytes) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) throw new Error("WebAudio is not available");
+    const ctx = new Ctx({ sampleRate: MP3_SAMPLE_RATE });
+    try {
+      const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      return await ctx.decodeAudioData(copy);
+    } finally {
+      ctx.close?.().catch(() => {});
+    }
+  }
+
+  async function fetchCover(urls) {
+    for (const url of urls.filter(Boolean)) {
+      try {
+        const res = await fetchWithTimeout(url, { timeout: 8000 });
+        if (!res.ok) continue;
+        const bytes = new Uint8Array(await res.arrayBuffer());
+        if (bytes.length && bytes.length < 2_000_000 && detectImageMime(bytes)) return { bytes };
+      } catch {
+        // Try the next candidate.
+      }
+    }
+    return null;
+  }
+
+  /** Fetch a stream and decode it. Tries other instances if one fails. */
+  async function fetchDecodedAudio(item, report) {
+    const exclude = new Set();
+    let lastError = null;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      report("Looking up stream");
+      let found;
+      try {
+        found = await withPiped(
+          (base, signal) => fetchJson(`${base}/streams/${item.videoId}`, { signal, timeout: 12000 }),
+          { exclude }
+        );
+      } catch (e) {
+        throw lastError || e;
+      }
+      exclude.add(found.base);
+      const info = found.value;
+      if (info?.livestream) throw new Error("live streams are not supported");
+      if (info?.duration > MAX_DURATION_SEC) throw new Error("this video is too long to be a song");
+
+      for (const stream of rankAudioStreams(info).slice(0, 2)) {
+        try {
+          const bytes = await downloadBytes(stream.url, {
+            expected: Number(stream.contentLength) || 0,
+            onProgress: (p) => report(`Downloading ${Math.round(p * 100)}%`),
+          });
+          report("Decoding");
+          const audio = await decodeAudio(bytes);
+          return { audio, info };
+        } catch (e) {
+          lastError = e;
+          console.warn("[ytm-local] stream failed", stream.mimeType, e);
+        }
+      }
+    }
+    throw lastError || new Error("could not fetch audio");
+  }
+
+  async function downloadTrack(item, dir, report) {
+    const fileName = buildFileName(item);
+    const meta = { title: item.title, artist: item.artist };
+
+    if (dir && (await fileExists(dir, fileName))) {
+      report("Already saved");
+      return { fileName, meta, existed: true };
+    }
+
+    const { audio, info } = await fetchDecodedAudio(item, report);
+    if (!meta.title) meta.title = info?.title || item.videoId;
+    if (!meta.artist) meta.artist = cleanArtist(info?.uploader);
+
+    report("Loading encoder");
+    const lame = await loadLame();
+    const chunks = await encodeMp3(audio, lame, {
+      onProgress: (p) => report(`Encoding ${Math.round(p * 100)}%`),
+    });
+
+    report("Tagging");
+    const cover = await fetchCover([item.thumbnail, info?.thumbnailUrl]);
+    const tag = buildId3Tag({
+      title: meta.title,
+      artist: meta.artist,
+      album: DEFAULT_ALBUM,
+      durationMs: audio.duration * 1000,
+      cover,
+    });
+    const blob = new Blob([tag, ...chunks], { type: "audio/mpeg" });
+
+    report("Saving");
+    if (dir) await writeToFolder(dir, fileName, blob);
+    else saveViaAnchor(blob, fileName);
+
+    return { fileName, meta, existed: false };
+  }
+
+  // Serialize downloads: decoding and encoding are memory heavy.
+  let queueTail = Promise.resolve();
+  function enqueue(task) {
+    const run = queueTail.then(() => task());
+    queueTail = run.catch(() => {});
+    return run;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Playback of the saved file through Spotify's Local Files
+  // ---------------------------------------------------------------------------
+
+  async function waitForLocalTrack(meta, timeoutMs) {
+    const api = Spicetify.Platform?.LocalFilesAPI;
+    if (!api?.getTracks) return null;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        const hit = matchLocalTrack(await api.getTracks(), meta);
+        if (hit) return hit;
+      } catch (e) {
+        console.warn("[ytm-local] LocalFilesAPI.getTracks failed", e);
+      }
+      if (Date.now() >= deadline) return null;
+      await sleep(1500);
+    }
+  }
+
+  async function playSaved(meta, timeoutMs) {
+    const hit = await waitForLocalTrack(meta, timeoutMs);
+    if (!hit) return false;
+    await Spicetify.Player.playUri(hit.uri);
+    return true;
+  }
+
+  const LOCAL_FILES_HINT =
+    "Saved, but Spotify has not listed it yet. Make sure the chosen folder is added under " +
+    "Settings > Local Files > Add a source (and Show local files is on).";
+
+  // ---------------------------------------------------------------------------
+  // UI: result rows
+  // ---------------------------------------------------------------------------
+
+  const ytmUrl = (id) => `https://music.youtube.com/watch?v=${id}`;
+
+  function renderResultRow(item, status) {
+    let saved = null;
+    let busy = false;
+
+    const dlButton = el(
       "button",
       {
-        className:
-          "main-buttons-button main-button-secondary",
-        style: {
-          padding: "6px 14px",
-          cursor: "pointer",
-          flexShrink: "0",
-        },
-        onclick: () => onOpen(item),
+        className: "main-buttons-button main-button-primary",
+        style: { padding: "6px 14px", cursor: "pointer", flexShrink: "0", minWidth: "132px" },
       },
-      "▶ Open"
+      "Download"
     );
+    const openButton = el(
+      "button",
+      {
+        className: "main-buttons-button main-button-secondary",
+        style: { padding: "6px 14px", cursor: "pointer", flexShrink: "0" },
+        onclick: () => window.open(ytmUrl(item.videoId), "_blank"),
+      },
+      "YT Music"
+    );
+
+    const setLabel = (text) => {
+      dlButton.textContent = text;
+    };
+
+    dlButton.onclick = async () => {
+      if (busy) return;
+      busy = true;
+      dlButton.disabled = true;
+      try {
+        if (saved) {
+          setLabel("Opening...");
+          if (!(await playSaved(saved, 8000))) notify(LOCAL_FILES_HINT, true);
+          setLabel("Play");
+          return;
+        }
+
+        // Folder access needs the click's user gesture, so ask before queuing.
+        let dir;
+        try {
+          dir = await prepareFolder();
+        } catch (e) {
+          if (e?.name === "AbortError") {
+            setLabel("Download");
+            return;
+          }
+          throw e;
+        }
+
+        setLabel("Queued");
+        const result = await enqueue(() => downloadTrack(item, dir, setLabel));
+        saved = result.meta;
+
+        setLabel("Waiting for Spotify");
+        if (await playSaved(saved, 25000)) {
+          notify(`Playing: ${saved.title}`);
+        } else {
+          notify(LOCAL_FILES_HINT, true);
+        }
+        setLabel("Play");
+      } catch (e) {
+        console.error("[ytm-local] download failed", e);
+        setLabel("Retry");
+        const message = `Download failed: ${e?.message || e}`;
+        dlButton.title = message;
+        if (status) status.textContent = message;
+        notify(message, true);
+      } finally {
+        busy = false;
+        dlButton.disabled = false;
+      }
+    };
 
     return el(
       "div",
-      {
-        style: {
-          display: "flex",
-          alignItems: "center",
-          gap: "12px",
-          padding: "8px 0",
-        },
-      },
+      { style: { display: "flex", alignItems: "center", gap: "12px", padding: "8px 0" } },
       el("img", {
         src: item.thumbnail || "",
         style: {
-          width: "64px",
-          height: "36px",
+          width: "48px",
+          height: "48px",
           objectFit: "cover",
           borderRadius: "4px",
           backgroundColor: "var(--spice-card)",
@@ -225,76 +954,95 @@
         { style: { flex: "1", minWidth: "0" } },
         el(
           "div",
-          {
-            style: {
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-            },
-          },
+          { style: { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } },
           item.title
         ),
         el(
           "div",
           { style: { fontSize: "12px", opacity: "0.7" } },
-          [item.artist, formatDuration(item.duration)].filter(
-            Boolean
-          ).join(" / ")
+          [item.artist, formatDuration(item.duration)].filter(Boolean).join(" / ")
         )
       ),
-      button
+      dlButton,
+      openButton
     );
+  }
+
+  function renderResults(listEl, items, status, limit = Infinity) {
+    listEl.replaceChildren();
+    if (!items.length) {
+      listEl.append(el("div", { style: { opacity: "0.7" } }, "Nothing was found."));
+      return;
+    }
+    for (const item of items.slice(0, limit)) {
+      listEl.append(renderResultRow(item, status));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // UI: popup modal
+  // ---------------------------------------------------------------------------
+
+  const searchCache = new Map();
+
+  async function resolveUrlItem(videoId) {
+    try {
+      const { value } = await withPiped((base, signal) =>
+        fetchJson(`${base}/streams/${videoId}`, { signal, timeout: 12000 })
+      );
+      return {
+        type: "song",
+        videoId,
+        title: value?.title || videoId,
+        artist: cleanArtist(value?.uploader),
+        album: "",
+        duration: value?.duration || 0,
+        thumbnail: value?.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+      };
+    } catch {
+      return {
+        type: "song",
+        videoId,
+        title: videoId,
+        artist: "",
+        album: "",
+        duration: 0,
+        thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+      };
+    }
+  }
+
+  function inputStyle() {
+    return {
+      flex: "1",
+      padding: "6px 10px",
+      borderRadius: "4px",
+      border: "none",
+      background: "var(--spice-card)",
+      color: "var(--spice-text)",
+    };
   }
 
   function openModal() {
     const status = el("div", {
-      style: {
-        minHeight: "18px",
-        fontSize: "12px",
-        margin: "8px 0",
-        opacity: "0.8",
-      },
+      style: { minHeight: "18px", fontSize: "12px", margin: "8px 0", opacity: "0.8" },
     });
-    const list = el("div", {
-      style: { maxHeight: "50vh", overflowY: "auto" },
-    });
+    const list = el("div", { style: { maxHeight: "46vh", overflowY: "auto" } });
     const input = el("input", {
       type: "text",
-      placeholder:
-        "Song title, artist name, or YouTube/YT Music URL",
-      style: {
-        flex: "1",
-        padding: "8px 12px",
-        borderRadius: "4px",
-        border: "none",
-        background: "var(--spice-card)",
-        color: "var(--spice-text)",
-      },
+      placeholder: "Song title, artist name, or YouTube / YT Music URL",
+      style: { ...inputStyle(), padding: "8px 12px" },
     });
 
     const doSearch = async () => {
       const query = input.value.trim();
       if (!query) return;
-
-      // Extract video ID from YouTube/YT Music URLs
-      const videoId = extractVideoId(query);
-      if (videoId) {
-        status.textContent = "Opening in YouTube Music...";
-        window.open(
-          `https://music.youtube.com/watch?v=${videoId}`,
-          "_blank"
-        );
-        return;
-      }
-
       status.textContent = "Searching...";
       list.replaceChildren();
-
       try {
-        const results = await ytmSearch(query);
-        status.textContent = `${results.length} result${
-          results.length !== 1 ? "s" : ""
-        } found.`;
+        const videoId = extractVideoId(query);
+        const results = videoId ? [await resolveUrlItem(videoId)] : await ytmSearch(query);
+        status.textContent = `${results.length} result${results.length !== 1 ? "s" : ""} found.`;
         renderResults(list, results, status);
       } catch (e) {
         status.textContent = `Error: ${e.message}`;
@@ -304,8 +1052,7 @@
     const searchButton = el(
       "button",
       {
-        className:
-          "main-buttons-button main-button-primary",
+        className: "main-buttons-button main-button-primary",
         style: { padding: "8px 18px", cursor: "pointer" },
         onclick: doSearch,
       },
@@ -315,42 +1062,71 @@
       if (e.key === "Enter") doSearch();
     });
 
-    // Optional YouTube Data API key (stored locally in Spotify).
+    // Download folder row
+    const folderName = el("span", { style: { flex: "1", opacity: "0.9" } }, "Not set");
+    idbGet("dir").then((h) => {
+      if (h?.name) folderName.textContent = h.name;
+    });
+    const folderButton = el(
+      "button",
+      {
+        className: "main-buttons-button main-button-secondary",
+        style: { padding: "4px 12px", cursor: "pointer" },
+        onclick: async () => {
+          try {
+            const handle = await prepareFolder({ forcePick: true });
+            if (handle) folderName.textContent = handle.name;
+          } catch (e) {
+            if (e?.name !== "AbortError") status.textContent = `Folder error: ${e.message}`;
+          }
+        },
+      },
+      "Choose folder"
+    );
+    const folderRow = el(
+      "div",
+      { style: { display: "flex", alignItems: "center", gap: "8px", marginTop: "12px", fontSize: "12px" } },
+      "Save to:",
+      folderName,
+      folderButton
+    );
+    const folderHint = el(
+      "div",
+      { style: { fontSize: "11px", opacity: "0.6", marginTop: "4px" } },
+      "Add this folder in Spotify: Settings > Local Files > Add a source."
+    );
+
+    // Optional settings
+    const pipedInput = el("input", {
+      type: "text",
+      value: store.get(PIPED_URL_STORAGE) || "",
+      placeholder: "Custom Piped API URL (optional)",
+      style: inputStyle(),
+    });
+    pipedInput.addEventListener("change", () => {
+      store.set(PIPED_URL_STORAGE, pipedInput.value.trim());
+      resetPipedInstances();
+      searchCache.clear();
+      status.textContent = "Piped URL saved.";
+    });
     const keyInput = el("input", {
       type: "password",
       value: getApiKey(),
-      placeholder: "YouTube Data API v3 key (optional, more reliable)",
-      style: {
-        flex: "1",
-        padding: "4px 8px",
-        borderRadius: "4px",
-        border: "none",
-        background: "var(--spice-card)",
-        color: "var(--spice-text)",
-      },
+      placeholder: "YouTube Data API v3 key (optional fallback)",
+      style: inputStyle(),
     });
     keyInput.addEventListener("change", () => {
-      Spicetify.LocalStorage.set(API_KEY_STORAGE, keyInput.value.trim());
+      store.set(API_KEY_STORAGE, keyInput.value.trim());
       searchCache.clear();
-      status.textContent = keyInput.value.trim()
-        ? "API key saved."
-        : "API key removed. Public instances will be used.";
+      status.textContent = keyInput.value.trim() ? "API key saved." : "API key removed.";
     });
-    const keyRow = el(
-      "div",
-      {
-        style: {
-          display: "flex",
-          alignItems: "center",
-          gap: "8px",
-          marginTop: "12px",
-          fontSize: "12px",
-          opacity: "0.8",
-        },
-      },
-      "API key:",
-      keyInput
-    );
+    const optionalRow = (label, field) =>
+      el(
+        "div",
+        { style: { display: "flex", alignItems: "center", gap: "8px", marginTop: "8px", fontSize: "12px", opacity: "0.8" } },
+        label,
+        field
+      );
 
     const root = el(
       "div",
@@ -358,66 +1134,28 @@
       el("div", { style: { display: "flex", gap: "8px" } }, input, searchButton),
       status,
       list,
-      keyRow
+      folderRow,
+      folderHint,
+      optionalRow("Piped:", pipedInput),
+      optionalRow("API key:", keyInput)
     );
 
-    Spicetify.PopupModal.display({
-      title: "YT Music Local",
-      content: root,
-      isLarge: true,
-    });
+    Spicetify.PopupModal.display({ title: "YT Music Local", content: root, isLarge: true });
     setTimeout(() => input.focus(), 100);
   }
 
-  function renderResults(listEl, items, status, limit = Infinity) {
-    listEl.replaceChildren();
-    if (!items.length) {
-      listEl.append(
-        el("div", { style: { opacity: "0.7" } }, "Nothing was found.")
-      );
-      return;
-    }
-    for (const item of items.slice(0, limit)) {
-      listEl.append(
-        renderResultRow(item, (it) => {
-          const url = `https://music.youtube.com/watch?v=${it.videoId}`;
-          window.open(url, "_blank");
-        })
-      );
-    }
-  }
-
   // ---------------------------------------------------------------------------
-  // URL parsing — extract video ID from YouTube / YT Music URLs
-  // ---------------------------------------------------------------------------
-
-  const YOUTUBE_ID_RE =
-    /(?:youtube\.com\/watch\?[^#&]*v=|youtu\.be\/|music\.youtube\.com\/watch\?v=)([A-Za-z0-9_-]{11})/;
-
-  function extractVideoId(input) {
-    const m = String(input).match(YOUTUBE_ID_RE);
-    return m ? m[1] : null;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Integration with Spotify search page
+  // Integration with Spotify's search page
   // ---------------------------------------------------------------------------
 
   const SEARCH_SECTION_ID = "ytm-local-search-section";
   const SEARCH_DEBOUNCE_MS = 700;
   const SEARCH_VISIBLE_ROWS = 5;
-  const searchCache = new Map();
-  const searchState = {
-    query: "",
-    token: 0,
-    timer: null,
-    setupChecked: false,
-  };
+  const searchState = { query: "", token: 0, timer: null };
   let searchSection = null;
 
   function getSearchQuery() {
-    const pathname =
-      Spicetify.Platform?.History?.location?.pathname || "";
+    const pathname = Spicetify.Platform?.History?.location?.pathname || "";
     const m = pathname.match(/^\/search\/([^/]+)/);
     if (!m) return "";
     try {
@@ -428,57 +1166,24 @@
   }
 
   function findSearchContainer() {
-    return (
-      document.querySelector(
-        ".main-view-container__scroll-node-child"
-      ) || document.querySelector("main")
-    );
+    return document.querySelector(".main-view-container__scroll-node-child") || document.querySelector("main");
   }
 
   function createSearchSection() {
-    const title = el(
-      "h2",
-      {
-        style: {
-          fontSize: "24px",
-          fontWeight: "700",
-          margin: "0 0 8px",
-        },
-      },
-      "YouTube Music"
-    );
-    const status = el("div", {
-      style: {
-        minHeight: "18px",
-        fontSize: "12px",
-        margin: "4px 0",
-        opacity: "0.8",
-      },
-    });
+    const title = el("h2", { style: { fontSize: "24px", fontWeight: "700", margin: "0 0 8px" } }, "YouTube Music");
+    const status = el("div", { style: { minHeight: "18px", fontSize: "12px", margin: "4px 0", opacity: "0.8" } });
     const list = el("div");
     const moreButton = el(
       "button",
       {
-        className:
-          "main-buttons-button main-button-secondary",
-        style: {
-          padding: "6px 14px",
-          cursor: "pointer",
-          marginTop: "4px",
-          display: "none",
-        },
+        className: "main-buttons-button main-button-secondary",
+        style: { padding: "6px 14px", cursor: "pointer", marginTop: "4px", display: "none" },
       },
       "Show more"
     );
     const root = el(
       "section",
-      {
-        id: SEARCH_SECTION_ID,
-        style: {
-          padding: "16px 32px 8px",
-          color: "var(--spice-text)",
-        },
-      },
+      { id: SEARCH_SECTION_ID, style: { padding: "16px 32px 8px", color: "var(--spice-text)" } },
       title,
       status,
       list,
@@ -488,8 +1193,7 @@
   }
 
   function mountSearchSection() {
-    if (!searchSection)
-      searchSection = createSearchSection();
+    if (!searchSection) searchSection = createSearchSection();
     if (searchSection.root.isConnected) return true;
     const container = findSearchContainer();
     if (!container) return false;
@@ -498,11 +1202,7 @@
   }
 
   function unmountSearchSection() {
-    if (
-      searchSection &&
-      searchSection.root.isConnected
-    )
-      searchSection.root.remove();
+    if (searchSection?.root.isConnected) searchSection.root.remove();
   }
 
   function showSearchResults(items) {
@@ -526,15 +1226,11 @@
         items = await ytmSearch(query);
         searchCache.set(query, items);
       }
-      if (token !== searchState.token || !mountSearchSection())
-        return;
-      searchSection.status.textContent = `${items.length} result${
-        items.length !== 1 ? "s" : ""
-      } found.`;
+      if (token !== searchState.token || !mountSearchSection()) return;
+      searchSection.status.textContent = `${items.length} result${items.length !== 1 ? "s" : ""} found.`;
       showSearchResults(items);
     } catch (e) {
-      if (token !== searchState.token || !mountSearchSection())
-        return;
+      if (token !== searchState.token || !mountSearchSection()) return;
       searchSection.list.replaceChildren();
       searchSection.moreButton.style.display = "none";
       searchSection.status.textContent = `Error: ${e.message}`;
@@ -563,13 +1259,8 @@
       searchSection.moreButton.style.display = "none";
       searchSection.status.textContent = "Searching...";
     }
-    const delay = searchCache.has(query)
-      ? 0
-      : SEARCH_DEBOUNCE_MS;
-    searchState.timer = setTimeout(
-      () => runSearchPageQuery(query, token),
-      delay
-    );
+    const delay = searchCache.has(query) ? 0 : SEARCH_DEBOUNCE_MS;
+    searchState.timer = setTimeout(() => runSearchPageQuery(query, token), delay);
   }
 
   // ---------------------------------------------------------------------------
@@ -577,11 +1268,10 @@
   // ---------------------------------------------------------------------------
 
   Spicetify.Platform?.History?.listen?.(onSearchRouteChange);
-  // Re-check periodically — React may replace containers.
+  // Re-check periodically because React may replace containers.
   setInterval(onSearchRouteChange, 1000);
   onSearchRouteChange();
 
-  const ButtonClass =
-    Spicetify.Topbar?.Button || Spicetify.Playbar.Button;
+  const ButtonClass = Spicetify.Topbar?.Button || Spicetify.Playbar.Button;
   new ButtonClass("YT Music Local", "download", openModal);
 })();
