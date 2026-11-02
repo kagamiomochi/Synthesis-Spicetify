@@ -1,0 +1,32 @@
+name: Update VERSION on tag
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  update-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update VERSION in synthesis-spotify.js
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          sed -i "s|/\* VERSION \*/ const VERSION = \"[^\"]*\";|/* VERSION */ const VERSION = \"${TAG}\";|" synthesis-spotify.js
+          cat synthesis-spotify.js | head -15
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add synthesis-spotify.js
+          git diff --cached --quiet || git commit -m "chore: update VERSION to ${GITHUB_REF#refs/tags/}"
+          git push

@@ -6,6 +6,19 @@
 (async function () {
   "use strict";
 
+  /* VERSION */ const VERSION = "v0.3.0";
+  (() => {
+    try {
+      for (const s of document.scripts) {
+        if (/\/\* VERSION \*\/ const VERSION = "v\d+\.\d+\.\d+";/.test(s.textContent)) {
+          const m = /\/\* VERSION \*\/ const VERSION = "([^"]+)";/.exec(s.textContent);
+          if (m) VERSION = m[1];
+          break;
+        }
+      }
+    } catch {}
+  })();
+
   // ===========================================================================
   // Part 1: Pure helpers (no Spicetify dependency, unit-testable in Node)
   // ===========================================================================
@@ -1126,14 +1139,29 @@
 
     const root = el(
       "div",
-      { style: { color: "var(--spice-text)" } },
+      { style: { color: "var(--spice-text)", position: "relative" } },
       el("div", { style: { display: "flex", gap: "8px" } }, input, searchButton),
       status,
       list,
       folderRow,
       folderHint,
       optionalRow("Piped:", pipedInput),
-      optionalRow("API key:", keyInput)
+      optionalRow("API key:", keyInput),
+      el(
+        "span",
+        {
+          style: {
+            position: "absolute",
+            bottom: "4px",
+            right: "8px",
+            fontSize: "10px",
+            opacity: "0.35",
+            pointerEvents: "none",
+            userSelect: "none",
+          },
+        },
+        VERSION
+      )
     );
 
     Spicetify.PopupModal.display({ title: "Synthesis-Spotify", content: root, isLarge: true });
