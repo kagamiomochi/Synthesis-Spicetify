@@ -6,7 +6,7 @@
 (async function () {
   "use strict";
 
-  /* VERSION */ const VERSION = "v0.3.0";
+  /* VERSION */ const VERSION = "v0.3.3";
   (() => {
     try {
       for (const s of document.scripts) {
