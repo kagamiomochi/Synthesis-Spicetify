@@ -1,6 +1,6 @@
 [
   {
-    "name": "YT Music Local",
+    "name": "Synthesis-Spotify",
     "description": "Search YouTube Music directly from Spotify and open tracks in YouTube Music. No server or yt-dlp required.",
     "preview": "preview.png",
     "main": "ytm-local.js",
