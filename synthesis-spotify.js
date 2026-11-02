@@ -1,7 +1,7 @@
-// NAME: YT Music Local
+// NAME: Synthesis-Spotify
 // AUTHOR: kagamiomochi
 // DESCRIPTION: Search YouTube Music from Spotify, save tracks as MP3 local files and play them inside Spotify. No local server required.
-// SOURCE: https://github.com/kagamiomochi/YT-Music-Local
+// SOURCE: https://github.com/kagamiomochi/Synthesis-Spotify
 
 (async function () {
   "use strict";
@@ -29,9 +29,9 @@
     },
   };
 
-  const API_KEY_STORAGE = "ytmLocalApiKey";
-  const PIPED_URL_STORAGE = "ytmLocalPipedUrl";
-  const PIPED_LAST_GOOD_STORAGE = "ytmLocalPipedLast";
+  const API_KEY_STORAGE = "synthesisSpotifyApiKey";
+  const PIPED_URL_STORAGE = "synthesisSpotifyPipedUrl";
+  const PIPED_LAST_GOOD_STORAGE = "synthesisSpotifyPipedLast";
 
   const MP3_KBPS = 192;
   const MP3_SAMPLE_RATE = 44100;
@@ -380,7 +380,7 @@
         const vd = await vr.json();
         for (const v of vd.items || []) durations[v.id] = parseIsoDuration(v.contentDetails?.duration);
       } catch (e) {
-        console.warn("[ytm-local] duration lookup failed", e);
+        console.warn("[synthesis-spotify] duration lookup failed", e);
       }
     }
     return items.map((i) => ({
@@ -551,7 +551,7 @@
 
   function idbOpen() {
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open("ytm-local", 1);
+      const req = indexedDB.open("synthesis-spotify", 1);
       req.onupgradeneeded = () => req.result.createObjectStore("kv");
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
@@ -581,7 +581,7 @@
         tx.onerror = () => reject(tx.error);
       });
     } catch (e) {
-      console.warn("[ytm-local] could not persist folder handle", e);
+      console.warn("[synthesis-spotify] could not persist folder handle", e);
     }
   }
 
@@ -602,12 +602,12 @@
           if (perm !== "granted") perm = await saved.requestPermission({ mode: "readwrite" });
           if (perm === "granted") return saved;
         } catch (e) {
-          console.warn("[ytm-local] saved folder is not usable, asking again", e);
+          console.warn("[synthesis-spotify] saved folder is not usable, asking again", e);
         }
       }
     }
 
-    const handle = await window.showDirectoryPicker({ id: "ytm-local", mode: "readwrite", startIn: "music" });
+    const handle = await window.showDirectoryPicker({ id: "synthesis-spotify", mode: "readwrite", startIn: "music" });
     await idbSet("dir", handle);
     return handle;
   }
@@ -769,7 +769,7 @@
           return { audio, info };
         } catch (e) {
           lastError = e;
-          console.warn("[ytm-local] stream failed", stream.mimeType, e);
+          console.warn("[synthesis-spotify] stream failed", stream.mimeType, e);
         }
       }
     }
@@ -834,7 +834,7 @@
         const hit = matchLocalTrack(await api.getTracks(), meta);
         if (hit) return hit;
       } catch (e) {
-        console.warn("[ytm-local] LocalFilesAPI.getTracks failed", e);
+        console.warn("[synthesis-spotify] LocalFilesAPI.getTracks failed", e);
       }
       if (Date.now() >= deadline) return null;
       await sleep(1500);
@@ -920,7 +920,7 @@
         }
         setLabel("Play");
       } catch (e) {
-        console.error("[ytm-local] download failed", e);
+        console.error("[synthesis-spotify] download failed", e);
         setLabel("Retry");
         const message = `Download failed: ${e?.message || e}`;
         dlButton.title = message;
@@ -1136,7 +1136,7 @@
       optionalRow("API key:", keyInput)
     );
 
-    Spicetify.PopupModal.display({ title: "YT Music Local", content: root, isLarge: true });
+    Spicetify.PopupModal.display({ title: "Synthesis-Spotify", content: root, isLarge: true });
     setTimeout(() => input.focus(), 100);
   }
 
@@ -1144,7 +1144,7 @@
   // Integration with Spotify's search page
   // ---------------------------------------------------------------------------
 
-  const SEARCH_SECTION_ID = "ytm-local-search-section";
+  const SEARCH_SECTION_ID = "synthesis-spotify-search-section";
   const SEARCH_DEBOUNCE_MS = 700;
   const SEARCH_VISIBLE_ROWS = 5;
   const searchState = { query: "", token: 0, timer: null };
@@ -1269,5 +1269,5 @@
   onSearchRouteChange();
 
   const ButtonClass = Spicetify.Topbar?.Button || Spicetify.Playbar.Button;
-  new ButtonClass("YT Music Local", "download", openModal);
+  new ButtonClass("Synthesis-Spotify", "download", openModal);
 })();

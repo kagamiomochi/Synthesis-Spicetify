@@ -3,10 +3,13 @@
     "name": "Synthesis-Spotify",
     "description": "Search YouTube Music directly from Spotify and open tracks in YouTube Music. No server or yt-dlp required.",
     "preview": "preview.png",
-    "main": "ytm-local.js",
+    "main": "synthesis-spotify.js",
     "readme": "README.md",
     "authors": [
-      { "name": "kagamiomochi", "url": "https://github.com/kagamiomochi" }
+      {
+        "name": "kagamiomochi",
+        "url": "https://github.com/kagamiomochi"
+      }
     ],
     "tags": ["search", "youtube-music", "youtube"]
   }

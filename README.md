@@ -22,18 +22,18 @@ Search YouTube Music directly from Spotify and open tracks in YouTube Music — 
 
 ### Manual installation
 
-1. Copy `ytm-local.js` to your Spicetify Extensions folder:
+1. Copy `synthesis-spotify.js` to your Spicetify Extensions folder:
    ```bash
    # Linux
-   cp ytm-local.js ~/.config/spicetify/Extensions/
+   cp synthesis-spotify.js ~/.config/spicetify/Extensions/
    # macOS
-   cp ytm-local.js ~/Library/Application Support/spicetify/Extensions/
+   cp synthesis-spotify.js ~/Library/Application Support/spicetify/Extensions/
    # Windows
-   copy ytm-local.js %APPDATA%\spicetify\Extensions\
+   copy synthesis-spotify.js %APPDATA%\spicetify\Extensions\
    ```
 2. Register the extension:
    ```bash
-   spicetify config extensions ytm-local.js
+   spicetify config extensions synthesis-spotify.js
    spicetify apply
    ```
 

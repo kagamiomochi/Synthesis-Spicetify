@@ -2,7 +2,7 @@
 
 // YT Music Local — LEGACY: helper server + Spicetify extension in a single file.
 //
-// NOTE: Version 2.0+ is self-contained. See ytm-local.js and manifest.json.
+// NOTE: Version 2.0+ is self-contained. See synthesis-spotify.js and manifest.json.
 // The self-contained extension searches YouTube Music directly (no server needed)
 // and opens tracks in YouTube Music. No yt-dlp or ffmpeg required.
 //
@@ -922,7 +922,7 @@ async function startServer() {
   });
   watchIdle(server);
   const onListening = () => {
-    console.log(`ytm-local server: http://${HOST}:${PORT}`);
+    console.log(`synthesis-spotify server: http://${HOST}:${PORT}`);
     console.log(`download dir: ${MUSIC_DIR}`);
   };
   if (SOCKET_ACTIVATED) {
@@ -957,7 +957,7 @@ async function getExtensionsDir() {
 async function installExtension() {
   // When installed from server.js --install, prefer the legacy extension
   // (built from ytmLocalExtension) because it includes download support
-  // that requires the helper server.  The self-contained version (ytm-local.js)
+  // that requires the helper server.  The self-contained version (synthesis-spotify.js)
   // is installed instead when called manually (e.g. from the Spicetify
   // Marketplace) so that users get the modern, zero-dependency mode.
   const installLegacy = process.argv.includes("--install");
@@ -993,7 +993,7 @@ async function installExtension() {
 
   // Default (called directly or from Marketplace): install the self-contained
   // V2 extension (no server, no yt-dlp, no ffmpeg).
-  const selfContainedFile = "ytm-local.js";
+  const selfContainedFile = "synthesis-spotify.js";
   const selfContainedPath = __filename.replace(/server\.js$/, selfContainedFile);
 
   if (fs.existsSync(selfContainedPath)) {
@@ -1145,7 +1145,7 @@ async function installLaunchAgent() {
     "LaunchAgents",
     `${LAUNCHD_LABEL}.plist`
   );
-  const logPath = path.join(os.homedir(), "Library", "Logs", "ytm-local.log");
+  const logPath = path.join(os.homedir(), "Library", "Logs", "synthesis-spotify.log");
 
   // launchd gives agents a minimal PATH, so pass the current PATH to find
   // yt-dlp / ffmpeg (for example the ones installed by Homebrew).
