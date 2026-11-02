@@ -1,6 +1,6 @@
-# YT Music Local
+# Synthesis-Spotify
 
-[![Latest Tag](https://img.shields.io/github/v/tag/kagamiomochi/YT-Music-Local?sort=semver)](https://github.com/kagamiomochi/YT-Music-Local/tags)
+[![Latest Tag](https://img.shields.io/github/v/tag/kagamiomochi/Synthesis-Spotify?sort=semver)](https://github.com/kagamiomochi/Synthesis-Spotify/tags)
 
 Search YouTube Music directly from Spotify and open tracks in YouTube Music — no server, no yt-dlp, no ffmpeg required.
 
@@ -17,7 +17,7 @@ Search YouTube Music directly from Spotify and open tracks in YouTube Music — 
 ### Via Spicetify Marketplace (recommended)
 
 1. Open Spotify and go to the **Marketplace** tab
-2. Search for **YT Music Local**
+2. Search for **Synthesis-Spotify**
 3. Click **Install**
 
 ### Manual installation
@@ -39,7 +39,7 @@ Search YouTube Music directly from Spotify and open tracks in YouTube Music — 
 
 ## Usage
 
-1. Click the **"YT Music Local"** button in the top bar, or
+1. Click the **"Synthesis-Spotify"** button in the top bar, or
 2. Type a query in Spotify's built-in search bar to see YouTube Music results inline
 
 Click the **"▶ Open"** button next to any track to open it in YouTube Music.
