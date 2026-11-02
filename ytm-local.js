@@ -1,10 +1,6 @@
 // NAME: YT Music Local
 // AUTHOR: kagamiomochi
-<<<<<<< Updated upstream
-// DESCRIPTION: Search YouTube from Spotify (YouTube Data API key or public Invidious instances) and open tracks in YouTube Music. No server required.
-=======
 // DESCRIPTION: Search YouTube Music from Spotify, save tracks as MP3 local files and play them inside Spotify. No local server required.
->>>>>>> Stashed changes
 // SOURCE: https://github.com/kagamiomochi/YT-Music-Local
 
 (async function () {
