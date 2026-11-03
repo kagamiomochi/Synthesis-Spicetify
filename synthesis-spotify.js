@@ -269,6 +269,15 @@
     return /^https:\/\/[A-Za-z0-9.-]+(:\d+)?(\/[^\s]*)?$/.test(u) ? u : null;
   }
 
+  // "https://pipedapi.example.com/x" -> "pipedapi.example.com"
+  function hostOf(url) {
+    try {
+      return new URL(url).host;
+    } catch {
+      return String(url);
+    }
+  }
+
   async function fetchWithTimeout(url, { signal, timeout = 7000 } = {}) {
     const ctrl = new AbortController();
     const onAbort = () => ctrl.abort();
@@ -398,12 +407,13 @@
 
   async function searchWithPiped(query) {
     const q = encodeURIComponent(query);
-    const { value } = await withPiped((base, signal) =>
+    const { base, value } = await withPiped((base, signal) =>
       fetchJson(`${base}/search?q=${q}&filter=music_songs`, { signal, timeout: SEARCH_TIMEOUT_MS })
     );
+    const source = `Piped (${hostOf(base)})`;
     const items = (value?.items || []).map(mapPipedSearchItem).filter(Boolean);
     if (!items.length) throw new Error("no results");
-    return items.slice(0, 15);
+    return items.slice(0, 15).map((it) => ({ ...it, source }));
   }
 
   function rankAudioStreams(data) {
@@ -455,6 +465,7 @@
       }
     }
     return items.map((i) => ({
+      source: "YouTube Data API",
       type: "song",
       videoId: i.id.videoId,
       title: decodeHtml(i.snippet?.title || ""),
@@ -480,6 +491,7 @@
       // Ask all instances at once; the first valid answer wins.
       return await Promise.any(
         invidiousInstances.map(async (base) => {
+          const source = `Invidious (${hostOf(base)})`;
           const data = await fetchJson(`${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video`, {
             timeout: SEARCH_TIMEOUT_MS,
           });
@@ -488,6 +500,7 @@
             .filter((v) => v?.videoId)
             .slice(0, 10)
             .map((v) => ({
+              source,
               type: "song",
               videoId: v.videoId,
               title: v.title || "",
@@ -1077,6 +1090,14 @@
     );
   }
 
+  // "5 results found. (via Invidious (host))" - tells where the results came from.
+  function describeResults(items, cached = false) {
+    const n = items.length;
+    const source = items[0]?.source;
+    const via = source ? ` (via ${source}${cached ? ", cached" : ""})` : "";
+    return `${n} result${n !== 1 ? "s" : ""} found.${via}`;
+  }
+
   function renderResults(listEl, items, status, limit = Infinity) {
     listEl.replaceChildren();
     if (!items.length) {
@@ -1096,10 +1117,11 @@
 
   async function resolveUrlItem(videoId) {
     try {
-      const { value } = await withPiped((base, signal) =>
+      const { base, value } = await withPiped((base, signal) =>
         fetchJson(`${base}/streams/${videoId}`, { signal, timeout: 12000 })
       );
       return {
+        source: `Piped (${hostOf(base)})`,
         type: "song",
         videoId,
         title: value?.title || videoId,
@@ -1150,8 +1172,17 @@
       list.replaceChildren();
       try {
         const videoId = extractVideoId(query);
-        const results = videoId ? [await resolveUrlItem(videoId)] : await ytmSearch(query);
-        status.textContent = `${results.length} result${results.length !== 1 ? "s" : ""} found.`;
+        const cachedResults = videoId ? null : searchCache.get(query);
+        let results;
+        if (videoId) {
+          results = [await resolveUrlItem(videoId)];
+        } else if (cachedResults) {
+          results = cachedResults;
+        } else {
+          results = await ytmSearch(query);
+          searchCache.set(query, results);
+        }
+        status.textContent = describeResults(results, Boolean(cachedResults));
         renderResults(list, results, status);
       } catch (e) {
         status.textContent = `Error: ${e.message}`;
@@ -1346,12 +1377,13 @@
   async function runSearchPageQuery(query, token, signal) {
     try {
       let items = searchCache.get(query);
+      const cached = Boolean(items);
       if (!items) {
         items = await ytmSearch(query, { signal });
         searchCache.set(query, items);
       }
       if (token !== searchState.token || !mountSearchSection()) return;
-      searchSection.status.textContent = `${items.length} result${items.length !== 1 ? "s" : ""} found.`;
+      searchSection.status.textContent = describeResults(items, cached);
       showSearchResults(items);
     } catch (e) {
       if (token !== searchState.token || !mountSearchSection()) return;
