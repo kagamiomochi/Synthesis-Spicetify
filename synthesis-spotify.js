@@ -45,6 +45,13 @@
   const API_KEY_STORAGE = "synthesisSpotifyApiKey";
   const PIPED_URL_STORAGE = "synthesisSpotifyPipedUrl";
   const PIPED_LAST_GOOD_STORAGE = "synthesisSpotifyPipedLast";
+  const PIPED_REGISTRY_STORAGE = "synthesisSpotifyPipedRegistry";
+
+  // Search latency tuning.
+  const PIPED_REGISTRY_TTL_MS = 6 * 60 * 60 * 1000; // Re-fetch the instance registry at most every 6 hours.
+  const SEARCH_TIMEOUT_MS = 3500; // Per-instance timeout for search requests.
+  const INSTANCE_COOLDOWN_MS = 5 * 60 * 1000; // Skip an instance for this long after it failed.
+  const HEDGE_STEP_MS = 1500; // Each later backend joins the race this much after the previous one.
 
   const MP3_KBPS = 192;
   const MP3_SAMPLE_RATE = 44100;
@@ -281,18 +288,45 @@
     return res.json();
   }
 
+  function readRegistryCache() {
+    try {
+      const cached = JSON.parse(store.get(PIPED_REGISTRY_STORAGE) || "null");
+      if (!Array.isArray(cached?.list)) return { list: [], fresh: false };
+      return {
+        list: cached.list.map(normalizeBase).filter(Boolean),
+        fresh: Date.now() - Number(cached.at) < PIPED_REGISTRY_TTL_MS,
+      };
+    } catch {
+      return { list: [], fresh: false };
+    }
+  }
+
+  // Refresh the public instance registry in the background. A search never waits for it.
+  let registryRefresh = null;
+  function refreshPipedRegistry() {
+    if (registryRefresh) return registryRefresh;
+    registryRefresh = (async () => {
+      try {
+        const data = await fetchJson(PIPED_LIST_URL, { timeout: 5000 });
+        if (!Array.isArray(data)) return;
+        const list = data.map((i) => normalizeBase(i?.api_url)).filter(Boolean);
+        if (!list.length) return;
+        store.set(PIPED_REGISTRY_STORAGE, JSON.stringify({ at: Date.now(), list }));
+        pipedList = null; // Rebuild with the fresh registry on the next call.
+      } catch {
+        // The registry is optional; cached and built-in instances are used instead.
+      }
+    })();
+    return registryRefresh;
+  }
+
   async function getPipedInstances() {
     if (pipedList) return pipedList;
-    let dynamic = [];
-    try {
-      const data = await fetchJson(PIPED_LIST_URL, { timeout: 5000 });
-      if (Array.isArray(data)) dynamic = data.map((i) => normalizeBase(i?.api_url)).filter(Boolean);
-    } catch {
-      // The registry is optional; the built-in list is used instead.
-    }
+    const { list: cached, fresh } = readRegistryCache();
+    if (!fresh) refreshPipedRegistry();
     const custom = normalizeBase(store.get(PIPED_URL_STORAGE));
     const lastGood = normalizeBase(store.get(PIPED_LAST_GOOD_STORAGE));
-    pipedList = [...new Set([custom, lastGood, ...dynamic, ...PIPED_FALLBACK].filter(Boolean))];
+    pipedList = [...new Set([custom, lastGood, ...cached, ...PIPED_FALLBACK].filter(Boolean))];
     return pipedList;
   }
 
@@ -300,22 +334,46 @@
     pipedList = null;
   }
 
+  // Instances that failed recently are skipped so that dead ones do not slow down every search.
+  const deadUntil = new Map();
+  const isCoolingDown = (base) => (deadUntil.get(base) || 0) > Date.now();
+  // A 4xx (except 429) means the instance is alive and only rejected this request.
+  const isInstanceFault = (e) => !/^HTTP 4\d\d$/.test(e?.message || "") || e.message === "HTTP 429";
+
   /**
-   * Run fn(base, signal) against Piped instances, three at a time (first success wins).
-   * Instances in `exclude` are skipped. Returns { base, value }.
+   * Run fn(base, signal) against Piped instances, four at a time (first success wins).
+   * Instances in `exclude` and instances that failed recently are skipped. Returns { base, value }.
    */
-  async function withPiped(fn, { exclude = new Set(), batch = 3, maxTried = 9 } = {}) {
-    const all = (await getPipedInstances()).filter((b) => !exclude.has(b)).slice(0, maxTried);
+  async function withPiped(fn, { exclude = new Set(), batch = 4, maxTried = 8 } = {}) {
+    const candidates = (await getPipedInstances()).filter((b) => !exclude.has(b));
+    const alive = candidates.filter((b) => !isCoolingDown(b));
+    // If everything is cooling down, try them anyway instead of failing outright.
+    const all = (alive.length ? alive : candidates).slice(0, maxTried);
     let lastError = null;
     for (let i = 0; i < all.length; i += batch) {
       const group = all.slice(i, i + batch);
       const ctrl = new AbortController();
       try {
         const winner = await Promise.any(
-          group.map(async (base) => ({ base, value: await fn(base, ctrl.signal) }))
+          group.map(async (base) => {
+            try {
+              const value = await fn(base, ctrl.signal);
+              deadUntil.delete(base);
+              return { base, value };
+            } catch (e) {
+              // Do not blame an instance that was only aborted because another one won.
+              if (!ctrl.signal.aborted && isInstanceFault(e)) {
+                deadUntil.set(base, Date.now() + INSTANCE_COOLDOWN_MS);
+              }
+              throw e;
+            }
+          })
         );
         ctrl.abort();
-        store.set(PIPED_LAST_GOOD_STORAGE, winner.base);
+        if (store.get(PIPED_LAST_GOOD_STORAGE) !== winner.base) {
+          store.set(PIPED_LAST_GOOD_STORAGE, winner.base);
+          pipedList = null; // Put the new last-good instance first next time.
+        }
         return winner;
       } catch (e) {
         lastError = e instanceof AggregateError ? e.errors[0] : e;
@@ -341,7 +399,7 @@
   async function searchWithPiped(query) {
     const q = encodeURIComponent(query);
     const { value } = await withPiped((base, signal) =>
-      fetchJson(`${base}/search?q=${q}&filter=music_songs`, { signal })
+      fetchJson(`${base}/search?q=${q}&filter=music_songs`, { signal, timeout: SEARCH_TIMEOUT_MS })
     );
     const items = (value?.items || []).map(mapPipedSearchItem).filter(Boolean);
     if (!items.length) throw new Error("no results");
@@ -376,7 +434,7 @@
       q: query,
       key,
     });
-    const res = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
+    const res = await fetchWithTimeout(`https://www.googleapis.com/youtube/v3/search?${params}`, { timeout: 6000 });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
 
@@ -389,7 +447,7 @@
           id: items.map((i) => i.id.videoId).join(","),
           key,
         });
-        const vr = await fetch(`https://www.googleapis.com/youtube/v3/videos?${vp}`);
+        const vr = await fetchWithTimeout(`https://www.googleapis.com/youtube/v3/videos?${vp}`, { timeout: 4000 });
         const vd = await vr.json();
         for (const v of vd.items || []) durations[v.id] = parseIsoDuration(v.contentDetails?.duration);
       } catch (e) {
@@ -412,64 +470,104 @@
 
   async function searchWithInvidious(query) {
     if (!invidiousInstances) {
-      const list = await fetchJson("https://api.invidious.io/instances.json?sort_by=health");
+      const list = await fetchJson("https://api.invidious.io/instances.json?sort_by=health", { timeout: 4000 });
       invidiousInstances = list
         .filter(([, i]) => i?.api === true && i?.cors === true && i?.type === "https")
         .map(([, i]) => String(i.uri).replace(/\/$/, ""))
         .slice(0, 3);
     }
-    let lastError = null;
-    for (const base of invidiousInstances) {
-      try {
-        const data = await fetchJson(`${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video`, {
-          timeout: 6000,
-        });
-        if (!Array.isArray(data)) throw new Error("unexpected response");
-        return data
-          .filter((v) => v?.videoId)
-          .slice(0, 10)
-          .map((v) => ({
-            type: "song",
-            videoId: v.videoId,
-            title: v.title || "",
-            artist: cleanArtist(v.author),
-            album: "",
-            duration: v.lengthSeconds || 0,
-            thumbnail: `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
-          }));
-      } catch (e) {
-        lastError = e;
-      }
+    try {
+      // Ask all instances at once; the first valid answer wins.
+      return await Promise.any(
+        invidiousInstances.map(async (base) => {
+          const data = await fetchJson(`${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video`, {
+            timeout: SEARCH_TIMEOUT_MS,
+          });
+          if (!Array.isArray(data)) throw new Error("unexpected response");
+          return data
+            .filter((v) => v?.videoId)
+            .slice(0, 10)
+            .map((v) => ({
+              type: "song",
+              videoId: v.videoId,
+              title: v.title || "",
+              artist: cleanArtist(v.author),
+              album: "",
+              duration: v.lengthSeconds || 0,
+              thumbnail: `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
+            }));
+        })
+      );
+    } catch (e) {
+      invidiousInstances = null;
+      throw e instanceof AggregateError ? e.errors[0] : e;
     }
-    invidiousInstances = null;
-    throw lastError || new Error("no Invidious instance responded");
   }
 
   /**
-   * Search YouTube. Order: Piped (YouTube Music songs filter) -> Data API (if key) -> Invidious.
+   * Run search backends as a hedged race. The first backend starts immediately; each later one
+   * starts after its delay, or at once when every earlier one has already failed. The first
+   * success wins. This keeps a dead or slow Piped pool from blocking the fallbacks.
+   * backends: { label, delay, run }[]
+   */
+  function raceBackends(backends, signal) {
+    return new Promise((resolve, reject) => {
+      const errors = [];
+      const timers = [];
+      const started = new Set();
+      let finished = false;
+      let failures = 0;
+
+      const finish = (fn, arg) => {
+        if (finished) return;
+        finished = true;
+        timers.forEach(clearTimeout);
+        fn(arg);
+      };
+
+      const start = (i) => {
+        if (finished || started.has(i)) return;
+        // The query is stale (the user kept typing): do not spend more requests or API quota on it.
+        if (signal?.aborted) return finish(reject, new Error("search cancelled"));
+        started.add(i);
+        backends[i].run().then(
+          (value) => finish(resolve, value),
+          (e) => {
+            if (finished) return;
+            errors.push(`${backends[i].label}: ${e.message}`);
+            if (++failures === backends.length) {
+              finish(reject, new Error(`Search failed. ${errors.join(" / ")}`));
+              return;
+            }
+            const next = backends.findIndex((_, idx) => !started.has(idx));
+            if (next !== -1) start(next);
+          }
+        );
+      };
+
+      backends.forEach((b, i) => {
+        if (i === 0) start(0);
+        else timers.push(setTimeout(() => start(i), b.delay));
+      });
+    });
+  }
+
+  /**
+   * Search YouTube. Order: YouTube Data API (only when a key is set) -> Invidious -> Piped.
+   * The first backend starts immediately; each later one joins after HEDGE_STEP_MS, or at once
+   * if every earlier one has failed. The first success wins.
    * Returns { type, videoId, title, artist, album, duration, thumbnail }[]
    */
-  async function ytmSearch(query) {
-    const errors = [];
-    try {
-      return await searchWithPiped(query);
-    } catch (e) {
-      errors.push(`Piped: ${e.message}`);
-    }
+  async function ytmSearch(query, { signal } = {}) {
+    const runs = [];
     const key = getApiKey();
-    if (key) {
-      try {
-        return await searchWithDataApi(query, key);
-      } catch (e) {
-        errors.push(`YouTube API: ${e.message}`);
-      }
-    }
-    try {
-      return await searchWithInvidious(query);
-    } catch (e) {
-      errors.push(`Invidious: ${e.message}`);
-    }
-    throw new Error(`Search failed. ${errors.join(" / ")}`);
+    if (key) runs.push({ label: "YouTube API", run: () => searchWithDataApi(query, key) });
+    runs.push({ label: "Invidious", run: () => searchWithInvidious(query) });
+    runs.push({ label: "Piped", run: () => searchWithPiped(query) });
+    return raceBackends(
+      runs.map((b, i) => ({ ...b, delay: i * HEDGE_STEP_MS })),
+      signal
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -527,6 +625,8 @@
       matchLocalTrack,
       resetPipedInstances,
       normalizeBase,
+      raceBackends,
+      ytmSearch,
     };
     return;
   }
@@ -1173,9 +1273,9 @@
   // ---------------------------------------------------------------------------
 
   const SEARCH_SECTION_ID = "synthesis-spotify-search-section";
-  const SEARCH_DEBOUNCE_MS = 700;
+  const SEARCH_DEBOUNCE_MS = 450;
   const SEARCH_VISIBLE_ROWS = 5;
-  const searchState = { query: "", token: 0, timer: null };
+  const searchState = { query: "", token: 0, timer: null, ctrl: null };
   let searchSection = null;
 
   function getSearchQuery() {
@@ -1243,11 +1343,11 @@
     }
   }
 
-  async function runSearchPageQuery(query, token) {
+  async function runSearchPageQuery(query, token, signal) {
     try {
       let items = searchCache.get(query);
       if (!items) {
-        items = await ytmSearch(query);
+        items = await ytmSearch(query, { signal });
         searchCache.set(query, items);
       }
       if (token !== searchState.token || !mountSearchSection()) return;
@@ -1267,6 +1367,7 @@
       clearTimeout(searchState.timer);
       searchState.query = "";
       searchState.token++;
+      searchState.ctrl?.abort();
       unmountSearchSection();
       return;
     }
@@ -1278,13 +1379,15 @@
     searchState.query = query;
     const token = ++searchState.token;
     clearTimeout(searchState.timer);
+    searchState.ctrl?.abort();
+    const { signal } = (searchState.ctrl = new AbortController());
     if (mountSearchSection()) {
       searchSection.list.replaceChildren();
       searchSection.moreButton.style.display = "none";
       searchSection.status.textContent = "Searching...";
     }
     const delay = searchCache.has(query) ? 0 : SEARCH_DEBOUNCE_MS;
-    searchState.timer = setTimeout(() => runSearchPageQuery(query, token), delay);
+    searchState.timer = setTimeout(() => runSearchPageQuery(query, token, signal), delay);
   }
 
   // ---------------------------------------------------------------------------
