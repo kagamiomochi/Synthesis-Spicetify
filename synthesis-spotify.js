@@ -43,7 +43,7 @@
 	// ---------------------------------------------------------------------
 	// Constants and configuration
 	// ---------------------------------------------------------------------
-	/* VERSION */ const VERSION = "0.0.0";
+	/* VERSION */ const VERSION = "v0.4.0";
 	const LIBCURL_URL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.5/libcurl_full.mjs";
 	const YTJS_URL = "https://cdn.jsdelivr.net/npm/youtubei.js@18.3.0/bundle/browser.js";
 	const CONFIG_KEY = "synthesis-spotify:config";
