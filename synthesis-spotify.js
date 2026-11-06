@@ -1,1436 +1,1338 @@
-// NAME: Synthesis-Spotify
+// NAME: Synthesis Spotify
 // AUTHOR: kagamiomochi
-// DESCRIPTION: Search YouTube Music from Spotify, save tracks as MP3 local files and play them inside Spotify. No local server required.
-// SOURCE: https://github.com/kagamiomochi/Synthesis-Spotify
-
-(async function () {
-  "use strict";
-
-  /* VERSION */ const VERSION = "v0.3.4";
-  (() => {
-    try {
-      for (const s of document.scripts) {
-        if (/\/\* VERSION \*\/ const VERSION = "v\d+\.\d+\.\d+";/.test(s.textContent)) {
-          const m = /\/\* VERSION \*\/ const VERSION = "([^"]+)";/.exec(s.textContent);
-          if (m) VERSION = m[1];
-          break;
-        }
-      }
-    } catch {}
-  })();
-
-  // ===========================================================================
-  // Part 1: Pure helpers (no Spicetify dependency, unit-testable in Node)
-  // ===========================================================================
-
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  const store = {
-    get(key) {
-      try {
-        return globalThis.Spicetify?.LocalStorage?.get(key) ?? null;
-      } catch {
-        return null;
-      }
-    },
-    set(key, value) {
-      try {
-        globalThis.Spicetify?.LocalStorage?.set(key, value);
-      } catch {
-        // Ignore storage errors.
-      }
-    },
-  };
-
-  const API_KEY_STORAGE = "synthesisSpotifyApiKey";
-  const PIPED_URL_STORAGE = "synthesisSpotifyPipedUrl";
-  const PIPED_LAST_GOOD_STORAGE = "synthesisSpotifyPipedLast";
-  const PIPED_REGISTRY_STORAGE = "synthesisSpotifyPipedRegistry";
-
-  // Search latency tuning.
-  const PIPED_REGISTRY_TTL_MS = 6 * 60 * 60 * 1000; // Re-fetch the instance registry at most every 6 hours.
-  const SEARCH_TIMEOUT_MS = 3500; // Per-instance timeout for search requests.
-  const INSTANCE_COOLDOWN_MS = 5 * 60 * 1000; // Skip an instance for this long after it failed.
-  const HEDGE_STEP_MS = 1500; // Each later backend joins the race this much after the previous one.
-
-  const MP3_KBPS = 192;
-  const MP3_SAMPLE_RATE = 44100;
-  const MAX_DURATION_SEC = 20 * 60;
-  const DEFAULT_ALBUM = "YouTube Music";
-  const LAME_URLS = [
-    "https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js",
-    "https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js",
-  ];
-
-  const YOUTUBE_ID_RE =
-    /(?:youtube\.com\/watch\?[^#&]*v=|youtu\.be\/|music\.youtube\.com\/watch\?[^#&]*v=)([A-Za-z0-9_-]{11})/;
-
-  function extractVideoId(input) {
-    const m = String(input).match(YOUTUBE_ID_RE);
-    return m ? m[1] : null;
-  }
-
-  // Piped returns relative paths such as "/watch?v=XXXXXXXXXXX".
-  function parseVideoIdFromPath(path) {
-    const m = /[?&]v=([A-Za-z0-9_-]{11})/.exec(String(path || ""));
-    return m ? m[1] : null;
-  }
-
-  // Auto-generated music channels are named "<Artist> - Topic".
-  const cleanArtist = (name) => String(name || "").replace(/ - Topic$/, "").trim();
-
-  function formatDuration(sec) {
-    if (!sec) return "";
-    const m = Math.floor(sec / 60);
-    const s = String(Math.floor(sec % 60)).padStart(2, "0");
-    return `${m}:${s}`;
-  }
-
-  function sanitizeFileName(name) {
-    return (
-      String(name)
-        // eslint-disable-next-line no-control-regex
-        .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
-        .replace(/\s+/g, " ")
-        .replace(/^\.+/, "")
-        .trim()
-        .slice(0, 120) || "track"
-    );
-  }
-
-  function buildFileName(item) {
-    const base = [item.artist, item.title].filter(Boolean).join(" - ") || item.videoId;
-    return `${sanitizeFileName(base)} [${item.videoId}].mp3`;
-  }
-
-  // "PT1H2M3S" -> seconds
-  function parseIsoDuration(iso) {
-    const m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso || "");
-    if (!m) return 0;
-    const [, d, h, min, sec] = m.map((x) => Number(x || 0));
-    return ((d * 24 + h) * 60 + min) * 60 + sec;
-  }
-
-  function decodeHtml(str) {
-    const t = document.createElement("textarea");
-    t.innerHTML = str;
-    return t.value;
-  }
-
-  // ---------------------------------------------------------------------------
-  // ID3v2.3 tag writer (UTF-16 text so that Japanese titles survive)
-  // ---------------------------------------------------------------------------
-
-  function concatBytes(parts) {
-    const total = parts.reduce((n, p) => n + p.length, 0);
-    const out = new Uint8Array(total);
-    let off = 0;
-    for (const p of parts) {
-      out.set(p, off);
-      off += p.length;
-    }
-    return out;
-  }
-
-  function latin1Bytes(str) {
-    const out = new Uint8Array(str.length);
-    for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xff;
-    return out;
-  }
-
-  function utf16leBytes(str) {
-    const out = new Uint8Array(str.length * 2);
-    for (let i = 0; i < str.length; i++) {
-      const c = str.charCodeAt(i);
-      out[i * 2] = c & 0xff;
-      out[i * 2 + 1] = c >> 8;
-    }
-    return out;
-  }
-
-  function detectImageMime(bytes) {
-    if (bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
-    if (bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e) return "image/png";
-    return null;
-  }
-
-  function id3Frame(id, payload) {
-    const head = new Uint8Array(10);
-    head.set(latin1Bytes(id), 0);
-    new DataView(head.buffer).setUint32(4, payload.length); // v2.3: plain big-endian size
-    return concatBytes([head, payload]);
-  }
-
-  function buildId3Tag({ title, artist, album, durationMs, cover }) {
-    const frames = [];
-    const text = (id, value) => {
-      if (!value) return;
-      frames.push(id3Frame(id, concatBytes([Uint8Array.of(0x01, 0xff, 0xfe), utf16leBytes(String(value))])));
-    };
-    text("TIT2", title);
-    text("TPE1", artist);
-    text("TPE2", artist);
-    text("TALB", album);
-    if (durationMs > 0) {
-      frames.push(id3Frame("TLEN", concatBytes([Uint8Array.of(0x00), latin1Bytes(String(Math.round(durationMs)))])));
-    }
-    if (cover?.bytes?.length) {
-      const mime = detectImageMime(cover.bytes);
-      if (mime) {
-        frames.push(
-          id3Frame(
-            "APIC",
-            concatBytes([
-              Uint8Array.of(0x00),
-              latin1Bytes(mime),
-              Uint8Array.of(0x00, 0x03, 0x00), // end of mime, picture type 3 (front cover), empty description
-              cover.bytes,
-            ])
-          )
-        );
-      }
-    }
-    const body = concatBytes(frames);
-    const size = body.length;
-    const header = Uint8Array.of(
-      0x49, 0x44, 0x33, // "ID3"
-      0x03, 0x00, // version 2.3.0
-      0x00, // flags
-      (size >> 21) & 0x7f,
-      (size >> 14) & 0x7f,
-      (size >> 7) & 0x7f,
-      size & 0x7f // syncsafe size
-    );
-    return concatBytes([header, body]);
-  }
-
-  // ---------------------------------------------------------------------------
-  // MP3 encoding (lamejs, loaded lazily). Works in slices so the UI stays alive.
-  // ---------------------------------------------------------------------------
-
-  async function encodeMp3(audio, lame, { kbps = MP3_KBPS, onProgress } = {}) {
-    const channels = Math.min(audio.numberOfChannels, 2);
-    const encoder = new lame.Mp3Encoder(channels, audio.sampleRate, kbps);
-    const left = audio.getChannelData(0);
-    const right = channels === 2 ? audio.getChannelData(1) : null;
-    const total = left.length;
-    const SLICE = 1152 * 64;
-    const out = [];
-
-    const toInt16 = (src, start, end) => {
-      const buf = new Int16Array(end - start);
-      for (let i = start, j = 0; i < end; i++, j++) {
-        const s = Math.max(-1, Math.min(1, src[i]));
-        buf[j] = s < 0 ? s * 0x8000 : s * 0x7fff;
-      }
-      return buf;
-    };
-
-    for (let pos = 0; pos < total; pos += SLICE) {
-      const end = Math.min(total, pos + SLICE);
-      const l = toInt16(left, pos, end);
-      const chunk = right ? encoder.encodeBuffer(l, toInt16(right, pos, end)) : encoder.encodeBuffer(l);
-      if (chunk.length) out.push(new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)));
-      onProgress?.(end / total);
-      await sleep(0);
-    }
-    const tail = encoder.flush();
-    if (tail.length) out.push(new Uint8Array(tail.buffer.slice(tail.byteOffset, tail.byteOffset + tail.byteLength)));
-    return out;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Piped client (public instances, CORS enabled, no local server needed)
-  // ---------------------------------------------------------------------------
-
-  const PIPED_LIST_URL = "https://piped-instances.kavin.rocks/";
-  const PIPED_FALLBACK = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.leptons.xyz",
-    "https://pipedapi.nosebs.ru",
-    "https://pipedapi-libre.kavin.rocks",
-    "https://piped-api.privacy.com.de",
-    "https://pipedapi.adminforge.de",
-    "https://api.piped.yt",
-    "https://pipedapi.drgns.space",
-    "https://pipedapi.owo.si",
-    "https://pipedapi.ducks.party",
-    "https://piped-api.codespace.cz",
-    "https://pipedapi.reallyaweso.me",
-    "https://api.piped.private.coffee",
-    "https://pipedapi.darkness.services",
-    "https://pipedapi.orangenet.cc",
-  ];
-
-  let pipedList = null;
-
-  function normalizeBase(url) {
-    const u = String(url || "").trim().replace(/\/+$/, "");
-    return /^https:\/\/[A-Za-z0-9.-]+(:\d+)?(\/[^\s]*)?$/.test(u) ? u : null;
-  }
-
-  // "https://pipedapi.example.com/x" -> "pipedapi.example.com"
-  function hostOf(url) {
-    try {
-      return new URL(url).host;
-    } catch {
-      return String(url);
-    }
-  }
-
-  async function fetchWithTimeout(url, { signal, timeout = 7000 } = {}) {
-    const ctrl = new AbortController();
-    const onAbort = () => ctrl.abort();
-    signal?.addEventListener("abort", onAbort);
-    const timer = setTimeout(() => ctrl.abort(), timeout);
-    try {
-      return await fetch(url, { signal: ctrl.signal });
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-    }
-  }
-
-  async function fetchJson(url, opts) {
-    const res = await fetchWithTimeout(url, opts);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
-  }
-
-  function readRegistryCache() {
-    try {
-      const cached = JSON.parse(store.get(PIPED_REGISTRY_STORAGE) || "null");
-      if (!Array.isArray(cached?.list)) return { list: [], fresh: false };
-      return {
-        list: cached.list.map(normalizeBase).filter(Boolean),
-        fresh: Date.now() - Number(cached.at) < PIPED_REGISTRY_TTL_MS,
-      };
-    } catch {
-      return { list: [], fresh: false };
-    }
-  }
-
-  // Refresh the public instance registry in the background. A search never waits for it.
-  let registryRefresh = null;
-  function refreshPipedRegistry() {
-    if (registryRefresh) return registryRefresh;
-    registryRefresh = (async () => {
-      try {
-        const data = await fetchJson(PIPED_LIST_URL, { timeout: 5000 });
-        if (!Array.isArray(data)) return;
-        const list = data.map((i) => normalizeBase(i?.api_url)).filter(Boolean);
-        if (!list.length) return;
-        store.set(PIPED_REGISTRY_STORAGE, JSON.stringify({ at: Date.now(), list }));
-        pipedList = null; // Rebuild with the fresh registry on the next call.
-      } catch {
-        // The registry is optional; cached and built-in instances are used instead.
-      }
-    })();
-    return registryRefresh;
-  }
-
-  async function getPipedInstances() {
-    if (pipedList) return pipedList;
-    const { list: cached, fresh } = readRegistryCache();
-    if (!fresh) refreshPipedRegistry();
-    const custom = normalizeBase(store.get(PIPED_URL_STORAGE));
-    const lastGood = normalizeBase(store.get(PIPED_LAST_GOOD_STORAGE));
-    pipedList = [...new Set([custom, lastGood, ...cached, ...PIPED_FALLBACK].filter(Boolean))];
-    return pipedList;
-  }
-
-  function resetPipedInstances() {
-    pipedList = null;
-  }
-
-  // Instances that failed recently are skipped so that dead ones do not slow down every search.
-  const deadUntil = new Map();
-  const isCoolingDown = (base) => (deadUntil.get(base) || 0) > Date.now();
-  // A 4xx (except 429) means the instance is alive and only rejected this request.
-  const isInstanceFault = (e) => !/^HTTP 4\d\d$/.test(e?.message || "") || e.message === "HTTP 429";
-
-  /**
-   * Run fn(base, signal) against Piped instances, four at a time (first success wins).
-   * Instances in `exclude` and instances that failed recently are skipped. Returns { base, value }.
-   */
-  async function withPiped(fn, { exclude = new Set(), batch = 4, maxTried = 8 } = {}) {
-    const candidates = (await getPipedInstances()).filter((b) => !exclude.has(b));
-    const alive = candidates.filter((b) => !isCoolingDown(b));
-    // If everything is cooling down, try them anyway instead of failing outright.
-    const all = (alive.length ? alive : candidates).slice(0, maxTried);
-    let lastError = null;
-    for (let i = 0; i < all.length; i += batch) {
-      const group = all.slice(i, i + batch);
-      const ctrl = new AbortController();
-      try {
-        const winner = await Promise.any(
-          group.map(async (base) => {
-            try {
-              const value = await fn(base, ctrl.signal);
-              deadUntil.delete(base);
-              return { base, value };
-            } catch (e) {
-              // Do not blame an instance that was only aborted because another one won.
-              if (!ctrl.signal.aborted && isInstanceFault(e)) {
-                deadUntil.set(base, Date.now() + INSTANCE_COOLDOWN_MS);
-              }
-              throw e;
-            }
-          })
-        );
-        ctrl.abort();
-        if (store.get(PIPED_LAST_GOOD_STORAGE) !== winner.base) {
-          store.set(PIPED_LAST_GOOD_STORAGE, winner.base);
-          pipedList = null; // Put the new last-good instance first next time.
-        }
-        return winner;
-      } catch (e) {
-        lastError = e instanceof AggregateError ? e.errors[0] : e;
-      }
-    }
-    throw new Error(`No Piped instance responded${lastError ? ` (${lastError.message})` : ""}`);
-  }
-
-  function mapPipedSearchItem(it) {
-    const videoId = parseVideoIdFromPath(it?.url);
-    if (!videoId || (it.type && it.type !== "stream")) return null;
-    return {
-      type: "song",
-      videoId,
-      title: it.title || "",
-      artist: cleanArtist(it.uploaderName),
-      album: "",
-      duration: it.duration > 0 ? it.duration : 0,
-      thumbnail: it.thumbnail || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
-    };
-  }
-
-  async function searchWithPiped(query) {
-    const q = encodeURIComponent(query);
-    const { base, value } = await withPiped((base, signal) =>
-      fetchJson(`${base}/search?q=${q}&filter=music_songs`, { signal, timeout: SEARCH_TIMEOUT_MS })
-    );
-    const source = `Piped (${hostOf(base)})`;
-    const items = (value?.items || []).map(mapPipedSearchItem).filter(Boolean);
-    if (!items.length) throw new Error("no results");
-    return items.slice(0, 15).map((it) => ({ ...it, source }));
-  }
-
-  function rankAudioStreams(data) {
-    const list = (data?.audioStreams || []).filter((s) => s?.url && !s.videoOnly);
-    const score = (s) => {
-      const mime = String(s.mimeType || "").toLowerCase();
-      // Opus/WebM first: it decodes in Spotify's Chromium build without proprietary codecs.
-      let sc = mime.includes("webm") || mime.includes("opus") ? 2_000_000 : 0;
-      const track = String(s.audioTrackType || "").toLowerCase();
-      if (track && !track.includes("original")) sc -= 1_000_000;
-      return sc + (Number(s.bitrate) || 0);
-    };
-    return list.sort((a, b) => score(b) - score(a));
-  }
-
-  // ---------------------------------------------------------------------------
-  // Fallback search backends (kept from the previous version)
-  // ---------------------------------------------------------------------------
-
-  const getApiKey = () => (store.get(API_KEY_STORAGE) || "").trim();
-
-  async function searchWithDataApi(query, key) {
-    const params = new URLSearchParams({
-      part: "snippet",
-      type: "video",
-      videoCategoryId: "10",
-      maxResults: "10",
-      q: query,
-      key,
-    });
-    const res = await fetchWithTimeout(`https://www.googleapis.com/youtube/v3/search?${params}`, { timeout: 6000 });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
-
-    const items = (data.items || []).filter((i) => i?.id?.videoId);
-    const durations = {};
-    if (items.length) {
-      try {
-        const vp = new URLSearchParams({
-          part: "contentDetails",
-          id: items.map((i) => i.id.videoId).join(","),
-          key,
-        });
-        const vr = await fetchWithTimeout(`https://www.googleapis.com/youtube/v3/videos?${vp}`, { timeout: 4000 });
-        const vd = await vr.json();
-        for (const v of vd.items || []) durations[v.id] = parseIsoDuration(v.contentDetails?.duration);
-      } catch (e) {
-        console.warn("[synthesis-spotify] duration lookup failed", e);
-      }
-    }
-    return items.map((i) => ({
-      source: "YouTube Data API",
-      type: "song",
-      videoId: i.id.videoId,
-      title: decodeHtml(i.snippet?.title || ""),
-      artist: cleanArtist(decodeHtml(i.snippet?.channelTitle || "")),
-      album: "",
-      duration: durations[i.id.videoId] || 0,
-      thumbnail:
-        i.snippet?.thumbnails?.medium?.url || `https://i.ytimg.com/vi/${i.id.videoId}/mqdefault.jpg`,
-    }));
-  }
-
-  let invidiousInstances = null;
-
-  async function searchWithInvidious(query) {
-    if (!invidiousInstances) {
-      const list = await fetchJson("https://api.invidious.io/instances.json?sort_by=health", { timeout: 4000 });
-      invidiousInstances = list
-        .filter(([, i]) => i?.api === true && i?.cors === true && i?.type === "https")
-        .map(([, i]) => String(i.uri).replace(/\/$/, ""))
-        .slice(0, 3);
-    }
-    try {
-      // Ask all instances at once; the first valid answer wins.
-      return await Promise.any(
-        invidiousInstances.map(async (base) => {
-          const source = `Invidious (${hostOf(base)})`;
-          const data = await fetchJson(`${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video`, {
-            timeout: SEARCH_TIMEOUT_MS,
-          });
-          if (!Array.isArray(data)) throw new Error("unexpected response");
-          return data
-            .filter((v) => v?.videoId)
-            .slice(0, 10)
-            .map((v) => ({
-              source,
-              type: "song",
-              videoId: v.videoId,
-              title: v.title || "",
-              artist: cleanArtist(v.author),
-              album: "",
-              duration: v.lengthSeconds || 0,
-              thumbnail: `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
-            }));
-        })
-      );
-    } catch (e) {
-      invidiousInstances = null;
-      throw e instanceof AggregateError ? e.errors[0] : e;
-    }
-  }
-
-  /**
-   * Run search backends as a hedged race. The first backend starts immediately; each later one
-   * starts after its delay, or at once when every earlier one has already failed. The first
-   * success wins. This keeps a dead or slow Piped pool from blocking the fallbacks.
-   * backends: { label, delay, run }[]
-   */
-  function raceBackends(backends, signal) {
-    return new Promise((resolve, reject) => {
-      const errors = [];
-      const timers = [];
-      const started = new Set();
-      let finished = false;
-      let failures = 0;
-
-      const finish = (fn, arg) => {
-        if (finished) return;
-        finished = true;
-        timers.forEach(clearTimeout);
-        fn(arg);
-      };
-
-      const start = (i) => {
-        if (finished || started.has(i)) return;
-        // The query is stale (the user kept typing): do not spend more requests or API quota on it.
-        if (signal?.aborted) return finish(reject, new Error("search cancelled"));
-        started.add(i);
-        backends[i].run().then(
-          (value) => finish(resolve, value),
-          (e) => {
-            if (finished) return;
-            errors.push(`${backends[i].label}: ${e.message}`);
-            if (++failures === backends.length) {
-              finish(reject, new Error(`Search failed. ${errors.join(" / ")}`));
-              return;
-            }
-            const next = backends.findIndex((_, idx) => !started.has(idx));
-            if (next !== -1) start(next);
-          }
-        );
-      };
-
-      backends.forEach((b, i) => {
-        if (i === 0) start(0);
-        else timers.push(setTimeout(() => start(i), b.delay));
-      });
-    });
-  }
-
-  /**
-   * Search YouTube. Order: YouTube Data API (only when a key is set) -> Invidious -> Piped.
-   * The first backend starts immediately; each later one joins after HEDGE_STEP_MS, or at once
-   * if every earlier one has failed. The first success wins.
-   * Returns { type, videoId, title, artist, album, duration, thumbnail }[]
-   */
-  async function ytmSearch(query, { signal } = {}) {
-    const runs = [];
-    const key = getApiKey();
-    if (key) runs.push({ label: "YouTube API", run: () => searchWithDataApi(query, key) });
-    runs.push({ label: "Invidious", run: () => searchWithInvidious(query) });
-    runs.push({ label: "Piped", run: () => searchWithPiped(query) });
-    return raceBackends(
-      runs.map((b, i) => ({ ...b, delay: i * HEDGE_STEP_MS })),
-      signal
-    );
-  }
-
-  // ---------------------------------------------------------------------------
-  // Spotify local file URI helpers
-  // ---------------------------------------------------------------------------
-
-  const normText = (s) => String(s || "").normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
-
-  // spotify:local:<artist>:<album>:<title>:<duration>
-  function parseLocalUri(uri) {
-    const parts = String(uri || "").split(":");
-    if (parts[0] !== "spotify" || parts[1] !== "local" || parts.length < 6) return null;
-    const dec = (s) => {
-      try {
-        return decodeURIComponent(s.replace(/\+/g, " "));
-      } catch {
-        return s;
-      }
-    };
-    return {
-      artist: dec(parts[2]),
-      album: dec(parts[3]),
-      title: dec(parts.slice(4, -1).join(":")),
-      duration: Number(parts[parts.length - 1]) || 0,
-    };
-  }
-
-  function matchLocalTrack(tracks, { title, artist }) {
-    const t = normText(title);
-    const a = normText(artist);
-    const titleHits = [];
-    for (const tr of tracks || []) {
-      const p = parseLocalUri(tr?.uri);
-      if (!p || normText(p.title) !== t) continue;
-      if (!a || normText(p.artist) === a) return tr;
-      titleHits.push(tr);
-    }
-    // Same title but a different artist string: accept only if it is unambiguous.
-    return titleHits.length === 1 ? titleHits[0] : null;
-  }
-
-  // Test hook: expose pure helpers and stop before touching Spicetify.
-  if (globalThis.__YTM_LOCAL_TEST__) {
-    globalThis.__YTM_LOCAL_TEST__.exports = {
-      extractVideoId,
-      parseVideoIdFromPath,
-      sanitizeFileName,
-      buildFileName,
-      buildId3Tag,
-      encodeMp3,
-      withPiped,
-      mapPipedSearchItem,
-      rankAudioStreams,
-      parseLocalUri,
-      matchLocalTrack,
-      resetPipedInstances,
-      normalizeBase,
-      raceBackends,
-      ytmSearch,
-    };
-    return;
-  }
-
-  // ===========================================================================
-  // Part 2: Spicetify-dependent code
-  // ===========================================================================
-
-  while (
-    !window.Spicetify ||
-    !Spicetify.PopupModal ||
-    !Spicetify.showNotification ||
-    !Spicetify.LocalStorage ||
-    !(Spicetify.Topbar?.Button || Spicetify.Playbar?.Button)
-  ) {
-    await sleep(300);
-  }
-
-  function el(tag, props = {}, ...children) {
-    const node = document.createElement(tag);
-    const { style, ...rest } = props;
-    Object.assign(node, rest);
-    if (style) Object.assign(node.style, style);
-    for (const c of children) {
-      node.append(c instanceof Node ? c : document.createTextNode(String(c)));
-    }
-    return node;
-  }
-
-  const notify = (text, isError = false) => Spicetify.showNotification(text, isError);
-
-  // ---------------------------------------------------------------------------
-  // Download folder (File System Access API, handle persisted in IndexedDB)
-  // ---------------------------------------------------------------------------
-
-  function idbOpen() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open("synthesis-spotify", 1);
-      req.onupgradeneeded = () => req.result.createObjectStore("kv");
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-
-  async function idbGet(key) {
-    try {
-      const db = await idbOpen();
-      return await new Promise((resolve, reject) => {
-        const req = db.transaction("kv").objectStore("kv").get(key);
-        req.onsuccess = () => resolve(req.result ?? null);
-        req.onerror = () => reject(req.error);
-      });
-    } catch {
-      return null;
-    }
-  }
-
-  async function idbSet(key, value) {
-    try {
-      const db = await idbOpen();
-      await new Promise((resolve, reject) => {
-        const tx = db.transaction("kv", "readwrite");
-        tx.objectStore("kv").put(value, key);
-        tx.oncomplete = resolve;
-        tx.onerror = () => reject(tx.error);
-      });
-    } catch (e) {
-      console.warn("[synthesis-spotify] could not persist folder handle", e);
-    }
-  }
-
-  /**
-   * Resolve the folder to save into. Must be called directly from a click handler
-   * (before any long await) because permission prompts and pickers need a user gesture.
-   * Returns a FileSystemDirectoryHandle, or null when the picker API is unavailable
-   * (the caller then falls back to a plain browser download).
-   */
-  async function prepareFolder({ forcePick = false } = {}) {
-    if (typeof window.showDirectoryPicker !== "function") return null;
-
-    if (!forcePick) {
-      const saved = await idbGet("dir");
-      if (saved) {
-        try {
-          let perm = await saved.queryPermission({ mode: "readwrite" });
-          if (perm !== "granted") perm = await saved.requestPermission({ mode: "readwrite" });
-          if (perm === "granted") return saved;
-        } catch (e) {
-          console.warn("[synthesis-spotify] saved folder is not usable, asking again", e);
-        }
-      }
-    }
-
-    const handle = await window.showDirectoryPicker({ id: "synthesis-spotify", mode: "readwrite", startIn: "music" });
-    await idbSet("dir", handle);
-    return handle;
-  }
-
-  async function fileExists(dir, name) {
-    try {
-      await dir.getFileHandle(name);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async function writeToFolder(dir, name, blob) {
-    const handle = await dir.getFileHandle(name, { create: true });
-    const writable = await handle.createWritable();
-    try {
-      await writable.write(blob);
-      await writable.close();
-    } catch (e) {
-      try {
-        await writable.abort();
-      } catch {
-        // Ignore.
-      }
-      throw e;
-    }
-  }
-
-  function saveViaAnchor(blob, name) {
-    const a = el("a", { href: URL.createObjectURL(blob), download: name, style: { display: "none" } });
-    document.body.append(a);
-    a.click();
-    setTimeout(() => {
-      URL.revokeObjectURL(a.href);
-      a.remove();
-    }, 15000);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Download pipeline: Piped stream -> decode (WebAudio) -> MP3 (lamejs) -> file
-  // ---------------------------------------------------------------------------
-
-  let lamePromise = null;
-
-  function loadScript(src) {
-    return new Promise((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src = src;
-      s.onload = resolve;
-      s.onerror = () => reject(new Error(`could not load ${src}`));
-      document.head.append(s);
-    });
-  }
-
-  function loadLame() {
-    if (window.lamejs?.Mp3Encoder) return Promise.resolve(window.lamejs);
-    if (!lamePromise) {
-      lamePromise = (async () => {
-        let lastError = null;
-        for (const url of LAME_URLS) {
-          try {
-            await loadScript(url);
-            if (window.lamejs?.Mp3Encoder) return window.lamejs;
-          } catch (e) {
-            lastError = e;
-          }
-        }
-        throw lastError || new Error("MP3 encoder is unavailable");
-      })().catch((e) => {
-        lamePromise = null;
-        throw e;
-      });
-    }
-    return lamePromise;
-  }
-
-  async function downloadBytes(url, { expected = 0, onProgress } = {}) {
-    const ctrl = new AbortController();
-    let timer = setTimeout(() => ctrl.abort(), 20000);
-    try {
-      const res = await fetch(url, { signal: ctrl.signal });
-      if (!res.ok) throw new Error(`stream HTTP ${res.status}`);
-      const total = Number(res.headers.get("content-length")) || expected || 0;
-      if (!res.body?.getReader) return new Uint8Array(await res.arrayBuffer());
-      const reader = res.body.getReader();
-      const chunks = [];
-      let got = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        got += value.length;
-        clearTimeout(timer);
-        timer = setTimeout(() => ctrl.abort(), 20000);
-        if (total) onProgress?.(Math.min(1, got / total));
-      }
-      return concatBytes(chunks);
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async function decodeAudio(bytes) {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) throw new Error("WebAudio is not available");
-    const ctx = new Ctx({ sampleRate: MP3_SAMPLE_RATE });
-    try {
-      const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-      return await ctx.decodeAudioData(copy);
-    } finally {
-      ctx.close?.().catch(() => {});
-    }
-  }
-
-  async function fetchCover(urls) {
-    for (const url of urls.filter(Boolean)) {
-      try {
-        const res = await fetchWithTimeout(url, { timeout: 8000 });
-        if (!res.ok) continue;
-        const bytes = new Uint8Array(await res.arrayBuffer());
-        if (bytes.length && bytes.length < 2_000_000 && detectImageMime(bytes)) return { bytes };
-      } catch {
-        // Try the next candidate.
-      }
-    }
-    return null;
-  }
-
-  /** Fetch a stream and decode it. Tries other instances if one fails. */
-  async function fetchDecodedAudio(item, report) {
-    const exclude = new Set();
-    let lastError = null;
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      report("Looking up stream");
-      let found;
-      try {
-        found = await withPiped(
-          (base, signal) => fetchJson(`${base}/streams/${item.videoId}`, { signal, timeout: 12000 }),
-          { exclude }
-        );
-      } catch (e) {
-        throw lastError || e;
-      }
-      exclude.add(found.base);
-      const info = found.value;
-      if (info?.livestream) throw new Error("live streams are not supported");
-      if (info?.duration > MAX_DURATION_SEC) throw new Error("this video is too long to be a song");
-
-      for (const stream of rankAudioStreams(info).slice(0, 2)) {
-        try {
-          const bytes = await downloadBytes(stream.url, {
-            expected: Number(stream.contentLength) || 0,
-            onProgress: (p) => report(`Downloading ${Math.round(p * 100)}%`),
-          });
-          report("Decoding");
-          const audio = await decodeAudio(bytes);
-          return { audio, info };
-        } catch (e) {
-          lastError = e;
-          console.warn("[synthesis-spotify] stream failed", stream.mimeType, e);
-        }
-      }
-    }
-    throw lastError || new Error("could not fetch audio");
-  }
-
-  async function downloadTrack(item, dir, report) {
-    const fileName = buildFileName(item);
-    const meta = { title: item.title, artist: item.artist };
-
-    if (dir && (await fileExists(dir, fileName))) {
-      report("Already saved");
-      return { fileName, meta, existed: true };
-    }
-
-    const { audio, info } = await fetchDecodedAudio(item, report);
-    if (!meta.title) meta.title = info?.title || item.videoId;
-    if (!meta.artist) meta.artist = cleanArtist(info?.uploader);
-
-    report("Loading encoder");
-    const lame = await loadLame();
-    const chunks = await encodeMp3(audio, lame, {
-      onProgress: (p) => report(`Encoding ${Math.round(p * 100)}%`),
-    });
-
-    report("Tagging");
-    const cover = await fetchCover([item.thumbnail, info?.thumbnailUrl]);
-    const tag = buildId3Tag({
-      title: meta.title,
-      artist: meta.artist,
-      album: DEFAULT_ALBUM,
-      durationMs: audio.duration * 1000,
-      cover,
-    });
-    const blob = new Blob([tag, ...chunks], { type: "audio/mpeg" });
-
-    report("Saving");
-    if (dir) await writeToFolder(dir, fileName, blob);
-    else saveViaAnchor(blob, fileName);
-
-    return { fileName, meta, existed: false };
-  }
-
-  // Serialize downloads: decoding and encoding are memory heavy.
-  let queueTail = Promise.resolve();
-  function enqueue(task) {
-    const run = queueTail.then(() => task());
-    queueTail = run.catch(() => {});
-    return run;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Playback of the saved file through Spotify's Local Files
-  // ---------------------------------------------------------------------------
-
-  async function waitForLocalTrack(meta, timeoutMs) {
-    const api = Spicetify.Platform?.LocalFilesAPI;
-    if (!api?.getTracks) return null;
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      try {
-        const hit = matchLocalTrack(await api.getTracks(), meta);
-        if (hit) return hit;
-      } catch (e) {
-        console.warn("[synthesis-spotify] LocalFilesAPI.getTracks failed", e);
-      }
-      if (Date.now() >= deadline) return null;
-      await sleep(1500);
-    }
-  }
-
-  async function playSaved(meta, timeoutMs) {
-    const hit = await waitForLocalTrack(meta, timeoutMs);
-    if (!hit) return false;
-    await Spicetify.Player.playUri(hit.uri);
-    return true;
-  }
-
-  const LOCAL_FILES_HINT =
-    "Saved, but Spotify has not listed it yet. Make sure the chosen folder is added under " +
-    "Settings > Local Files > Add a source (and Show local files is on).";
-
-  // ---------------------------------------------------------------------------
-  // UI: result rows
-  // ---------------------------------------------------------------------------
-
-  const ytmUrl = (id) => `https://music.youtube.com/watch?v=${id}`;
-
-  function renderResultRow(item, status) {
-    let saved = null;
-    let busy = false;
-
-    const dlButton = el(
-      "button",
-      {
-        className: "main-buttons-button main-button-primary",
-        style: { padding: "6px 14px", cursor: "pointer", flexShrink: "0", minWidth: "132px" },
-      },
-      "Download"
-    );
-    const openButton = el(
-      "button",
-      {
-        className: "main-buttons-button main-button-secondary",
-        style: { padding: "6px 14px", cursor: "pointer", flexShrink: "0" },
-        onclick: () => window.open(ytmUrl(item.videoId), "_blank"),
-      },
-      "YT Music"
-    );
-
-    const setLabel = (text) => {
-      dlButton.textContent = text;
-    };
-
-    dlButton.onclick = async () => {
-      if (busy) return;
-      busy = true;
-      dlButton.disabled = true;
-      try {
-        if (saved) {
-          setLabel("Opening...");
-          if (!(await playSaved(saved, 8000))) notify(LOCAL_FILES_HINT, true);
-          setLabel("Play");
-          return;
-        }
-
-        // Folder access needs the click's user gesture, so ask before queuing.
-        let dir;
-        try {
-          dir = await prepareFolder();
-        } catch (e) {
-          if (e?.name === "AbortError") {
-            setLabel("Download");
-            return;
-          }
-          throw e;
-        }
-
-        setLabel("Queued");
-        const result = await enqueue(() => downloadTrack(item, dir, setLabel));
-        saved = result.meta;
-
-        setLabel("Waiting for Spotify");
-        if (await playSaved(saved, 25000)) {
-          notify(`Playing: ${saved.title}`);
-        } else {
-          notify(LOCAL_FILES_HINT, true);
-        }
-        setLabel("Play");
-      } catch (e) {
-        console.error("[synthesis-spotify] download failed", e);
-        setLabel("Retry");
-        const message = `Download failed: ${e?.message || e}`;
-        dlButton.title = message;
-        if (status) status.textContent = message;
-        notify(message, true);
-      } finally {
-        busy = false;
-        dlButton.disabled = false;
-      }
-    };
-
-    return el(
-      "div",
-      { style: { display: "flex", alignItems: "center", gap: "12px", padding: "8px 0" } },
-      el("img", {
-        src: item.thumbnail || "",
-        style: {
-          width: "48px",
-          height: "48px",
-          objectFit: "cover",
-          borderRadius: "4px",
-          backgroundColor: "var(--spice-card)",
-        },
-      }),
-      el(
-        "div",
-        { style: { flex: "1", minWidth: "0" } },
-        el(
-          "div",
-          { style: { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } },
-          item.title
-        ),
-        el(
-          "div",
-          { style: { fontSize: "12px", opacity: "0.7" } },
-          [item.artist, formatDuration(item.duration)].filter(Boolean).join(" / ")
-        )
-      ),
-      dlButton,
-      openButton
-    );
-  }
-
-  // "5 results found. (via Invidious (host))" - tells where the results came from.
-  function describeResults(items, cached = false) {
-    const n = items.length;
-    const source = items[0]?.source;
-    const via = source ? ` (via ${source}${cached ? ", cached" : ""})` : "";
-    return `${n} result${n !== 1 ? "s" : ""} found.${via}`;
-  }
-
-  function renderResults(listEl, items, status, limit = Infinity) {
-    listEl.replaceChildren();
-    if (!items.length) {
-      listEl.append(el("div", { style: { opacity: "0.7" } }, "Nothing was found."));
-      return;
-    }
-    for (const item of items.slice(0, limit)) {
-      listEl.append(renderResultRow(item, status));
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // UI: popup modal
-  // ---------------------------------------------------------------------------
-
-  const searchCache = new Map();
-
-  async function resolveUrlItem(videoId) {
-    try {
-      const { base, value } = await withPiped((base, signal) =>
-        fetchJson(`${base}/streams/${videoId}`, { signal, timeout: 12000 })
-      );
-      return {
-        source: `Piped (${hostOf(base)})`,
-        type: "song",
-        videoId,
-        title: value?.title || videoId,
-        artist: cleanArtist(value?.uploader),
-        album: "",
-        duration: value?.duration || 0,
-        thumbnail: value?.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
-      };
-    } catch {
-      return {
-        type: "song",
-        videoId,
-        title: videoId,
-        artist: "",
-        album: "",
-        duration: 0,
-        thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
-      };
-    }
-  }
-
-  function inputStyle() {
-    return {
-      flex: "1",
-      padding: "6px 10px",
-      borderRadius: "4px",
-      border: "none",
-      background: "var(--spice-card)",
-      color: "var(--spice-text)",
-    };
-  }
-
-  function openModal() {
-    const status = el("div", {
-      style: { minHeight: "18px", fontSize: "12px", margin: "8px 0", opacity: "0.8" },
-    });
-    const list = el("div", { style: { maxHeight: "46vh", overflowY: "auto" } });
-    const input = el("input", {
-      type: "text",
-      placeholder: "Song title, artist name, or YouTube / YT Music URL",
-      style: { ...inputStyle(), padding: "8px 12px" },
-    });
-
-    const doSearch = async () => {
-      const query = input.value.trim();
-      if (!query) return;
-      status.textContent = "Searching...";
-      list.replaceChildren();
-      try {
-        const videoId = extractVideoId(query);
-        const cachedResults = videoId ? null : searchCache.get(query);
-        let results;
-        if (videoId) {
-          results = [await resolveUrlItem(videoId)];
-        } else if (cachedResults) {
-          results = cachedResults;
-        } else {
-          results = await ytmSearch(query);
-          searchCache.set(query, results);
-        }
-        status.textContent = describeResults(results, Boolean(cachedResults));
-        renderResults(list, results, status);
-      } catch (e) {
-        status.textContent = `Error: ${e.message}`;
-      }
-    };
-
-    const searchButton = el(
-      "button",
-      {
-        className: "main-buttons-button main-button-primary",
-        style: { padding: "8px 18px", cursor: "pointer" },
-        onclick: doSearch,
-      },
-      "Search"
-    );
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") doSearch();
-    });
-
-    // Download folder row
-    const folderName = el("span", { style: { flex: "1", opacity: "0.9" } }, "Not set");
-    idbGet("dir").then((h) => {
-      if (h?.name) folderName.textContent = h.name;
-    });
-    const folderButton = el(
-      "button",
-      {
-        className: "main-buttons-button main-button-secondary",
-        style: { padding: "4px 12px", cursor: "pointer" },
-        onclick: async () => {
-          try {
-            const handle = await prepareFolder({ forcePick: true });
-            if (handle) folderName.textContent = handle.name;
-          } catch (e) {
-            if (e?.name !== "AbortError") status.textContent = `Folder error: ${e.message}`;
-          }
-        },
-      },
-      "Choose folder"
-    );
-    const folderRow = el(
-      "div",
-      { style: { display: "flex", alignItems: "center", gap: "8px", marginTop: "12px", fontSize: "12px" } },
-      "Save to:",
-      folderName,
-      folderButton
-    );
-    const folderHint = el(
-      "div",
-      { style: { fontSize: "11px", opacity: "0.6", marginTop: "4px" } },
-      "Add this folder in Spotify: Settings > Local Files > Add a source."
-    );
-
-    // Optional settings
-    const pipedInput = el("input", {
-      type: "text",
-      value: store.get(PIPED_URL_STORAGE) || "",
-      placeholder: "Custom Piped API URL (optional)",
-      style: inputStyle(),
-    });
-    pipedInput.addEventListener("change", () => {
-      store.set(PIPED_URL_STORAGE, pipedInput.value.trim());
-      resetPipedInstances();
-      searchCache.clear();
-      status.textContent = "Piped URL saved.";
-    });
-    const keyInput = el("input", {
-      type: "password",
-      value: getApiKey(),
-      placeholder: "YouTube Data API v3 key (optional fallback)",
-      style: inputStyle(),
-    });
-    keyInput.addEventListener("change", () => {
-      store.set(API_KEY_STORAGE, keyInput.value.trim());
-      searchCache.clear();
-      status.textContent = keyInput.value.trim() ? "API key saved." : "API key removed.";
-    });
-    const optionalRow = (label, field) =>
-      el(
-        "div",
-        { style: { display: "flex", alignItems: "center", gap: "8px", marginTop: "8px", fontSize: "12px", opacity: "0.8" } },
-        label,
-        field
-      );
-
-    const root = el(
-      "div",
-      { style: { color: "var(--spice-text)", position: "relative" } },
-      el("div", { style: { display: "flex", gap: "8px" } }, input, searchButton),
-      status,
-      list,
-      folderRow,
-      folderHint,
-      optionalRow("Piped:", pipedInput),
-      optionalRow("API key:", keyInput),
-      el(
-        "span",
-        {
-          style: {
-            position: "absolute",
-            bottom: "4px",
-            right: "8px",
-            fontSize: "10px",
-            opacity: "0.35",
-            pointerEvents: "none",
-            userSelect: "none",
-          },
-        },
-        VERSION
-      )
-    );
-
-    Spicetify.PopupModal.display({ title: "Synthesis-Spotify", content: root, isLarge: true });
-    setTimeout(() => input.focus(), 100);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Integration with Spotify's search page
-  // ---------------------------------------------------------------------------
-
-  const SEARCH_SECTION_ID = "synthesis-spotify-search-section";
-  const SEARCH_DEBOUNCE_MS = 450;
-  const SEARCH_VISIBLE_ROWS = 5;
-  const searchState = { query: "", token: 0, timer: null, ctrl: null };
-  let searchSection = null;
-
-  function getSearchQuery() {
-    const pathname = Spicetify.Platform?.History?.location?.pathname || "";
-    const m = pathname.match(/^\/search\/([^/]+)/);
-    if (!m) return "";
-    try {
-      return decodeURIComponent(m[1]).trim();
-    } catch {
-      return "";
-    }
-  }
-
-  function findSearchContainer() {
-    return document.querySelector(".main-view-container__scroll-node-child") || document.querySelector("main");
-  }
-
-  function createSearchSection() {
-    const title = el("h2", { style: { fontSize: "24px", fontWeight: "700", margin: "0 0 8px" } }, "YouTube Music");
-    const status = el("div", { style: { minHeight: "18px", fontSize: "12px", margin: "4px 0", opacity: "0.8" } });
-    const list = el("div");
-    const moreButton = el(
-      "button",
-      {
-        className: "main-buttons-button main-button-secondary",
-        style: { padding: "6px 14px", cursor: "pointer", marginTop: "4px", display: "none" },
-      },
-      "Show more"
-    );
-    const root = el(
-      "section",
-      { id: SEARCH_SECTION_ID, style: { padding: "16px 32px 8px", color: "var(--spice-text)" } },
-      title,
-      status,
-      list,
-      moreButton
-    );
-    return { root, status, list, moreButton };
-  }
-
-  function mountSearchSection() {
-    if (!searchSection) searchSection = createSearchSection();
-    if (searchSection.root.isConnected) return true;
-    const container = findSearchContainer();
-    if (!container) return false;
-    container.prepend(searchSection.root);
-    return true;
-  }
-
-  function unmountSearchSection() {
-    if (searchSection?.root.isConnected) searchSection.root.remove();
-  }
-
-  function showSearchResults(items) {
-    const { list, status, moreButton } = searchSection;
-    renderResults(list, items, status, SEARCH_VISIBLE_ROWS);
-    if (items.length > SEARCH_VISIBLE_ROWS) {
-      moreButton.style.display = "";
-      moreButton.onclick = () => {
-        renderResults(list, items, status);
-        moreButton.style.display = "none";
-      };
-    } else {
-      moreButton.style.display = "none";
-    }
-  }
-
-  async function runSearchPageQuery(query, token, signal) {
-    try {
-      let items = searchCache.get(query);
-      const cached = Boolean(items);
-      if (!items) {
-        items = await ytmSearch(query, { signal });
-        searchCache.set(query, items);
-      }
-      if (token !== searchState.token || !mountSearchSection()) return;
-      searchSection.status.textContent = describeResults(items, cached);
-      showSearchResults(items);
-    } catch (e) {
-      if (token !== searchState.token || !mountSearchSection()) return;
-      searchSection.list.replaceChildren();
-      searchSection.moreButton.style.display = "none";
-      searchSection.status.textContent = `Error: ${e.message}`;
-    }
-  }
-
-  function onSearchRouteChange() {
-    const query = getSearchQuery();
-    if (!query) {
-      clearTimeout(searchState.timer);
-      searchState.query = "";
-      searchState.token++;
-      searchState.ctrl?.abort();
-      unmountSearchSection();
-      return;
-    }
-    if (query === searchState.query) {
-      mountSearchSection();
-      return;
-    }
-
-    searchState.query = query;
-    const token = ++searchState.token;
-    clearTimeout(searchState.timer);
-    searchState.ctrl?.abort();
-    const { signal } = (searchState.ctrl = new AbortController());
-    if (mountSearchSection()) {
-      searchSection.list.replaceChildren();
-      searchSection.moreButton.style.display = "none";
-      searchSection.status.textContent = "Searching...";
-    }
-    const delay = searchCache.has(query) ? 0 : SEARCH_DEBOUNCE_MS;
-    searchState.timer = setTimeout(() => runSearchPageQuery(query, token, signal), delay);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Initialize
-  // ---------------------------------------------------------------------------
-
-  Spicetify.Platform?.History?.listen?.(onSearchRouteChange);
-  // Re-check periodically because React may replace containers.
-  setInterval(onSearchRouteChange, 1000);
-  onSearchRouteChange();
-
-  const ButtonClass = Spicetify.Topbar?.Button || Spicetify.Playbar.Button;
-  new ButtonClass("Synthesis-Spotify", "download", openModal);
+// DESCRIPTION: Transcending all musical boundaries.
+
+/*
+ * Synthesis Spotify
+ *
+ * Architecture overview:
+ *  - Network:  libcurl.js (WASM libcurl + Wisp websocket proxy) replaces fetch() to bypass CORS.
+ *  - Data:     youtubei.js (YouTube.js) talks to YouTube Music through that custom fetch.
+ *  - Audio:    the audio stream is downloaded into a Blob, played via a Blob URL on a hidden <audio>.
+ *  - Spotify:  search page injection, a virtual queue interleaved with Spotify's own queue,
+ *              and a small mini player that is shown while a non-Spotify track is active.
+ *
+ * Both libraries are loaded lazily from jsDelivr (pinned versions) on first use.
+ */
+
+(async function SynthesisSpotify() {
+	"use strict";
+
+	// ---------------------------------------------------------------------
+	// Boot: wait until Spicetify is ready
+	// ---------------------------------------------------------------------
+	const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+	for (let i = 0; i < 150; i++) {
+		if (
+			window.Spicetify?.Player?.addEventListener &&
+			Spicetify.Platform?.History &&
+			Spicetify.Menu &&
+			Spicetify.PopupModal &&
+			Spicetify.showNotification
+		) {
+			break;
+		}
+		await sleep(200);
+	}
+	if (!window.Spicetify?.Platform?.History) {
+		console.error("[Synthesis Spotify] Spicetify did not become ready, aborting.");
+		return;
+	}
+
+	// ---------------------------------------------------------------------
+	// Constants and configuration
+	// ---------------------------------------------------------------------
+	/* VERSION */ const VERSION = "0.0.0";
+	const LIBCURL_URL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.5/libcurl_full.mjs";
+	const YTJS_URL = "https://cdn.jsdelivr.net/npm/youtubei.js@18.3.0/bundle/browser.js";
+	const CONFIG_KEY = "synthesis-spotify:config";
+	const MAX_CACHED_TRACKS = 4;
+	const SEARCH_DEBOUNCE_MS = 700;
+
+	const DEFAULT_CONFIG = {
+		// Wisp proxy servers, tried in order. A local one (your own IP) is far more reliable with YouTube
+		// than the shared public one. Traffic stays end-to-end TLS encrypted.
+		wispServers: ["ws://localhost:6001/", "wss://wisp.mercurywork.shop/"],
+		// InnerTube clients tried in order to obtain a directly playable audio URL.
+		clients: ["visionos", "tv_samsung"],
+		resultLimit: 8,
+		prefetchNext: true,
+	};
+
+	const CONFIG_VERSION = 4;
+
+	function loadConfig() {
+		try {
+			const stored = JSON.parse(localStorage.getItem(CONFIG_KEY) || "{}");
+			// v4 changed the default client list; drop an older saved list so the new defaults apply.
+			if (stored.configVersion !== CONFIG_VERSION) delete stored.clients;
+			return { ...DEFAULT_CONFIG, ...stored, configVersion: CONFIG_VERSION };
+		} catch {
+			return { ...DEFAULT_CONFIG };
+		}
+	}
+
+	let config = loadConfig();
+
+	function saveConfig(patch) {
+		config = { ...config, ...patch };
+		try {
+			localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
+		} catch (error) {
+			console.warn("[Synthesis Spotify] Failed to save config", error);
+		}
+	}
+
+	// ---------------------------------------------------------------------
+	// i18n (ja / en)
+	// ---------------------------------------------------------------------
+	const lang = String(Spicetify.Locale?.getLocale?.() || navigator.language || "en")
+		.toLowerCase()
+		.startsWith("ja")
+		? "ja"
+		: "en";
+
+	const STRINGS = {
+		ja: {
+			sectionTitle: "Synthesis Spotify",
+			sectionSub: "YouTube Music の検索結果",
+			searching: "YouTube Music を検索中...",
+			noResults: "YouTube Music に該当する曲が見つかりませんでした。",
+			failed: "YouTube Music の検索に失敗しました。",
+			retry: "再試行",
+			openSettings: "設定を開く",
+			play: "再生",
+			addQueue: "キューに追加",
+			playNext: "次に再生",
+			queueTitle: "Synthesis Spotify キュー",
+			queueEmpty: "キューは空です。",
+			remove: "削除",
+			clear: "すべて削除",
+			playNow: "今すぐ再生",
+			loading: (p) => `読み込み中 ${Math.round(p * 100)}%`,
+			preparing: "準備中...",
+			addedQueue: "キューに追加しました",
+			addedNext: "次に再生します",
+			playFailed: (m) => `再生に失敗しました: ${m}`,
+			settingsTitle: "Synthesis Spotify 設定",
+			wispLabel: "Wisp プロキシ (1行に1つ、上から順に試行)",
+			clientsLabel: "InnerTube クライアント (visionos / tv_samsung、カンマ区切り、上から順に試行)",
+			save: "保存",
+			saved: "設定を保存しました",
+			test: "接続テスト",
+			clearCache: "音声キャッシュを削除",
+			cacheCleared: "音声キャッシュを削除しました",
+			privacyNote: "通信は libcurl.js により端末内で TLS 終端され、Wisp プロキシには接続先ホスト名のみ見えます。",
+			menu: "Synthesis Spotify 設定",
+			botHint: "共有Wispプロキシの出口IPがYouTubeに弾かれている可能性があります。自宅PCでローカルのWispサーバーを起動し、設定のWisp欄に ws://localhost:6001/ を指定してください。",
+		},
+		en: {
+			sectionTitle: "Synthesis Spotify",
+			sectionSub: "YouTube Music results",
+			searching: "Searching YouTube Music...",
+			noResults: "No matching songs on YouTube Music.",
+			failed: "YouTube Music search failed.",
+			retry: "Retry",
+			openSettings: "Open settings",
+			play: "Play",
+			addQueue: "Add to queue",
+			playNext: "Play next",
+			queueTitle: "Synthesis Spotify queue",
+			queueEmpty: "The queue is empty.",
+			remove: "Remove",
+			clear: "Clear all",
+			playNow: "Play now",
+			loading: (p) => `Loading ${Math.round(p * 100)}%`,
+			preparing: "Preparing...",
+			addedQueue: "Added to queue",
+			addedNext: "Will play next",
+			playFailed: (m) => `Playback failed: ${m}`,
+			settingsTitle: "Synthesis Spotify settings",
+			wispLabel: "Wisp proxies (one per line, tried in order)",
+			clientsLabel: "InnerTube clients (visionos / tv_samsung, comma separated, tried in order)",
+			save: "Save",
+			saved: "Settings saved",
+			test: "Connection test",
+			clearCache: "Clear audio cache",
+			cacheCleared: "Audio cache cleared",
+			privacyNote: "TLS is terminated inside this app by libcurl.js; the Wisp proxy only sees destination hostnames.",
+			menu: "Synthesis Spotify settings",
+			botHint: "The shared Wisp proxy's IP is probably flagged by YouTube. Run a local Wisp server on your PC and set ws://localhost:6001/ in the settings.",
+		},
+	};
+
+	const t = (key, ...args) => {
+		const value = STRINGS[lang][key] ?? STRINGS.en[key] ?? key;
+		return typeof value === "function" ? value(...args) : value;
+	};
+
+	// ---------------------------------------------------------------------
+	// Small DOM helpers and icons
+	// ---------------------------------------------------------------------
+	const svg = (path) => `<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="${path}"/></svg>`;
+	const ICONS = {
+		play: svg("M3 1.7v12.6a.7.7 0 0 0 1.05.6l10.5-6.3a.7.7 0 0 0 0-1.2L4.05 1.1A.7.7 0 0 0 3 1.7z"),
+		pause: svg("M2.7 1h3.6v14H2.7zM9.7 1h3.6v14H9.7z"),
+		next: svg("M12.7 1h1.6v14h-1.6zM1.7 1.6v12.8a.5.5 0 0 0 .8.4l8.6-6.4a.5.5 0 0 0 0-.8L2.5 1.2a.5.5 0 0 0-.8.4z"),
+		plus: svg("M15 7H9V1H7v6H1v2h6v6h2V9h6z"),
+		playNext: svg("M1 2h9v1.5H1zM1 6.25h9v1.5H1zM1 10.5h5v1.5H1zM10 9.5v5l4.5-2.5z"),
+		close: svg("M2.47 2.47a.75.75 0 0 1 1.06 0L8 6.94l4.47-4.47a.75.75 0 1 1 1.06 1.06L9.06 8l4.47 4.47a.75.75 0 1 1-1.06 1.06L8 9.06l-4.47 4.47a.75.75 0 0 1-1.06-1.06L6.94 8 2.47 3.53a.75.75 0 0 1 0-1.06z"),
+	};
+
+	function h(tag, props = {}, ...children) {
+		const el = document.createElement(tag);
+		for (const [key, value] of Object.entries(props || {})) {
+			if (value == null || value === false) continue;
+			if (key === "class") el.className = value;
+			else if (key === "html") el.innerHTML = value;
+			else if (key.startsWith("on") && typeof value === "function") el.addEventListener(key.slice(2).toLowerCase(), value);
+			else el.setAttribute(key, value === true ? "" : value);
+		}
+		for (const child of children.flat()) {
+			if (child == null || child === false) continue;
+			el.append(child.nodeType ? child : document.createTextNode(String(child)));
+		}
+		return el;
+	}
+
+	function formatTime(ms) {
+		if (!Number.isFinite(ms) || ms <= 0) return "";
+		const total = Math.round(ms / 1000);
+		return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+	}
+
+	const notify = (message, isError = false) => Spicetify.showNotification(message, isError);
+
+	function throwIfAborted(signal) {
+		if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+	}
+
+	function withTimeout(promise, ms, label) {
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error(`${label || "operation"} timed out`)), ms);
+			promise.then(
+				(value) => {
+					clearTimeout(timer);
+					resolve(value);
+				},
+				(error) => {
+					clearTimeout(timer);
+					reject(error);
+				}
+			);
+		});
+	}
+
+	// ---------------------------------------------------------------------
+	// Network layer: libcurl.js (fetch replacement that is not bound by CORS)
+	// ---------------------------------------------------------------------
+	let curlPromise = null;
+	let activeWisp = "";
+	let lastPlayerUserAgent = null;
+	const isLocalWisp = () => /^wss?:\/\/(localhost|127\.0\.0\.1|\[::1\])/.test(activeWisp);
+
+	// Minimal cookie jar for *.youtube.com (libcurl.js has no cookie storage of its own).
+	const cookieJar = new Map();
+	const isYouTubeHost = (hostname) => hostname === "youtube.com" || hostname.endsWith(".youtube.com");
+
+	function storeCookies(res) {
+		for (const [name, value] of res.raw_headers || []) {
+			if (String(name).toLowerCase() !== "set-cookie") continue;
+			const pair = String(value).split(";")[0];
+			const eq = pair.indexOf("=");
+			if (eq <= 0) continue;
+			const key = pair.slice(0, eq).trim();
+			const val = pair.slice(eq + 1).trim();
+			if (!val || /expires=Thu, 01 Jan 1970/i.test(value)) cookieJar.delete(key);
+			else cookieJar.set(key, val);
+		}
+	}
+
+	async function pickWispServer(libcurl) {
+		const failures = [];
+		for (const url of config.wispServers) {
+			try {
+				libcurl.set_websocket(url);
+				const res = await withTimeout(libcurl.fetch("https://www.gstatic.com/generate_204"), 10000, `Wisp ${url}`);
+				if (res.status === 204 || res.ok) return url;
+				failures.push(`${url}: HTTP ${res.status}`);
+			} catch (error) {
+				failures.push(`${url}: ${error?.message || error}`);
+			}
+		}
+		throw new Error(`No usable Wisp server. ${failures.join(" / ")}`);
+	}
+
+	function loadCurl() {
+		curlPromise ??= (async () => {
+			const mod = await import(LIBCURL_URL);
+			const libcurl = mod.libcurl;
+			// The "full" build embeds the WASM binary, so no URL is needed here.
+			await libcurl.load_wasm();
+			libcurl.activeWisp = await pickWispServer(libcurl);
+			activeWisp = libcurl.activeWisp;
+			return libcurl;
+		})().catch((error) => {
+			curlPromise = null;
+			throw error;
+		});
+		return curlPromise;
+	}
+
+	// Drop-in replacement for fetch(), also handed to youtubei.js.
+	async function curlFetch(input, init = {}) {
+		const libcurl = await loadCurl();
+		const isRequest = typeof Request !== "undefined" && input instanceof Request;
+		const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+		const headers = new Headers(init.headers || (isRequest ? input.headers : undefined));
+
+		if (url.includes("/youtubei/v1/player") && headers.get("User-Agent")) {
+			lastPlayerUserAgent = headers.get("User-Agent");
+		}
+		// googlevideo URLs are signed for a specific client, so reuse the UA of the last /player call.
+		if (new URL(url).hostname.endsWith(".googlevideo.com") && !headers.get("User-Agent") && lastPlayerUserAgent) {
+			headers.set("User-Agent", lastPlayerUserAgent);
+		}
+
+		// Do NOT hand the Request object to libcurl.fetch: unlike native fetch, libcurl.js lets the
+		// Request's own body override init.body. youtubei.js builds the Request from the raw payload and
+		// passes the processed body (with the InnerTube context) in init, so we resolve everything here.
+		let body = init.body;
+		if (body === undefined && isRequest && input.body) body = await input.clone().arrayBuffer();
+
+		const youtubeHost = isYouTubeHost(new URL(url).hostname);
+		if (youtubeHost && cookieJar.size && !headers.get("Cookie")) {
+			headers.set("Cookie", [...cookieJar].map(([k, v]) => `${k}=${v}`).join("; "));
+		}
+
+		const res = await libcurl.fetch(url, {
+			method: init.method || (isRequest ? input.method : "GET"),
+			headers,
+			body,
+			redirect: init.redirect || (isRequest ? input.redirect : "follow"),
+			signal: init.signal || (isRequest ? input.signal : undefined),
+		});
+		if (youtubeHost) storeCookies(res);
+		return res;
+	}
+
+	// ---------------------------------------------------------------------
+	// Provider: YouTube Music (youtubei.js)
+	// ---------------------------------------------------------------------
+	const innertubes = { plain: null, player: null };
+	function getInnertube(withPlayer = false) {
+		const slot = withPlayer ? "player" : "plain";
+		innertubes[slot] ??= (async () => {
+			const mod = await import(YTJS_URL);
+			// The web build has no JS evaluator; it is required to decipher signatures and "n" params.
+			mod.Platform.shim.eval = async (data) => new Function(data.output)();
+			const region = (navigator.language || "en-US").split("-")[1]?.toUpperCase() || "US";
+			const base = {
+				fetch: curlFetch,
+				cache: new mod.UniversalCache(false),
+				// The JS player (base.js + eval) is only loaded for clients that need deciphering.
+				retrieve_player: withPlayer,
+				lang: "en",
+				location: region,
+			};
+			try {
+				return await mod.Innertube.create(base);
+			} catch (error) {
+				console.warn("[Synthesis Spotify] Session bootstrap failed, retrying with a local session", error);
+				return await mod.Innertube.create({ ...base, generate_session_locally: true });
+			}
+		})().catch((error) => {
+			innertubes[slot] = null;
+			throw error;
+		});
+		return innertubes[slot];
+	}
+
+	function resizeThumbnail(url, size = 226) {
+		if (!url) return "";
+		return url.replace(/=w\d+-h\d+[^&]*$/, `=w${size}-h${size}-l90-rj`);
+	}
+
+	async function youtubeSearch(query, limit) {
+		const yt = await getInnertube();
+		const res = await yt.music.search(query, { type: "song" });
+		const shelf = res.contents?.find((node) => node.type === "MusicShelf");
+		const items = shelf?.contents ?? [];
+		const tracks = [];
+		for (const item of items) {
+			if (!item?.id || !item.title) continue;
+			const thumbs = item.thumbnail?.contents ?? [];
+			tracks.push({
+				provider: "youtube",
+				id: item.id,
+				title: item.title,
+				artists: (item.artists ?? []).map((artist) => artist.name).filter(Boolean),
+				album: item.album?.name || "",
+				durationMs: (item.duration?.seconds ?? 0) * 1000,
+				thumbnail: resizeThumbnail(thumbs[thumbs.length - 1]?.url || thumbs[0]?.url),
+			});
+			if (tracks.length >= limit) break;
+		}
+		return tracks;
+	}
+
+	// ---- Audio download through libcurl (ranged requests, like YouTube's own player) ----
+	async function downloadFormat(url, total, mime, { signal, onProgress, userAgent } = {}) {
+		const CHUNK = 10 * 1024 * 1024;
+		const cpn = Array.from(crypto.getRandomValues(new Uint8Array(16)), (n) => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"[n % 64]).join("");
+		const parts = [];
+		let received = 0;
+
+		while (!total || received < total) {
+			throwIfAborted(signal);
+			const end = (total ? Math.min(received + CHUNK, total) : received + CHUNK) - 1;
+			const res = await curlFetch(`${url}&cpn=${cpn}&range=${received}-${end}`, {
+				method: "GET",
+				headers: { accept: "*/*", origin: "https://www.youtube.com", referer: "https://www.youtube.com", ...(userAgent ? { "user-agent": userAgent } : {}) },
+				signal,
+			});
+			if (!res.ok) throw new Error(`googlevideo returned HTTP ${res.status}`);
+
+			const reader = res.body.getReader();
+			let chunkBytes = 0;
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				parts.push(value);
+				chunkBytes += value.byteLength;
+				received += value.byteLength;
+				if (total) onProgress?.(Math.min(received / total, 1));
+			}
+			if (!chunkBytes || (!total && chunkBytes < CHUNK)) break;
+		}
+		throwIfAborted(signal);
+		if (total && received < total * 0.98) throw new Error("incomplete download");
+		return new Blob(parts, { type: mime });
+	}
+
+	// ---- InnerTube clients (copied from yt-dlp's definitions, 2026-11) ----
+	// These two currently return playable audio without a PO token. If YouTube starts rejecting them,
+	// compare with INNERTUBE_CLIENTS in yt-dlp (yt_dlp/extractor/youtube/_base.py) and update the versions.
+	const CLIENT_DEFS = {
+		visionos: {
+			id: 101,
+			needsPlayer: false,
+			client: {
+				clientName: "VISIONOS",
+				clientVersion: "1.02",
+				deviceMake: "Apple",
+				deviceModel: "RealityDevice17,1",
+				userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+				osName: "visionOS",
+				osVersion: "26.5.23O471",
+			},
+		},
+		tv_samsung: {
+			id: 7,
+			needsPlayer: true,
+			client: {
+				clientName: "TVHTML5",
+				clientVersion: "5.20260707",
+				deviceMake: "Samsung",
+				deviceModel: "UKS9800",
+				userAgent: "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1",
+				osName: "Tizen",
+				osVersion: "2.4.0",
+			},
+		},
+	};
+
+	// yt-dlp downloads the watch page first, which also hands out the session cookies.
+	let warmUpPromise = null;
+	function warmUpSession() {
+		warmUpPromise ??= curlFetch("https://www.youtube.com/", {
+			headers: { accept: "text/html,application/xhtml+xml,*/*;q=0.8", "accept-language": "en-US,en;q=0.5" },
+		})
+			.then((res) => res.arrayBuffer())
+			.catch((error) => console.warn("[Synthesis Spotify] session warm-up failed", error));
+		return warmUpPromise;
+	}
+
+	// Builds the /player request the same way yt-dlp does (no web-only fields mixed into app clients).
+	async function requestPlayer(videoId, clientKey, signal) {
+		const def = CLIENT_DEFS[clientKey];
+		if (!def) throw new Error(`unknown client "${clientKey}" (use ${Object.keys(CLIENT_DEFS).join(" / ")})`);
+
+		const yt = await getInnertube(false);
+		const visitorData = yt.session.context.client.visitorData;
+		await warmUpSession();
+
+		const contentPlaybackContext = { html5Preference: "HTML5_PREF_WANTS" };
+		if (def.needsPlayer) {
+			const ytWithPlayer = await getInnertube(true);
+			const sts = ytWithPlayer.session.player?.signature_timestamp;
+			if (sts) contentPlaybackContext.signatureTimestamp = sts;
+		}
+
+		const res = await curlFetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
+			method: "POST",
+			headers: {
+				accept: "*/*",
+				"accept-language": "en-US,en;q=0.5",
+				"content-type": "application/json",
+				origin: "https://www.youtube.com",
+				"user-agent": def.client.userAgent,
+				"x-youtube-client-name": String(def.id),
+				"x-youtube-client-version": def.client.clientVersion,
+				"x-goog-visitor-id": visitorData,
+			},
+			body: JSON.stringify({
+				context: { client: { ...def.client, hl: "en", timeZone: "UTC", utcOffsetMinutes: 0, visitorData } },
+				videoId,
+				playbackContext: { contentPlaybackContext },
+				contentCheckOk: true,
+				racyCheckOk: true,
+			}),
+			signal,
+		});
+		if (!res.ok) throw new Error(`player request failed: HTTP ${res.status}`);
+
+		const data = await res.json();
+		const status = data.playabilityStatus?.status;
+		if (status !== "OK") {
+			const reason = data.playabilityStatus?.reason;
+			throw new Error(reason ? `${status}: ${reason}` : String(status));
+		}
+		return data;
+	}
+
+	// Prefers Opus (WebM), which Chromium plays reliably, then the best AAC (MP4).
+	function pickAudioFormat(streamingData) {
+		const candidates = (streamingData?.adaptiveFormats ?? []).filter(
+			(f) =>
+				f.mimeType?.startsWith("audio/") &&
+				(f.url || f.signatureCipher || f.cipher) &&
+				f.audioTrack?.audioIsDefault !== false
+		);
+		const score = (f) => (f.mimeType.includes("opus") ? 1e9 : 0) + (f.bitrate || 0);
+		return candidates.sort((a, b) => score(b) - score(a))[0] ?? null;
+	}
+
+	// Plain URLs are used as they are; ciphered ones / "n" params need the JS player.
+	async function resolveFormatUrl(format) {
+		const needsDecipher = Boolean(format.signatureCipher || format.cipher) || /[?&]n=/.test(format.url || "");
+		if (!needsDecipher) return format.url;
+		const yt = await getInnertube(true);
+		return yt.session.player.decipher(format.url, format.signatureCipher, format.cipher);
+	}
+
+	async function youtubeFetchAudio(track, { signal, onProgress } = {}) {
+		const errors = [];
+
+		for (const client of config.clients) {
+			throwIfAborted(signal);
+			try {
+				const data = await requestPlayer(track.id, client, signal);
+				const format = pickAudioFormat(data.streamingData);
+				if (!format) throw new Error("no audio format in the response");
+
+				const url = await resolveFormatUrl(format);
+				if (!url) throw new Error("could not build a stream URL");
+				const blob = await downloadFormat(url, Number(format.contentLength) || 0, format.mimeType, {
+					signal,
+					onProgress,
+					userAgent: CLIENT_DEFS[client].client.userAgent,
+				});
+				return { blob, mime: format.mimeType };
+			} catch (error) {
+				if (error?.name === "AbortError") throw error;
+				errors.push(`${client}: ${error?.message || error}`);
+			}
+		}
+		const joined = errors.join(" | ") || "no client available";
+		if (/not a bot/i.test(joined) && !isLocalWisp()) throw new Error(`${joined} (${t("botHint")})`);
+		throw new Error(joined);
+	}
+
+	// Registry so that more services can be added later.
+	const providers = {
+		youtube: {
+			id: "youtube",
+			label: "YouTube Music",
+			search: youtubeSearch,
+			fetchAudio: youtubeFetchAudio,
+		},
+	};
+
+	// ---------------------------------------------------------------------
+	// Audio cache (Blob URLs)
+	// ---------------------------------------------------------------------
+	const audioCache = new Map(); // key -> { url }
+	const inflight = new Map(); // key -> { controller, listeners, promise }
+	const trackKey = (track) => `${track.provider}:${track.id}`;
+
+	function evictCache() {
+		const keep = new Set([state.current && trackKey(state.current), state.queue[0] && trackKey(state.queue[0])].filter(Boolean));
+		for (const key of [...audioCache.keys()]) {
+			if (audioCache.size <= MAX_CACHED_TRACKS) break;
+			if (keep.has(key)) continue;
+			URL.revokeObjectURL(audioCache.get(key).url);
+			audioCache.delete(key);
+		}
+	}
+
+	function clearAudioCache() {
+		const current = state.current && trackKey(state.current);
+		for (const [key, entry] of [...audioCache]) {
+			if (key === current && state.status !== "idle") continue;
+			URL.revokeObjectURL(entry.url);
+			audioCache.delete(key);
+		}
+	}
+
+	function getAudioUrl(track, onProgress) {
+		const key = trackKey(track);
+		const cached = audioCache.get(key);
+		if (cached) {
+			audioCache.delete(key);
+			audioCache.set(key, cached); // refresh LRU order
+			return Promise.resolve(cached.url);
+		}
+
+		let job = inflight.get(key);
+		if (!job) {
+			const controller = new AbortController();
+			job = { controller, listeners: new Set(), promise: null };
+			job.promise = providers[track.provider]
+				.fetchAudio(track, {
+					signal: controller.signal,
+					onProgress: (p) => job.listeners.forEach((fn) => fn(p)),
+				})
+				.then(({ blob }) => {
+					const url = URL.createObjectURL(blob);
+					audioCache.set(key, { url });
+					evictCache();
+					return url;
+				})
+				.finally(() => inflight.delete(key));
+			inflight.set(key, job);
+		}
+		if (onProgress) job.listeners.add(onProgress);
+		return job.promise;
+	}
+
+	function abortLoad(track) {
+		if (!track) return;
+		const key = trackKey(track);
+		if (state.queue.some((queued) => trackKey(queued) === key)) return; // still wanted
+		inflight.get(key)?.controller.abort();
+	}
+
+	// ---------------------------------------------------------------------
+	// Playback engine
+	// ---------------------------------------------------------------------
+	const audio = new Audio();
+	audio.preload = "auto";
+
+	const state = {
+		current: null, // active non-Spotify track
+		status: "idle", // idle | loading | playing | paused
+		progress: 0, // download progress while loading (0..1)
+		queue: [], // virtual queue of non-Spotify tracks
+		resumeSpotify: false, // resume Spotify once the virtual queue drains
+		suppressUntil: 0, // ignore Spotify events until this timestamp
+	};
+	let playToken = 0;
+	let qidCounter = 0;
+
+	function readSpotify() {
+		const data = Spicetify.Player.data;
+		return {
+			uri: data?.item?.uri ?? null,
+			ctx: data?.context?.uri ?? data?.contextUri ?? null,
+		};
+	}
+
+	function pauseSpotify() {
+		if (Spicetify.Player.isPlaying()) {
+			state.resumeSpotify = true;
+			Spicetify.Player.pause();
+		}
+	}
+
+	function resumeSpotifyIfNeeded() {
+		if (!state.resumeSpotify) return;
+		state.resumeSpotify = false;
+		state.suppressUntil = Date.now() + 1000;
+		Spicetify.Player.play();
+	}
+
+	function updateMediaSession(track) {
+		if (!("mediaSession" in navigator) || !track) return;
+		try {
+			navigator.mediaSession.metadata = new MediaMetadata({
+				title: track.title,
+				artist: track.artists.join(", "),
+				album: track.album || providers[track.provider].label,
+				artwork: track.thumbnail ? [{ src: track.thumbnail, sizes: "226x226" }] : [],
+			});
+			navigator.mediaSession.playbackState = "playing";
+		} catch {
+			// MediaSession is best effort only.
+		}
+	}
+
+	async function playTrack(track) {
+		const token = ++playToken;
+		const previous = state.current;
+		if (previous && state.status === "loading") abortLoad(previous);
+
+		audio.pause();
+		state.current = track;
+		state.status = "loading";
+		state.progress = 0;
+		pauseSpotify();
+		renderMini();
+
+		try {
+			const url = await getAudioUrl(track, (p) => {
+				if (token !== playToken) return;
+				state.progress = p;
+				renderMini();
+			});
+			if (token !== playToken) return;
+
+			audio.src = url;
+			syncVolume();
+			await audio.play();
+			if (token !== playToken) return;
+
+			state.status = "playing";
+			updateMediaSession(track);
+			renderMini();
+			if (config.prefetchNext && state.queue[0]) {
+				getAudioUrl(state.queue[0]).catch(() => {});
+			}
+		} catch (error) {
+			if (token !== playToken || error?.name === "AbortError") return;
+			console.error("[Synthesis Spotify] playback failed", error);
+			notify(t("playFailed", error?.message || error), true);
+			playNextFromQueue();
+		}
+	}
+
+	function playNextFromQueue() {
+		const next = state.queue.shift();
+		renderQueueModal();
+		if (next) {
+			playTrack(next);
+		} else {
+			stopYT(true);
+		}
+	}
+
+	function stopYT(resumeSpotify) {
+		playToken++;
+		abortLoad(state.current);
+		audio.pause();
+		audio.removeAttribute("src");
+		audio.load();
+		state.current = null;
+		state.status = "idle";
+		state.progress = 0;
+		renderMini();
+		if (resumeSpotify) resumeSpotifyIfNeeded();
+		else state.resumeSpotify = false;
+	}
+
+	function toggleYT() {
+		if (state.status === "playing") {
+			audio.pause();
+			state.status = "paused";
+		} else if (state.status === "paused") {
+			audio.play().catch(() => {});
+			state.status = "playing";
+		}
+		renderMini();
+	}
+
+	function addToQueue(track, { next = false } = {}) {
+		const entry = { ...track, qid: ++qidCounter };
+		if (next) state.queue.unshift(entry);
+		else state.queue.push(entry);
+		renderQueueModal();
+
+		// Nothing is playing at all: start right away instead of leaving the track stranded.
+		if (state.status === "idle" && !Spicetify.Player.isPlaying()) {
+			playNextFromQueue();
+			return;
+		}
+		notify(next ? t("addedNext") : t("addedQueue"));
+		if (config.prefetchNext && state.queue[0]) getAudioUrl(state.queue[0]).catch(() => {});
+	}
+
+	function playNow(track) {
+		playTrack({ ...track });
+	}
+
+	// Audio element events
+	audio.addEventListener("ended", () => playNextFromQueue());
+	audio.addEventListener("error", () => {
+		if (!audio.getAttribute("src")) return;
+		notify(t("playFailed", audio.error?.message || "media error"), true);
+		playNextFromQueue();
+	});
+	audio.addEventListener("timeupdate", () => updateSeek());
+
+	// Keep the volume in sync with Spotify's volume slider.
+	function syncVolume() {
+		try {
+			audio.volume = Math.min(1, Math.max(0, Spicetify.Player.getVolume()));
+			audio.muted = Spicetify.Player.getMute();
+		} catch {
+			// ignore
+		}
+	}
+	setInterval(() => {
+		if (state.status !== "idle") syncVolume();
+	}, 500);
+
+	// ---------------------------------------------------------------------
+	// Spotify player integration
+	// ---------------------------------------------------------------------
+	let lastSpotify = readSpotify();
+
+	Spicetify.Player.addEventListener("onplaypause", () => {
+		const playing = Spicetify.Player.isPlaying();
+		if (Date.now() < state.suppressUntil) return;
+
+		if (playing) {
+			// Spotify's play button was pressed while a non-Spotify track is active:
+			// keep Spotify silent and use the button as play/pause for our track.
+			if (state.status !== "idle") {
+				state.suppressUntil = Date.now() + 300;
+				Spicetify.Player.pause();
+				toggleYT();
+			}
+			return;
+		}
+
+		// Spotify stopped at the very end of its last track: continue with our queue.
+		if (state.status === "idle" && state.queue.length) {
+			const remaining = Spicetify.Player.getDuration() - Spicetify.Player.getProgress();
+			if (Spicetify.Player.getDuration() > 0 && remaining < 1500) {
+				state.resumeSpotify = false;
+				playNextFromQueue();
+			}
+		}
+	});
+
+	Spicetify.Player.addEventListener("songchange", () => {
+		const now = readSpotify();
+		const prev = lastSpotify;
+		lastSpotify = now;
+		if (!now.uri || now.uri === prev.uri) return;
+		if (Date.now() < state.suppressUntil) return;
+
+		// Same playback context means "next/previous/auto-advance"; a different one means the user
+		// started something else in Spotify.
+		const advance = Boolean(prev.uri) && prev.ctx === now.ctx;
+
+		if (state.status !== "idle") {
+			if (!advance) {
+				stopYT(false);
+			} else if (state.queue.length) {
+				state.suppressUntil = Date.now() + 300;
+				Spicetify.Player.pause();
+				playNextFromQueue();
+			} else {
+				stopYT(false); // Spotify already started the new track
+			}
+			return;
+		}
+
+		if (advance && state.queue.length) {
+			// Queued non-Spotify tracks play between the finished Spotify track and the next one.
+			state.suppressUntil = Date.now() + 300;
+			state.resumeSpotify = true;
+			Spicetify.Player.pause();
+			playNextFromQueue();
+		}
+	});
+
+	// ---------------------------------------------------------------------
+	// Styles
+	// ---------------------------------------------------------------------
+	document.head.append(
+		h("style", { id: "synthesis-spotify-style" }, `
+		.ss-section { margin: 8px 0 24px; padding: 0 var(--content-spacing, 32px); box-sizing: border-box; }
+		.ss-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
+		.ss-head h2 { margin: 0; font-size: 24px; font-weight: 700; color: var(--text-base, #fff); }
+		.ss-head span { font-size: 13px; color: var(--text-subdued, #a7a7a7); }
+		.ss-status { padding: 16px 8px; color: var(--text-subdued, #a7a7a7); font-size: 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+		.ss-row { display: grid; grid-template-columns: 48px minmax(0, 1fr) minmax(0, 0.6fr) auto 48px; gap: 12px; align-items: center; padding: 6px 8px; border-radius: 6px; }
+		.ss-row:hover { background: rgba(128, 128, 128, 0.18); }
+		.ss-cover-wrap { position: relative; width: 40px; height: 40px; }
+		.ss-cover { width: 40px; height: 40px; border-radius: 4px; object-fit: cover; background: rgba(128, 128, 128, 0.3); }
+		.ss-cover-play { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; border: 0; border-radius: 4px; background: rgba(0, 0, 0, 0.55); color: #fff; cursor: pointer; }
+		.ss-row:hover .ss-cover-play { display: flex; }
+		.ss-meta { min-width: 0; }
+		.ss-title, .ss-sub, .ss-album { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.ss-title { font-size: 15px; color: var(--text-base, #fff); }
+		.ss-sub, .ss-album { font-size: 13px; color: var(--text-subdued, #a7a7a7); }
+		.ss-actions { display: flex; gap: 4px; opacity: 0; }
+		.ss-row:hover .ss-actions { opacity: 1; }
+		.ss-dur { font-size: 13px; color: var(--text-subdued, #a7a7a7); text-align: right; font-variant-numeric: tabular-nums; }
+		.ss-btn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 50%; background: transparent; color: var(--text-subdued, #a7a7a7); cursor: pointer; }
+		.ss-btn:hover { color: var(--text-base, #fff); transform: scale(1.08); }
+		.ss-link { border: 0; background: transparent; color: var(--text-base, #fff); text-decoration: underline; cursor: pointer; font-size: 13px; padding: 0; }
+		@media (max-width: 900px) { .ss-row { grid-template-columns: 48px minmax(0, 1fr) auto 48px; } .ss-album { display: none; } }
+
+		.ss-mini { position: fixed; left: 16px; bottom: 104px; z-index: 9999; width: 340px; display: none; grid-template-columns: 48px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px; border-radius: 10px; background: var(--background-elevated-base, #242424); color: var(--text-base, #fff); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
+		.ss-mini.ss-visible { display: grid; }
+		.ss-mini-cover { width: 48px; height: 48px; border-radius: 6px; object-fit: cover; background: rgba(128, 128, 128, 0.3); }
+		.ss-mini-title { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.ss-mini-sub { font-size: 12px; color: var(--text-subdued, #a7a7a7); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.ss-mini-seek { width: 100%; margin: 6px 0 0; accent-color: var(--essential-bright-accent, #1ed760); }
+		.ss-mini-ctrl { display: flex; gap: 2px; }
+
+		.ss-queue { display: flex; flex-direction: column; gap: 4px; min-width: 380px; max-height: 60vh; overflow-y: auto; }
+		.ss-queue .ss-row { grid-template-columns: 48px minmax(0, 1fr) auto; }
+		.ss-queue .ss-actions { opacity: 1; }
+		.ss-settings label { display: block; margin: 12px 0 4px; font-size: 13px; color: var(--text-subdued, #a7a7a7); }
+		.ss-settings textarea, .ss-settings input[type="text"] { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 6px; border: 1px solid rgba(128, 128, 128, 0.5); background: rgba(128, 128, 128, 0.15); color: var(--text-base, #fff); font-family: monospace; font-size: 12px; }
+		.ss-settings .ss-buttons { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+		.ss-settings button.ss-primary { padding: 8px 16px; border: 0; border-radius: 500px; background: var(--essential-bright-accent, #1ed760); color: #000; font-weight: 700; cursor: pointer; }
+		.ss-settings button.ss-secondary { padding: 8px 16px; border: 1px solid rgba(128, 128, 128, 0.6); border-radius: 500px; background: transparent; color: var(--text-base, #fff); cursor: pointer; }
+		.ss-settings pre { margin: 12px 0 0; padding: 10px; max-height: 220px; overflow: auto; border-radius: 6px; background: rgba(0, 0, 0, 0.35); font-size: 11px; white-space: pre-wrap; }
+		.ss-settings small { display: block; margin-top: 10px; color: var(--text-subdued, #a7a7a7); }
+	`)
+	);
+
+	// ---------------------------------------------------------------------
+	// Images (fall back to Blob URLs fetched through libcurl if <img> is blocked)
+	// ---------------------------------------------------------------------
+	const imageCache = new Map();
+
+	function loadImage(img, url) {
+		if (!url) return;
+		if (imageCache.has(url)) {
+			img.src = imageCache.get(url);
+			return;
+		}
+		img.addEventListener(
+			"error",
+			async () => {
+				if (img.dataset.fallback) return;
+				img.dataset.fallback = "1";
+				try {
+					const res = await curlFetch(url);
+					const blobUrl = URL.createObjectURL(await res.blob());
+					imageCache.set(url, blobUrl);
+					img.src = blobUrl;
+				} catch {
+					// leave the placeholder
+				}
+			},
+			{ once: true }
+		);
+		img.src = url;
+	}
+
+	// ---------------------------------------------------------------------
+	// Mini player (visible while a non-Spotify track is active)
+	// ---------------------------------------------------------------------
+	let mini = null;
+
+	function ensureMini() {
+		if (mini) return mini;
+		const cover = h("img", { class: "ss-mini-cover", alt: "" });
+		const title = h("div", { class: "ss-mini-title" });
+		const sub = h("div", { class: "ss-mini-sub" });
+		const seek = h("input", { class: "ss-mini-seek", type: "range", min: "0", max: "1000", value: "0" });
+		seek.addEventListener("input", () => {
+			const duration = Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
+			if (duration > 0) audio.currentTime = (Number(seek.value) / 1000) * duration;
+		});
+		const toggle = h("button", { class: "ss-btn", onClick: toggleYT });
+		const next = h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.next, onClick: playNextFromQueue });
+		const close = h("button", { class: "ss-btn", html: ICONS.close, onClick: () => stopYT(true) });
+		const root = h(
+			"div",
+			{ class: "ss-mini" },
+			cover,
+			h("div", { style: "min-width:0" }, title, sub, seek),
+			h("div", { class: "ss-mini-ctrl" }, toggle, next, close)
+		);
+		document.body.append(root);
+		mini = { root, cover, title, sub, seek, toggle, lastCoverUrl: "" };
+		return mini;
+	}
+
+	function renderMini() {
+		const ui = ensureMini();
+		const track = state.current;
+		ui.root.classList.toggle("ss-visible", Boolean(track) && state.status !== "idle");
+		if (!track) return;
+
+		ui.title.textContent = track.title;
+		ui.sub.textContent =
+			state.status === "loading"
+				? `${t("loading", state.progress)}  -  ${track.artists.join(", ")}`
+				: track.artists.join(", ");
+		if (ui.lastCoverUrl !== track.thumbnail) {
+			ui.lastCoverUrl = track.thumbnail;
+			ui.cover.removeAttribute("data-fallback");
+			loadImage(ui.cover, track.thumbnail);
+		}
+		ui.toggle.innerHTML = state.status === "playing" ? ICONS.pause : ICONS.play;
+		ui.toggle.title = state.status === "playing" ? "Pause" : t("play");
+		ui.seek.disabled = state.status === "loading";
+		if (state.status === "loading") ui.seek.value = String(Math.round(state.progress * 1000));
+	}
+
+	function updateSeek() {
+		if (!mini || state.status === "loading") return;
+		const duration = Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
+		if (duration > 0) mini.seek.value = String(Math.round((audio.currentTime / duration) * 1000));
+	}
+
+	// ---------------------------------------------------------------------
+	// Queue popup
+	// ---------------------------------------------------------------------
+	let queueModalBody = null;
+
+	function renderQueueRow(track, index) {
+		const img = h("img", { class: "ss-cover", alt: "" });
+		loadImage(img, track.thumbnail);
+		return h(
+			"div",
+			{ class: "ss-row" },
+			h("div", { class: "ss-cover-wrap" }, img),
+			h("div", { class: "ss-meta" }, h("div", { class: "ss-title" }, track.title), h("div", { class: "ss-sub" }, track.artists.join(", "))),
+			h(
+				"div",
+				{ class: "ss-actions" },
+				h("button", {
+					class: "ss-btn",
+					title: t("playNow"),
+					html: ICONS.play,
+					onClick: () => {
+						state.queue.splice(index, 1);
+						playTrack(track);
+						renderQueueModal();
+					},
+				}),
+				h("button", {
+					class: "ss-btn",
+					title: t("remove"),
+					html: ICONS.close,
+					onClick: () => {
+						state.queue.splice(index, 1);
+						renderQueueModal();
+					},
+				})
+			)
+		);
+	}
+
+	function renderQueueModal() {
+		if (!queueModalBody || !queueModalBody.isConnected) return;
+		queueModalBody.replaceChildren(
+			...(state.queue.length
+				? [
+						...state.queue.map(renderQueueRow),
+						h("button", { class: "ss-link", onClick: () => { state.queue.length = 0; renderQueueModal(); } }, t("clear")),
+				  ]
+				: [h("div", { class: "ss-status" }, t("queueEmpty"))])
+		);
+	}
+
+	function openQueue() {
+		queueModalBody = h("div", { class: "ss-queue" });
+		Spicetify.PopupModal.display({ title: t("queueTitle"), content: queueModalBody });
+		renderQueueModal();
+	}
+
+	// ---------------------------------------------------------------------
+	// Search page integration
+	// ---------------------------------------------------------------------
+	const search = { query: "", token: 0, timer: null, section: null, body: null, status: "idle", results: [], error: null };
+
+	function trackRow(track) {
+		const img = h("img", { class: "ss-cover", alt: "", loading: "lazy" });
+		loadImage(img, track.thumbnail);
+		return h(
+			"div",
+			{ class: "ss-row", onDblclick: () => playNow(track) },
+			h(
+				"div",
+				{ class: "ss-cover-wrap" },
+				img,
+				h("button", { class: "ss-cover-play", title: t("play"), html: ICONS.play, onClick: () => playNow(track) })
+			),
+			h("div", { class: "ss-meta" }, h("div", { class: "ss-title" }, track.title), h("div", { class: "ss-sub" }, track.artists.join(", "))),
+			h("div", { class: "ss-album" }, track.album),
+			h(
+				"div",
+				{ class: "ss-actions" },
+				h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
+				h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) })
+			),
+			h("div", { class: "ss-dur" }, formatTime(track.durationMs))
+		);
+	}
+
+	function ensureSection() {
+		if (!search.section) {
+			search.body = h("div", { class: "ss-body" });
+			search.section = h(
+				"section",
+				{ class: "ss-section" },
+				h("div", { class: "ss-head" }, h("h2", {}, t("sectionTitle")), h("span", {}, t("sectionSub"))),
+				search.body
+			);
+		}
+		return search.section;
+	}
+
+	function renderSearch() {
+		if (!search.body) return;
+		const { status } = search;
+		if (status === "loading") {
+			search.body.replaceChildren(h("div", { class: "ss-status" }, t("searching")));
+		} else if (status === "error") {
+			search.body.replaceChildren(
+				h(
+					"div",
+					{ class: "ss-status" },
+					h("span", {}, `${t("failed")} ${search.error || ""}`),
+					h("button", { class: "ss-link", onClick: () => runSearch(search.query) }, t("retry")),
+					h("button", { class: "ss-link", onClick: openSettings }, t("openSettings"))
+				)
+			);
+		} else if (status === "done" && !search.results.length) {
+			search.body.replaceChildren(h("div", { class: "ss-status" }, t("noResults")));
+		} else if (status === "done") {
+			search.body.replaceChildren(...search.results.map(trackRow));
+		}
+	}
+
+	function attachSection() {
+		if (!search.query || !search.section || search.section.isConnected) return;
+		const scroll = document.querySelector(".main-view-container__scroll-node-child");
+		if (!scroll) return;
+		const host = scroll.querySelector('[data-testid="search-body"]') || scroll.firstElementChild || scroll;
+		host.prepend(search.section);
+	}
+
+	function detachSection() {
+		search.section?.remove();
+	}
+
+	async function runSearch(query) {
+		const token = ++search.token;
+		search.query = query;
+		search.status = "loading";
+		ensureSection();
+		renderSearch();
+		attachSection();
+
+		try {
+			const results = await providers.youtube.search(query, config.resultLimit);
+			if (token !== search.token) return;
+			search.results = results;
+			search.status = "done";
+		} catch (error) {
+			if (token !== search.token) return;
+			console.error("[Synthesis Spotify] search failed", error);
+			search.error = error?.message || String(error);
+			search.status = "error";
+		}
+		renderSearch();
+		attachSection();
+	}
+
+	function onRoute(location) {
+		const match = (location?.pathname || "").match(/^\/search\/([^/]+)/);
+		clearTimeout(search.timer);
+		if (!match) {
+			search.token++;
+			search.query = "";
+			detachSection();
+			return;
+		}
+		let query = "";
+		try {
+			query = decodeURIComponent(match[1]).trim();
+		} catch {
+			query = match[1];
+		}
+		if (!query) {
+			search.token++;
+			search.query = "";
+			detachSection();
+			return;
+		}
+		if (query === search.query && search.status !== "error") {
+			attachSection();
+			return;
+		}
+		// Spotify updates the route while typing, so debounce before hitting YouTube.
+		search.timer = setTimeout(() => runSearch(query), SEARCH_DEBOUNCE_MS);
+	}
+
+	Spicetify.Platform.History.listen(onRoute);
+	onRoute(Spicetify.Platform.History.location);
+
+	// Spotify re-renders the search page and may drop our section; re-attach when needed.
+	let attachScheduled = false;
+	new MutationObserver(() => {
+		if (attachScheduled || !search.query) return;
+		attachScheduled = true;
+		requestAnimationFrame(() => {
+			attachScheduled = false;
+			attachSection();
+		});
+	}).observe(document.body, { childList: true, subtree: true });
+
+	// ---------------------------------------------------------------------
+	// Diagnostics and settings
+	// ---------------------------------------------------------------------
+	async function runDiagnostics(log) {
+		const step = async (label, fn) => {
+			log(`[..] ${label}`);
+			try {
+				const detail = await fn();
+				log(`[OK] ${label}${detail ? ` (${detail})` : ""}`);
+				return true;
+			} catch (error) {
+				log(`[NG] ${label}: ${error?.message || error}`);
+				return false;
+			}
+		};
+
+		let libcurl = null;
+		if (!(await step("libcurl.js (WASM)", async () => {
+			libcurl = await loadCurl();
+			return `wisp: ${libcurl.activeWisp}`;
+		}))) {
+			log("Hint: the WASM may be blocked by Spotify's CSP, or no Wisp server is reachable.");
+			return;
+		}
+
+		let tracks = [];
+		if (!(await step("youtubei.js session + YouTube Music search", async () => {
+			tracks = await youtubeSearch("daft punk one more time", 3);
+			if (!tracks.length) throw new Error("0 results");
+			return `${tracks.length} results`;
+		}))) {
+			return;
+		}
+
+		const working = [];
+		for (const client of config.clients) {
+			await step(`player response with ${client}`, async () => {
+				const data = await requestPlayer(tracks[0].id, client);
+				const fmt = pickAudioFormat(data.streamingData);
+				if (!fmt) throw new Error("no audio format in the response");
+				const ciphered = Boolean(fmt.signatureCipher || fmt.cipher || /[?&]n=/.test(fmt.url || ""));
+				const url = await resolveFormatUrl(fmt);
+				working.push({ url, client, fmt });
+				return `${fmt.mimeType}, ${Math.round((Number(fmt.contentLength) || 0) / 1024)} KiB${ciphered ? ", deciphered with JS player" : ""}`;
+			});
+		}
+		log(`Session cookies: ${[...cookieJar.keys()].join(", ") || "(none)"}`);
+		if (!working.length) {
+			log("Hint: every client failed. Check the messages above (eval/CSP errors, HTTP status, or LOGIN_REQUIRED).");
+			if (!isLocalWisp()) log(`Hint: ${t("botHint")}`);
+			return;
+		}
+		const info = working[0];
+		log(`Using ${info.client} for the download test.`);
+
+		await step("audio fetch via libcurl (first 64 KiB)", async () => {
+			const res = await curlFetch(`${info.url}&range=0-65535`, {
+				headers: {
+					origin: "https://www.youtube.com",
+					referer: "https://www.youtube.com",
+					"user-agent": CLIENT_DEFS[info.client].client.userAgent,
+				},
+			});
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const buf = await res.arrayBuffer();
+			return `${buf.byteLength} bytes`;
+		});
+	}
+
+	function openSettings() {
+		const wisp = h("textarea", { rows: "3" });
+		wisp.value = config.wispServers.join("\n");
+		const clients = h("input", { type: "text" });
+		clients.value = config.clients.join(", ");
+		const output = h("pre", { style: "display:none" });
+		const log = (line) => {
+			output.style.display = "block";
+			output.textContent += `${line}\n`;
+			output.scrollTop = output.scrollHeight;
+		};
+		const collect = () => ({
+			wispServers: wisp.value.split("\n").map((s) => s.trim()).filter(Boolean),
+			clients: clients.value.split(",").map((s) => s.trim()).filter(Boolean),
+		});
+
+		const content = h(
+			"div",
+			{ class: "ss-settings" },
+			h("label", {}, t("wispLabel")),
+			wisp,
+			h("label", {}, t("clientsLabel")),
+			clients,
+			h(
+				"div",
+				{ class: "ss-buttons" },
+				h("button", { class: "ss-primary", onClick: () => { saveConfig(collect()); notify(t("saved")); } }, t("save")),
+				h(
+					"button",
+					{
+						class: "ss-secondary",
+						onClick: async () => {
+							saveConfig(collect());
+							// Reset the lazily created singletons so the new settings take effect.
+							curlPromise = null;
+							innertubes.plain = null;
+							innertubes.player = null;
+							warmUpPromise = null;
+							cookieJar.clear();
+							output.textContent = "";
+							await runDiagnostics(log);
+						},
+					},
+					t("test")
+				),
+				h("button", { class: "ss-secondary", onClick: () => { clearAudioCache(); notify(t("cacheCleared")); } }, t("clearCache"))
+			),
+			output,
+			h("small", {}, `${t("privacyNote")}  ${VERSION}`)
+		);
+		Spicetify.PopupModal.display({ title: t("settingsTitle"), content });
+	}
+
+	// ---------------------------------------------------------------------
+	// Registration
+	// ---------------------------------------------------------------------
+	try {
+		new Spicetify.Menu.Item(t("menu"), false, () => openSettings()).register();
+	} catch (error) {
+		console.warn("[Synthesis Spotify] Failed to register menu item", error);
+	}
+	try {
+		new Spicetify.Playbar.Button(t("queueTitle"), "queue", () => openQueue());
+	} catch (error) {
+		console.warn("[Synthesis Spotify] Failed to register playbar button", error);
+	}
+
+	// Warm up the heavy libraries while the app is idle so the first search feels fast.
+	(window.requestIdleCallback || ((fn) => setTimeout(fn, 4000)))(() => {
+		getInnertube().catch((error) => console.warn("[Synthesis Spotify] warm-up failed", error));
+	});
+
+	window.SynthesisSpotify = { version: VERSION, state, get config() { return config; }, providers, runDiagnostics };
+	console.log(`[Synthesis Spotify] ${VERSION} loaded`);
 })();

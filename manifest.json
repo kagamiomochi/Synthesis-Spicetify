@@ -1,7 +1,7 @@
 [
   {
-    "name": "Synthesis-Spotify",
-    "description": "Search YouTube Music directly from Spotify and open tracks in YouTube Music. No server or yt-dlp required.",
+    "name": "Synthesis Spotify",
+    "description": "Transcending all musical boundaries.",
     "preview": "preview.png",
     "main": "synthesis-spotify.js",
     "readme": "README.md",
