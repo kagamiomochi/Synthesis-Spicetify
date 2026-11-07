@@ -1,0 +1,10 @@
+[Unit]
+Description=Wisp server for Synthesis Spotify (backend on 127.0.0.1:6002)
+# Stop as soon as the proxy service that needs this unit is gone.
+StopWhenUnneeded=yes
+
+[Service]
+ExecStart=@RUN_SH@ --host 127.0.0.1 --port 6002
+# Report "started" only once the port accepts connections, so the proxy never
+# connects to a server that is still booting. ($$ is a literal $ in unit files.)
+ExecStartPost=/usr/bin/env bash -c 'for i in $$(seq 150); do (exec 3<>/dev/tcp/127.0.0.1/6002) 2>/dev/null && exit 0; sleep 0.2; done; exit 1'

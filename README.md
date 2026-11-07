@@ -94,6 +94,27 @@ systemctl --user enable --now synthesis-spotify-wisp.service
 On macOS or Windows, start `server/run.sh` yourself (Windows: inside WSL) or wrap it in your platform's service
 mechanism. These setups are untested.
 
+### Start it on demand with systemd socket activation (Linux, recommended)
+
+systemd listens on `127.0.0.1:6001`. The first connection starts the real Wisp server (on `127.0.0.1:6002`) and is
+forwarded to it; after 5 idle minutes both stop again. Spotify only connects to `ws://localhost:6001/` as usual, so
+nothing inside Spotify has to launch anything and no extension setting is needed.
+
+1. Install the units. If libcurl.js is not at the given path yet, the script clones it (with its submodule). The
+   path argument is optional; this is the default:
+
+   ```sh
+   wisp-launcher/linux/systemd/install.sh ~/.local/share/synthesis-spotify/libcurl.js
+   ```
+
+2. Run the `server/run.sh` inside that directory once by hand so the Python virtual environment gets created, then
+   stop it.
+3. Remove it with `wisp-launcher/linux/systemd/uninstall.sh`.
+
+The always-on service from the previous section also uses port 6001, so disable it first
+(`systemctl --user disable --now synthesis-spotify-wisp.service`). The first search after a cold start waits a few
+seconds while the server boots.
+
 ## Usage
 
 1. Search in Spotify as usual. The "Synthesis Spotify" section appears on the search results page.
@@ -180,17 +201,21 @@ Spotify の Spicetify Marketplace で「Synthesis Spotify」を検索してイ�
 
 ## ローカル Wisp サーバーの用意
 
-Python 3 と git が必要です。
+### systemd のソケットアクティベーションでオンデマンド起動する (Linux)
 
-```sh
-git clone https://github.com/ading2210/libcurl.js --recursive
-cd libcurl.js
-server/run.sh
-```
+Python3 と git が必要です。
 
-初回は仮想環境の作成と依存関係のインストールが行われます。`ws://localhost:6001/` で待ち受け、拡張が最初に試すアドレスと一致します。
+systemd が `127.0.0.1:6001` で待ち受け、最初の接続で本物の Wisp サーバー (`127.0.0.1:6002`) を起動して接続を転送します。5 分間アイドルになると両方とも止まります。Spotify はこれまで通り `ws://localhost:6001/` に接続するだけなので、Spotify の中から何かを起動する必要はなく、拡張の設定も不要です。
 
-Linux でバックグラウンド常駐させる場合は、上の英語セクションの systemd ユーザーサービスの例を使ってください。macOS と Windows(WSL)は未検証です。
+1. ユニットをインストールします。指定のパスに libcurl.js が無ければ、スクリプトがサブモジュールごと clone します。
+   パス引数は省略可で、下記が既定値です。
+
+   ```sh
+   wisp-launcher/linux/systemd/install.sh ~/.local/share/synthesis-spotify/libcurl.js
+   ```
+
+2. そのディレクトリ内の `server/run.sh` を一度手動で実行して Python の仮想環境を作り、止めます。
+3. 削除は `wisp-launcher/linux/systemd/uninstall.sh` で行います。
 
 ## 使い方
 
