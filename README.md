@@ -1,5 +1,7 @@
 # Synthesis Spotify
 
+[![Latest Tag](https://img.shields.io/github/v/tag/kagamiomochi/Synthesis-Spotify?sort=semver)](https://github.com/kagamiomochi/Synthesis-Spotify/tags)
+
 A [Spicetify](https://spicetify.app/) extension that brings YouTube Music into Spotify.
 
 - A "Synthesis Spotify" section with YouTube Music results appears on Spotify's search results page
