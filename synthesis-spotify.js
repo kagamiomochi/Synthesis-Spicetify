@@ -105,6 +105,7 @@
 			play: "再生",
 			addQueue: "キューに追加",
 			playNext: "次に再生",
+			openBrowser: "ブラウザで開く",
 			queueTitle: "Synthesis Spotify キュー",
 			queueEmpty: "キューは空です。",
 			remove: "削除",
@@ -138,6 +139,7 @@
 			play: "Play",
 			addQueue: "Add to queue",
 			playNext: "Play next",
+			openBrowser: "Open in browser",
 			queueTitle: "Synthesis Spotify queue",
 			queueEmpty: "The queue is empty.",
 			remove: "Remove",
@@ -177,6 +179,7 @@
 		next: svg("M12.7 1h1.6v14h-1.6zM1.7 1.6v12.8a.5.5 0 0 0 .8.4l8.6-6.4a.5.5 0 0 0 0-.8L2.5 1.2a.5.5 0 0 0-.8.4z"),
 		plus: svg("M15 7H9V1H7v6H1v2h6v6h2V9h6z"),
 		playNext: svg("M1 2h9v1.5H1zM1 6.25h9v1.5H1zM1 10.5h5v1.5H1zM10 9.5v5l4.5-2.5z"),
+		external: svg("M7 2v1.5H3.5v9h9V9H14v5.5H2V2zM9 1h6v6h-1.5V3.56L8.53 8.53 7.47 7.47l4.97-4.97H9z"),
 		close: svg("M2.47 2.47a.75.75 0 0 1 1.06 0L8 6.94l4.47-4.47a.75.75 0 1 1 1.06 1.06L9.06 8l4.47 4.47a.75.75 0 1 1-1.06 1.06L8 9.06l-4.47 4.47a.75.75 0 0 1-1.06-1.06L6.94 8 2.47 3.53a.75.75 0 0 1 0-1.06z"),
 	};
 
@@ -1053,6 +1056,14 @@
 	// ---------------------------------------------------------------------
 	// Search page integration
 	// ---------------------------------------------------------------------
+	// Open the track on YouTube Music in the default external browser
+	function openInBrowser(track) {
+		const url = `https://music.youtube.com/watch?v=${encodeURIComponent(track.id)}`;
+		// Do not check the return value: the Spotify client may return null even when the browser opened,
+		// and a fallback would open a second tab
+		window.open(url, "_blank", "noopener,noreferrer");
+	}
+
 	const search = { query: "", token: 0, timer: null, section: null, body: null, status: "idle", results: [], error: null };
 
 	function trackRow(track) {
@@ -1073,7 +1084,8 @@
 				"div",
 				{ class: "ss-actions" },
 				h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
-				h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) })
+				h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) }),
+				h("button", { class: "ss-btn", title: t("openBrowser"), html: ICONS.external, onClick: () => openInBrowser(track) })
 			),
 			h("div", { class: "ss-dur" }, formatTime(track.durationMs))
 		);
