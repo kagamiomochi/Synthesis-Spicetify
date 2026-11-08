@@ -1,8 +1,0 @@
-[Unit]
-Description=Wisp socket for Synthesis Spotify (127.0.0.1:6001)
-
-[Socket]
-ListenStream=127.0.0.1:6001
-
-[Install]
-WantedBy=sockets.target

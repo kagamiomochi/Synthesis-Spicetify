@@ -6,19 +6,22 @@ the first connection arrives. Connections are forwarded to the backend, and the
 backend is stopped again after it has been idle for a while. Spotify keeps
 connecting to ws://localhost:6001/ as usual.
 
-On macOS, the listening socket is owned by launchd (socket activation): nothing runs
-until the first connection, and the launcher exits again when idle. On Windows, a small
-launcher process stays resident and only the Wisp server is started on demand.
+The setup is the same on every OS (Linux, macOS, Windows): run "install" once.
+
+- Linux: systemd user units. systemd owns the listening socket and uses
+  systemd-socket-proxyd to forward connections, so nothing runs until the first connection.
+- macOS: a LaunchAgent with launchd socket activation, so nothing runs until the first
+  connection, and the launcher exits again when idle.
+- Windows: a scheduled task starts a small launcher process at login, and only the Wisp
+  server is started on demand.
 
 Only the Python standard library is used. Python 3.9+ and git are required.
 
 Usage:
-  python wisp_ondemand.py install     # setup + register autostart (macOS / Windows)
+  python wisp_ondemand.py install     # setup + register autostart (Linux / macOS / Windows)
   python wisp_ondemand.py uninstall   # remove autostart and stop the backend
   python wisp_ondemand.py setup       # only clone libcurl.js and prepare the venv
   python wisp_ondemand.py run         # run the launcher in the foreground
-
-On Linux the systemd socket activation in ../linux/systemd is recommended instead.
 """
 
 import argparse
@@ -108,7 +111,11 @@ def ensure_checkout(libcurl_dir):
 def ensure_venv(libcurl_dir):
     python = venv_python(libcurl_dir)
     if not python.is_file():
-        run_checked([sys.executable, "-m", "venv", server_dir(libcurl_dir) / ".venv"])
+        try:
+            run_checked([sys.executable, "-m", "venv", server_dir(libcurl_dir) / ".venv"])
+        except subprocess.CalledProcessError:
+            raise SystemExit("Failed to create the Python virtual environment. "
+                             "On Debian/Ubuntu, install the python3-venv package and try again.")
     probe = subprocess.run([str(python), "-c", "import wisp.server.cli"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if probe.returncode != 0:
@@ -502,6 +509,119 @@ def uninstall_windows(args):
         pid_path.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# Autostart: systemd user units (Linux)
+# ---------------------------------------------------------------------------
+
+SYSTEMD_SOCKET = f"{APP_NAME}-wisp-proxy.socket"
+SYSTEMD_PROXY = f"{APP_NAME}-wisp-proxy.service"
+SYSTEMD_BACKEND = f"{APP_NAME}-wisp-backend.service"
+# The always-on example unit from old versions of the README. It would occupy the port.
+SYSTEMD_LEGACY = f"{APP_NAME}-wisp.service"
+
+
+def systemd_unit_dir():
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return config / "systemd" / "user"
+
+
+def systemctl(*cmd, check=True):
+    full = ["systemctl", "--user", *cmd]
+    if check:
+        run_checked(full)
+    elif shutil.which("systemctl") is not None:
+        subprocess.run(full, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def systemd_quote(value):
+    """Quote one word of an ExecStart= line."""
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    text = text.replace("%", "%%").replace("$", "$$")
+    return f'"{text}"'
+
+
+def find_socket_proxyd():
+    for candidate in ("/usr/lib/systemd/systemd-socket-proxyd",
+                      "/lib/systemd/systemd-socket-proxyd"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which("systemd-socket-proxyd")
+    if found:
+        return found
+    raise SystemExit("systemd-socket-proxyd was not found.")
+
+
+def check_linux(args):
+    """Check the prerequisites before the (slow) setup. Returns the proxyd path."""
+    if shutil.which("systemctl") is None:
+        raise SystemExit("systemctl was not found. Without systemd, run "
+                         "`wisp_ondemand.py run` yourself, for example from your session's autostart.")
+    legacy = subprocess.run(["systemctl", "--user", "is-enabled", SYSTEMD_LEGACY],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if legacy.returncode == 0:
+        raise SystemExit(f"{SYSTEMD_LEGACY} is enabled and would conflict on port "
+                         f"{args.listen_port}.\n  systemctl --user disable --now {SYSTEMD_LEGACY}")
+    return find_socket_proxyd()
+
+
+def linux_units(args, proxyd):
+    """Return {unit file name: content} for the socket-activated setup."""
+    python = venv_python(args.libcurl_dir)
+    idle = max(1, round(args.idle_minutes * 60))
+    # Report "started" only once the port accepts connections, so the proxy never
+    # connects to a server that is still booting. ($$ is a literal $ in unit files.)
+    wait = (f"for i in $$(seq 150); do (exec 3<>/dev/tcp/{HOST}/{args.backend_port}) "
+            "2>/dev/null && exit 0; sleep 0.2; done; exit 1")
+    backend = f"""[Unit]
+Description=Wisp server for Synthesis Spotify (backend on {HOST}:{args.backend_port})
+# Stop as soon as the proxy service that needs this unit is gone.
+StopWhenUnneeded=yes
+
+[Service]
+ExecStart={systemd_quote(python)} -m wisp.server --host {HOST} --port {args.backend_port} --log-level warning --threads 1
+ExecStartPost=/usr/bin/env bash -c '{wait}'
+"""
+    proxy = f"""[Unit]
+Description=Wisp proxy for Synthesis Spotify (starts the backend on demand)
+Requires={SYSTEMD_BACKEND}
+After={SYSTEMD_BACKEND}
+
+[Service]
+# Exits after being idle, which in turn stops the backend (StopWhenUnneeded).
+ExecStart={systemd_quote(proxyd)} --exit-idle-time={idle}s {HOST}:{args.backend_port}
+"""
+    socket_unit = f"""[Unit]
+Description=Wisp socket for Synthesis Spotify ({HOST}:{args.listen_port})
+
+[Socket]
+ListenStream={HOST}:{args.listen_port}
+
+[Install]
+WantedBy=sockets.target
+"""
+    return {SYSTEMD_BACKEND: backend, SYSTEMD_PROXY: proxy, SYSTEMD_SOCKET: socket_unit}
+
+
+def install_linux(args, proxyd):
+    unit_dir = systemd_unit_dir()
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    for name, content in linux_units(args, proxyd).items():
+        (unit_dir / name).write_text(content, encoding="utf-8")
+    systemctl("daemon-reload")
+    # Stop old instances first, so that a re-install picks up new settings.
+    systemctl("stop", SYSTEMD_SOCKET, SYSTEMD_PROXY, SYSTEMD_BACKEND, check=False)
+    systemctl("enable", "--now", SYSTEMD_SOCKET)
+    print(f"Logs: journalctl --user -u {SYSTEMD_BACKEND} -u {SYSTEMD_PROXY}")
+
+
+def uninstall_linux(args):
+    systemctl("disable", "--now", SYSTEMD_SOCKET, check=False)
+    systemctl("stop", SYSTEMD_PROXY, SYSTEMD_BACKEND, check=False)
+    for name in (SYSTEMD_BACKEND, SYSTEMD_PROXY, SYSTEMD_SOCKET):
+        (systemd_unit_dir() / name).unlink(missing_ok=True)
+    systemctl("daemon-reload", check=False)
+
+
 def cmd_install(args):
     if sys.platform == "darwin":
         cmd_setup(args)
@@ -509,9 +629,13 @@ def cmd_install(args):
     elif IS_WINDOWS:
         cmd_setup(args)
         install_windows(args)
+    elif sys.platform.startswith("linux"):
+        proxyd = check_linux(args)
+        cmd_setup(args)
+        install_linux(args, proxyd)
     else:
-        raise SystemExit("On Linux, use wisp-launcher/linux/systemd/install.sh "
-                         "(or run `wisp_ondemand.py run` yourself).")
+        raise SystemExit(f"Unsupported platform: {sys.platform}. "
+                         "Run `wisp_ondemand.py run` yourself.")
     print(f"Installed. The launcher listens on {HOST}:{args.listen_port} "
           "and starts the Wisp server on the first connection.")
 
@@ -521,8 +645,10 @@ def cmd_uninstall(args):
         uninstall_macos(args)
     elif IS_WINDOWS:
         uninstall_windows(args)
+    elif sys.platform.startswith("linux"):
+        uninstall_linux(args)
     else:
-        raise SystemExit("On Linux, use wisp-launcher/linux/systemd/uninstall.sh.")
+        raise SystemExit(f"Unsupported platform: {sys.platform}.")
     print("Removed the autostart entry and stopped the launcher.")
 
 
