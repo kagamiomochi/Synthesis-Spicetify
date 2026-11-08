@@ -15,18 +15,20 @@ The setup is the same on every OS (Linux, macOS, Windows): run "install" once.
 - Windows: a scheduled task starts a small launcher process at login, and only the Wisp
   server is started on demand.
 
-Only the Python standard library is used. Python 3.9+ and git are required.
+The launcher itself only uses the Python standard library (3.9+). The Wisp server is
+wisp-js (Node.js), installed with npm, so Node.js 22.18+ (or 24.11+) and npm are required.
 
 Usage:
   python wisp_ondemand.py install     # setup + register autostart (Linux / macOS / Windows)
   python wisp_ondemand.py uninstall   # remove autostart and stop the backend
-  python wisp_ondemand.py setup       # only clone libcurl.js and prepare the venv
+  python wisp_ondemand.py setup       # only install wisp-js with npm
   python wisp_ondemand.py run         # run the launcher in the foreground
 """
 
 import argparse
 import asyncio
 import ctypes
+import json
 import logging
 import logging.handlers
 import os
@@ -44,7 +46,8 @@ from xml.sax.saxutils import escape
 APP_NAME = "synthesis-spotify"
 TASK_NAME = "SynthesisSpotifyWisp"
 LAUNCHD_LABEL = "io.github.kagamiomochi.synthesis-spotify-wisp"
-LIBCURL_REPO = "https://github.com/ading2210/libcurl.js"
+WISP_PACKAGE = "@mercuryworkshop/wisp-js"
+WISP_VERSION = "0.5.3"  # pinned; bump deliberately
 HOST = "127.0.0.1"
 IS_WINDOWS = os.name == "nt"
 
@@ -53,34 +56,33 @@ IS_WINDOWS = os.name == "nt"
 # Paths
 # ---------------------------------------------------------------------------
 
-def default_libcurl_dir():
+def default_install_dir():
     if IS_WINDOWS:
         base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
     else:
         base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-    return base / APP_NAME / "libcurl.js"
+    return base / APP_NAME / "wisp-js"
 
 
-def server_dir(libcurl_dir):
-    return libcurl_dir / "server" / "wisp_server"
+def package_dir(install_dir):
+    return install_dir / "node_modules" / "@mercuryworkshop" / "wisp-js"
 
 
-def venv_python(libcurl_dir):
-    venv = server_dir(libcurl_dir) / ".venv"
-    return venv / ("Scripts/python.exe" if IS_WINDOWS else "bin/python")
+def entry_script(install_dir):
+    return package_dir(install_dir) / "src" / "bin" / "server_cli.mjs"
 
 
-def state_dir(libcurl_dir):
-    # Logs and the pid file live next to the libcurl.js checkout.
-    return libcurl_dir.parent
+def state_dir(install_dir):
+    # Logs and the pid file live next to the wisp-js directory.
+    return install_dir.parent
 
 
-def pid_file(libcurl_dir):
-    return state_dir(libcurl_dir) / "wisp-backend.pid"
+def pid_file(install_dir):
+    return state_dir(install_dir) / "wisp-backend.pid"
 
 
 # ---------------------------------------------------------------------------
-# Setup: clone libcurl.js and prepare the Python virtual environment
+# Setup: install wisp-js with npm
 # ---------------------------------------------------------------------------
 
 def run_checked(cmd):
@@ -88,44 +90,64 @@ def run_checked(cmd):
     subprocess.check_call([str(c) for c in cmd])
 
 
-def ensure_checkout(libcurl_dir):
-    if (server_dir(libcurl_dir) / "pyproject.toml").is_file():
+def node_version(node):
+    try:
+        out = subprocess.run([str(node), "--version"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=20).stdout
+        return tuple(int(part) for part in out.strip().lstrip("v").split(".")[:3])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def node_supported(version):
+    # wisp-js (through its dependencies) needs Node.js ^22.18.0 || >=24.11.0.
+    major, minor = version[0], version[1]
+    return (major == 22 and minor >= 18) or (major == 24 and minor >= 11) or major >= 25
+
+
+def find_node(explicit=None):
+    """Return the absolute path of a usable Node.js binary."""
+    found = str(explicit) if explicit else shutil.which("node")
+    if not found:
+        raise SystemExit("Node.js was not found. Install Node.js 22.18+ (or 24.11+), "
+                         "or pass --node PATH.")
+    version = node_version(found)
+    if version is None:
+        raise SystemExit(f"Could not run `{found} --version`.")
+    if not node_supported(version):
+        raise SystemExit(f"Node.js {'.'.join(map(str, version))} is not supported by wisp-js. "
+                         "Install Node.js 22.18+ (or 24.11+), or pass --node PATH.")
+    return Path(os.path.abspath(found))
+
+
+def installed_version(install_dir):
+    try:
+        data = json.loads((package_dir(install_dir) / "package.json").read_text(encoding="utf-8"))
+        return data.get("version")
+    except (OSError, ValueError):
+        return None
+
+
+def ensure_install(install_dir):
+    if entry_script(install_dir).is_file() and installed_version(install_dir) == WISP_VERSION:
         return
-    if shutil.which("git") is None:
-        raise SystemExit("git is required to clone libcurl.js.")
-    if libcurl_dir.exists() and any(libcurl_dir.iterdir()):
-        if (libcurl_dir / ".git").exists():
-            # A clone made without --recursive lacks the Wisp server submodule.
-            run_checked(["git", "-C", libcurl_dir, "submodule", "update",
-                         "--init", "--depth", "1", "--recursive"])
-        else:
-            raise SystemExit(f"{libcurl_dir} exists but is not a libcurl.js git clone.")
-    else:
-        libcurl_dir.parent.mkdir(parents=True, exist_ok=True)
-        run_checked(["git", "clone", "--depth", "1", "--recurse-submodules",
-                     "--shallow-submodules", LIBCURL_REPO, libcurl_dir])
-    if not (server_dir(libcurl_dir) / "pyproject.toml").is_file():
-        raise SystemExit(f"The Wisp server was not found in {libcurl_dir}.")
-
-
-def ensure_venv(libcurl_dir):
-    python = venv_python(libcurl_dir)
-    if not python.is_file():
-        try:
-            run_checked([sys.executable, "-m", "venv", server_dir(libcurl_dir) / ".venv"])
-        except subprocess.CalledProcessError:
-            raise SystemExit("Failed to create the Python virtual environment. "
-                             "On Debian/Ubuntu, install the python3-venv package and try again.")
-    probe = subprocess.run([str(python), "-c", "import wisp.server.cli"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if probe.returncode != 0:
-        run_checked([python, "-m", "pip", "install", "-e", server_dir(libcurl_dir)])
+    npm = shutil.which("npm")
+    if npm is None:
+        raise SystemExit("npm was not found. It comes with Node.js; install it and try again.")
+    install_dir.mkdir(parents=True, exist_ok=True)
+    run_checked([npm, "install", "--prefix", install_dir, f"{WISP_PACKAGE}@{WISP_VERSION}",
+                 "--save-exact", "--omit=dev", "--no-audit", "--no-fund"])
+    if not entry_script(install_dir).is_file():
+        raise SystemExit(f"The Wisp server was not found in {install_dir} after npm install.")
 
 
 def cmd_setup(args):
-    ensure_checkout(args.libcurl_dir)
-    ensure_venv(args.libcurl_dir)
-    print(f"Wisp server is ready in {args.libcurl_dir}")
+    # Resolved once and recorded in the autostart entries, because launchd, Task Scheduler
+    # and systemd do not see the PATH of an interactive shell.
+    args.node = find_node(args.node)
+    ensure_install(args.install_dir)
+    print(f"Wisp server (wisp-js {WISP_VERSION}) is ready in {args.install_dir}")
+    print(f"Node.js: {args.node}")
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +190,9 @@ async def port_open(port):
 class Backend:
     """Owns the real Wisp server process."""
 
-    def __init__(self, libcurl_dir, port, startup_timeout):
-        self.libcurl_dir = libcurl_dir
+    def __init__(self, install_dir, node, port, startup_timeout):
+        self.install_dir = install_dir
+        self.node = node
         self.port = port
         self.startup_timeout = startup_timeout
         self.proc = None
@@ -189,27 +212,22 @@ class Backend:
             await self._start()
 
     async def _start(self):
-        python = venv_python(self.libcurl_dir)
-        if not python.is_file():
-            raise RuntimeError(f"{python} not found. Run: wisp_ondemand.py setup")
-        cmd = [str(python), "-m", "wisp.server", "--host", HOST, "--port", str(self.port),
-               "--log-level", "warning"]
+        entry = entry_script(self.install_dir)
+        if not entry.is_file():
+            raise RuntimeError(f"{entry} not found. Run: wisp_ondemand.py setup")
+        cmd = [str(self.node), str(entry), "-H", HOST, "-P", str(self.port), "-L", "WARN"]
         kwargs = {}
         if IS_WINDOWS:
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         else:
-            # One worker is plenty for a single local user (the default is one per CPU core).
-            # Not passed on Windows: the server only supports the option where SO_REUSEPORT
-            # exists, and elsewhere it calls logging.warn(), which Python 3.13 removed.
-            cmd += ["--threads", "1"]
-            # Own process group, so that worker processes can be stopped together with it.
+            # Own process group, so that it can be stopped together with any children.
             kwargs["start_new_session"] = True
-        log_path = state_dir(self.libcurl_dir) / "wisp-backend.log"
+        log_path = state_dir(self.install_dir) / "wisp-backend.log"
         logging.info("starting the Wisp server on %s:%d", HOST, self.port)
         with open(log_path, "wb") as log:
             self.proc = await asyncio.create_subprocess_exec(
                 *cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, **kwargs)
-        pid_file(self.libcurl_dir).write_text(str(self.proc.pid))
+        pid_file(self.install_dir).write_text(str(self.proc.pid))
 
         deadline = time.monotonic() + self.startup_timeout
         while time.monotonic() < deadline:
@@ -235,11 +253,10 @@ class Backend:
     async def _stop(self):
         proc, self.proc = self.proc, None
         if proc is None or proc.returncode is not None:
-            pid_file(self.libcurl_dir).unlink(missing_ok=True)
+            pid_file(self.install_dir).unlink(missing_ok=True)
             return
         if IS_WINDOWS:
-            # The venv python.exe is a redirector that starts the real interpreter
-            # as a child, so the whole process tree has to be killed.
+            # Kill the whole process tree, in case the server left children behind.
             kill_tree_windows(proc.pid)
         else:
             signal_group(proc.pid, signal.SIGTERM)
@@ -249,9 +266,9 @@ class Backend:
             proc.kill()
             await proc.wait()
         if not IS_WINDOWS:
-            # Worker processes may outlive the parent for a moment and keep the port open.
+            # Make sure nothing outlives the parent and keeps the port open.
             signal_group(proc.pid, signal.SIGKILL)
-        pid_file(self.libcurl_dir).unlink(missing_ok=True)
+        pid_file(self.install_dir).unlink(missing_ok=True)
 
 
 def signal_group(pgid, sig):
@@ -330,7 +347,7 @@ class Proxy:
 
 
 async def serve(args):
-    backend = Backend(args.libcurl_dir, args.backend_port, args.startup_timeout)
+    backend = Backend(args.install_dir, args.node, args.backend_port, args.startup_timeout)
     stop_event = asyncio.Event()
     if args.launchd_socket:
         proxy = Proxy(backend, args.backend_port, args.idle_minutes * 60, exit_event=stop_event)
@@ -361,10 +378,10 @@ async def serve(args):
         await backend.stop()
 
 
-def setup_logging(libcurl_dir):
-    state_dir(libcurl_dir).mkdir(parents=True, exist_ok=True)
+def setup_logging(install_dir):
+    state_dir(install_dir).mkdir(parents=True, exist_ok=True)
     handlers = [logging.handlers.RotatingFileHandler(
-        state_dir(libcurl_dir) / "wisp-ondemand.log", maxBytes=256 * 1024, backupCount=1,
+        state_dir(install_dir) / "wisp-ondemand.log", maxBytes=256 * 1024, backupCount=1,
         encoding="utf-8")]
     # pythonw.exe has no console, so only log to stderr when there is a terminal.
     if sys.stderr is not None and sys.stderr.isatty():
@@ -374,7 +391,8 @@ def setup_logging(libcurl_dir):
 
 
 def cmd_run(args):
-    setup_logging(args.libcurl_dir)
+    args.node = find_node(args.node)
+    setup_logging(args.install_dir)
     try:
         asyncio.run(serve(args))
     except OSError as exc:
@@ -389,7 +407,7 @@ def cmd_run(args):
 # ---------------------------------------------------------------------------
 
 def run_arguments(args, extra=()):
-    return ["run", "--libcurl-dir", str(args.libcurl_dir),
+    return ["run", "--install-dir", str(args.install_dir), "--node", str(args.node),
             "--listen-port", str(args.listen_port), "--backend-port", str(args.backend_port),
             "--idle-minutes", str(args.idle_minutes)] + list(extra)
 
@@ -501,7 +519,7 @@ def uninstall_windows(args):
     subprocess.run(["schtasks", "/End", "/TN", TASK_NAME], **quiet)
     subprocess.run(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"], **quiet)
     # Ending the task kills the launcher without letting it stop the backend.
-    pid_path = pid_file(args.libcurl_dir)
+    pid_path = pid_file(args.install_dir)
     if pid_path.is_file():
         pid = pid_path.read_text().strip()
         if pid.isdigit():
@@ -566,7 +584,8 @@ def check_linux(args):
 
 def linux_units(args, proxyd):
     """Return {unit file name: content} for the socket-activated setup."""
-    python = venv_python(args.libcurl_dir)
+    node = systemd_quote(args.node)
+    entry = systemd_quote(entry_script(args.install_dir))
     idle = max(1, round(args.idle_minutes * 60))
     # Report "started" only once the port accepts connections, so the proxy never
     # connects to a server that is still booting. ($$ is a literal $ in unit files.)
@@ -578,7 +597,7 @@ Description=Wisp server for Synthesis Spotify (backend on {HOST}:{args.backend_p
 StopWhenUnneeded=yes
 
 [Service]
-ExecStart={systemd_quote(python)} -m wisp.server --host {HOST} --port {args.backend_port} --log-level warning --threads 1
+ExecStart={node} {entry} -H {HOST} -P {args.backend_port} -L WARN
 ExecStartPost=/usr/bin/env bash -c '{wait}'
 """
     proxy = f"""[Unit]
@@ -660,8 +679,11 @@ def main():
     for name, func in commands.items():
         p = sub.add_parser(name)
         p.set_defaults(func=func)
-        p.add_argument("--libcurl-dir", type=Path, default=default_libcurl_dir(),
-                       help="Where libcurl.js (with its Wisp server) is or will be cloned.")
+        p.add_argument("--install-dir", type=Path, default=default_install_dir(),
+                       help="Where wisp-js is or will be installed with npm.")
+        if name in ("run", "setup", "install"):
+            p.add_argument("--node", type=Path, default=None,
+                           help="Node.js binary to use (default: node from PATH).")
         if name in ("run", "install"):
             p.add_argument("--listen-port", type=int, default=6001)
             p.add_argument("--backend-port", type=int, default=6002)
@@ -676,7 +698,7 @@ def main():
                            help="macOS: keep the launcher resident instead of using launchd "
                                 "socket activation.")
     args = parser.parse_args()
-    args.libcurl_dir = args.libcurl_dir.expanduser().resolve()
+    args.install_dir = args.install_dir.expanduser().resolve()
     args.func(args)
 
 

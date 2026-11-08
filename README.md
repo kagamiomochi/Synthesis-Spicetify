@@ -57,15 +57,15 @@ Open the Spicetify Marketplace in Spotify, search for "Synthesis Spotify" and in
 
 ## Setting up the local Wisp server
 
-The steps are the same on Linux, macOS and Windows. One script, `wisp-launcher/portable/wisp_ondemand.py`, clones
-libcurl.js (it contains the Wisp server), creates the Python virtual environment, registers an on-demand start with the
-OS and starts it. It listens on `127.0.0.1:6001`, starts the Wisp server on `127.0.0.1:6002` at the first connection,
+The steps are the same on Linux, macOS and Windows. One script, `wisp-launcher/portable/wisp_ondemand.py`, installs
+[wisp-js](https://github.com/MercuryWorkshop/wisp-js) (a Wisp server for Node.js) with npm, registers an on-demand
+start with the OS and starts it. It listens on `127.0.0.1:6001`, starts the Wisp server on `127.0.0.1:6002` at the first connection,
 forwards the connection, and stops the server again after 5 idle minutes. Spotify only connects to
 `ws://localhost:6001/`, which is the first address the extension tries, so nothing inside Spotify has to launch
 anything and no extension setting is needed.
 
-Requirements: Python 3.9+ and git. The script itself uses only the Python standard library. On Linux you also need
-systemd (with `systemd-socket-proxyd`), and on Debian/Ubuntu the `python3-venv` package.
+Requirements: Python 3.9+ (the script itself uses only the standard library), Node.js 22.18+ (or 24.11+) and npm.
+On Linux you also need systemd (with `systemd-socket-proxyd`).
 
 1. Clone this repository and run the installer:
 
@@ -79,9 +79,11 @@ systemd (with `systemd-socket-proxyd`), and on Debian/Ubuntu the `python3-venv` 
    py -3 wisp-launcher\portable\wisp_ondemand.py install
    ```
 
-   The libcurl.js checkout defaults to `~/.local/share/synthesis-spotify/libcurl.js` (Windows:
-   `%LOCALAPPDATA%\synthesis-spotify\libcurl.js`). Use `--libcurl-dir PATH` to change it, and `--idle-minutes N` to
-   change the idle time. On macOS, `--resident` keeps a resident launcher instead of using socket activation.
+   wisp-js (pinned to one version) is installed into `~/.local/share/synthesis-spotify/wisp-js` (Windows:
+   `%LOCALAPPDATA%\synthesis-spotify\wisp-js`). Use `--install-dir PATH` to change it, `--node PATH` to choose the
+   Node.js binary, and `--idle-minutes N` to change the idle time. The Node.js path is recorded at install time, so run
+   `install` again after you move or replace Node.js (for example with a version manager). On macOS, `--resident`
+   keeps a resident launcher instead of using socket activation.
 
 2. Remove it with `uninstall` (same Python command as above, with `uninstall` instead of `install`).
 
@@ -94,14 +96,16 @@ What gets registered:
 | Windows | Scheduled task that runs at login | A small launcher process. Only the Wisp server runs on demand. |
 
 Logs: on Linux, use `journalctl --user -u synthesis-spotify-wisp-backend.service -u synthesis-spotify-wisp-proxy.service`.
-On macOS and Windows, logs are written next to the libcurl.js directory (`wisp-ondemand.log` for the launcher,
+On macOS and Windows, logs are written next to the wisp-js directory (`wisp-ondemand.log` for the launcher,
 `wisp-backend.log` for the Wisp server).
 
 Other commands:
 
-- `wisp_ondemand.py setup` only clones libcurl.js and prepares the virtual environment.
+- `wisp_ondemand.py setup` only installs wisp-js with npm.
 - `wisp_ondemand.py run` runs the launcher in the foreground. This works on every OS, so it is also the way to go on
   Linux without systemd.
+- Older versions of this script used the Python Wisp server from libcurl.js. Run `install` again to switch to wisp-js;
+  the old `libcurl.js` directory is no longer used and can be deleted.
 - If an older version of this README had you enable `synthesis-spotify-wisp.service` (the always-on service), disable it
   first with `systemctl --user disable --now synthesis-spotify-wisp.service`. It uses port 6001 too, and the installer
   stops with a message when it finds it.
@@ -156,6 +160,7 @@ Open the profile menu in Spotify and choose "Synthesis Spotify settings".
 
 - [YouTube.js](https://github.com/LuanRT/YouTube.js) by LuanRT
 - [libcurl.js](https://github.com/ading2210/libcurl.js) by ading2210
+- [wisp-js](https://github.com/MercuryWorkshop/wisp-js) by MercuryWorkshop (the local Wisp server)
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp), whose client definitions are used as the reference for the player request
 
 ---
@@ -196,9 +201,9 @@ Spotify の Spicetify Marketplace で「Synthesis Spotify」を検索してイ�
 
 ## ローカル Wisp サーバーの用意
 
-手順は Linux、macOS、Windows で共通です。`wisp-launcher/portable/wisp_ondemand.py` という 1 つのスクリプトが、libcurl.js (Wisp サーバー入り) の clone、Python 仮想環境の作成、OS へのオンデマンド起動の登録、起動までを行います。`127.0.0.1:6001` で待ち受け、最初の接続で Wisp サーバーを `127.0.0.1:6002` に起動して接続を転送し、5 分間アイドルになるとサーバーを止めます。Spotify はこれまで通り `ws://localhost:6001/` (拡張が最初に試すアドレス) に接続するだけなので、Spotify の中から何かを起動する必要はなく、拡張の設定も不要です。
+手順は Linux、macOS、Windows で共通です。`wisp-launcher/portable/wisp_ondemand.py` という 1 つのスクリプトが、[wisp-js](https://github.com/MercuryWorkshop/wisp-js) (Node.js 製の Wisp サーバー) の npm でのインストール、OS へのオンデマンド起動の登録、起動までを行います。`127.0.0.1:6001` で待ち受け、最初の接続で Wisp サーバーを `127.0.0.1:6002` に起動して接続を転送し、5 分間アイドルになるとサーバーを止めます。Spotify はこれまで通り `ws://localhost:6001/` (拡張が最初に試すアドレス) に接続するだけなので、Spotify の中から何かを起動する必要はなく、拡張の設定も不要です。
 
-必要なもの: Python 3.9 以上と git。スクリプト自体は Python の標準ライブラリだけで動きます。Linux では加えて systemd (`systemd-socket-proxyd` を含む)、Debian/Ubuntu では `python3-venv` パッケージも必要です。
+必要なもの: Python 3.9 以上 (スクリプト自体は標準ライブラリだけで動きます)、Node.js 22.18 以上 (または 24.11 以上)、npm。Linux では加えて systemd (`systemd-socket-proxyd` を含む) も必要です。
 
 1. このリポジトリを clone して、インストーラーを実行します。
 
@@ -212,7 +217,7 @@ Spotify の Spicetify Marketplace で「Synthesis Spotify」を検索してイ�
    py -3 wisp-launcher\portable\wisp_ondemand.py install
    ```
 
-   libcurl.js の置き場所の既定値は `~/.local/share/synthesis-spotify/libcurl.js` です (Windows は `%LOCALAPPDATA%\synthesis-spotify\libcurl.js`)。`--libcurl-dir パス` で変更でき、`--idle-minutes 分` でアイドル時間を変えられます。macOS では `--resident` を付けると、ソケットアクティベーションではなく常駐型のランチャーになります。
+   wisp-js (バージョン固定) は `~/.local/share/synthesis-spotify/wisp-js` にインストールされます (Windows は `%LOCALAPPDATA%\synthesis-spotify\wisp-js`)。`--install-dir パス` で場所を、`--node パス` で使う Node.js を、`--idle-minutes 分` でアイドル時間を変えられます。Node.js のパスはインストール時に記録されるので、Node.js を移動したり (バージョン管理ツールなどで) 入れ替えたりしたら、もう一度 `install` を実行してください。macOS では `--resident` を付けると、ソケットアクティベーションではなく常駐型のランチャーになります。
 
 2. 削除は `uninstall` で行います (上と同じ Python コマンドの `install` を `uninstall` に変えます)。
 
@@ -224,12 +229,13 @@ Spotify の Spicetify Marketplace で「Synthesis Spotify」を検索してイ�
 | macOS | LaunchAgent (launchd のソケットアクティベーション) | なし。6001 番ポートは launchd が保持し、アイドルになるとランチャーも終了します。 |
 | Windows | ログイン時に実行するタスクスケジューラのタスク | 小さなランチャーのプロセス。Wisp サーバーだけがオンデマンドで動きます。 |
 
-ログ: Linux は `journalctl --user -u synthesis-spotify-wisp-backend.service -u synthesis-spotify-wisp-proxy.service` で見ます。macOS と Windows は libcurl.js ディレクトリの隣に出ます (ランチャーは `wisp-ondemand.log`、Wisp サーバーは `wisp-backend.log`)。
+ログ: Linux は `journalctl --user -u synthesis-spotify-wisp-backend.service -u synthesis-spotify-wisp-proxy.service` で見ます。macOS と Windows は wisp-js ディレクトリの隣に出ます (ランチャーは `wisp-ondemand.log`、Wisp サーバーは `wisp-backend.log`)。
 
 そのほかのコマンド:
 
-- `wisp_ondemand.py setup` は libcurl.js の clone と仮想環境の準備だけを行います。
+- `wisp_ondemand.py setup` は wisp-js の npm でのインストールだけを行います。
 - `wisp_ondemand.py run` はランチャーをフォアグラウンドで実行します。どの OS でも使えるので、systemd を使わない Linux ではこれを使います。
+- 以前のバージョンのスクリプトは libcurl.js 付属の Python 製 Wisp サーバーを使っていました。wisp-js に切り替えるには、もう一度 `install` を実行してください。古い `libcurl.js` ディレクトリは使われなくなるので削除して構いません。
 - 以前の README の手順で常時起動サービス `synthesis-spotify-wisp.service` を有効にしている場合は、先に `systemctl --user disable --now synthesis-spotify-wisp.service` で無効にしてください。同じ 6001 番ポートを使うため、インストーラーは見つけるとメッセージを出して止まります。
 
 転送、オンデマンド起動、アイドル停止は Linux で確認しています。macOS のソケットアクティベーションは Linux 上で模擬しただけで (`launch_activate_socket` の呼び出し自体は macOS が必要です)、macOS と Windows の自動起動の登録は実機では確認していません。
