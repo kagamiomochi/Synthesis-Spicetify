@@ -91,8 +91,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now synthesis-spotify-wisp.service
 ```
 
-On macOS or Windows, start `server/run.sh` yourself (Windows: inside WSL) or wrap it in your platform's service
-mechanism. These setups are untested.
+On macOS or Windows, use the portable launcher described below.
 
 ### Start it on demand with systemd socket activation (Linux, recommended)
 
@@ -114,6 +113,46 @@ nothing inside Spotify has to launch anything and no extension setting is needed
 The always-on service from the previous section also uses port 6001, so disable it first
 (`systemctl --user disable --now synthesis-spotify-wisp.service`). The first search after a cold start waits a few
 seconds while the server boots.
+
+### Start it on demand on macOS and Windows (portable launcher)
+
+`wisp-launcher/portable/wisp_ondemand.py` does the same as the systemd setup without needing systemd. It listens on
+`127.0.0.1:6001`, starts the Wisp server on `127.0.0.1:6002` at the first connection, forwards the connection, and
+stops the server again after 5 idle minutes. Spotify still only connects to `ws://localhost:6001/`.
+
+Requirements: Python 3.9+ and git. The launcher itself uses only the Python standard library.
+
+- macOS uses launchd socket activation, like the systemd setup. launchd owns port 6001, so nothing runs until the
+  first connection. The launcher then starts the Wisp server, and both exit again when idle.
+- Windows has no socket activation. A small launcher process starts at login and stays resident, and only the Wisp
+  server runs on demand.
+
+1. Run the installer. It clones libcurl.js (with its submodule) if needed, creates the Python virtual environment,
+   registers it (a LaunchAgent on macOS, a scheduled task that runs at login on Windows) and starts it:
+
+   ```sh
+   # macOS
+   python3 wisp-launcher/portable/wisp_ondemand.py install
+   ```
+
+   ```bat
+   :: Windows
+   py -3 wisp-launcher\portable\wisp_ondemand.py install
+   ```
+
+   The libcurl.js checkout defaults to `~/.local/share/synthesis-spotify/libcurl.js` (Windows:
+   `%LOCALAPPDATA%\synthesis-spotify\libcurl.js`). Use `--libcurl-dir PATH` to change it, and `--idle-minutes N` to
+   change the idle time. On macOS, `--resident` keeps a resident launcher instead of using socket activation.
+
+2. Remove it with `wisp_ondemand.py uninstall` (same Python command as above).
+
+Logs are written next to the libcurl.js directory (`wisp-ondemand.log` for the launcher, `wisp-backend.log` for the
+Wisp server). `wisp_ondemand.py run` runs the launcher in the foreground, which also works on Linux if you do not
+use systemd.
+
+The proxy, on-demand start and idle stop were tested on Linux. The macOS socket activation was only simulated on
+Linux (the `launch_activate_socket` call itself needs macOS), and the macOS and Windows autostart steps have not been
+tested on real machines yet.
 
 ## Usage
 
@@ -216,6 +255,35 @@ systemd が `127.0.0.1:6001` で待ち受け、最初の接続で本物の Wisp 
 
 2. そのディレクトリ内の `server/run.sh` を一度手動で実行して Python の仮想環境を作り、止めます。
 3. 削除は `wisp-launcher/linux/systemd/uninstall.sh` で行います。
+
+### macOS と Windows でオンデマンド起動する (ポータブルランチャー)
+
+`wisp-launcher/portable/wisp_ondemand.py` は、systemd を使わずに上記と同じ動きをします。`127.0.0.1:6001` で待ち受け、最初の接続で Wisp サーバーを `127.0.0.1:6002` に起動して接続を転送し、5 分間アイドルになるとサーバーを止めます。Spotify はこれまで通り `ws://localhost:6001/` に接続するだけです。
+
+Python 3.9 以上と git が必要です。ランチャー自体は Python の標準ライブラリだけで動きます。
+
+- macOS は systemd と同じく launchd のソケットアクティベーションを使います。6001 番ポートは launchd が保持するため、最初の接続があるまで何も動きません。接続が来るとランチャーが Wisp サーバーを起動し、アイドルになると両方とも終了します。
+- Windows にはソケットアクティベーションがないため、小さなランチャーのプロセスをログイン時に起動して常駐させ、Wisp サーバーだけをオンデマンドで動かします。
+
+1. インストーラーを実行します。必要なら libcurl.js をサブモジュールごと clone し、Python の仮想環境を作り、起動の仕組みを登録 (macOS は LaunchAgent、Windows はログイン時に実行するタスクスケジューラのタスク) して、すぐに起動します。
+
+   ```sh
+   # macOS
+   python3 wisp-launcher/portable/wisp_ondemand.py install
+   ```
+
+   ```bat
+   :: Windows
+   py -3 wisp-launcher\portable\wisp_ondemand.py install
+   ```
+
+   libcurl.js の置き場所の既定値は `~/.local/share/synthesis-spotify/libcurl.js` です (Windows は `%LOCALAPPDATA%\synthesis-spotify\libcurl.js`)。`--libcurl-dir パス` で変更でき、`--idle-minutes 分` でアイドル時間を変えられます。macOS では `--resident` を付けると、ソケットアクティベーションではなく常駐型のランチャーになります。
+
+2. 削除は `wisp_ondemand.py uninstall` で行います (上と同じ Python コマンドです)。
+
+ログは libcurl.js ディレクトリの隣に出ます (ランチャーは `wisp-ondemand.log`、Wisp サーバーは `wisp-backend.log`)。`wisp_ondemand.py run` でフォアグラウンド実行もでき、systemd を使わない Linux でも使えます。
+
+転送、オンデマンド起動、アイドル停止は Linux で確認しています。macOS のソケットアクティベーションは Linux 上で模擬しただけで (`launch_activate_socket` の呼び出し自体は macOS が必要です)、macOS と Windows の自動起動の登録は実機では確認していません。
 
 ## 使い方
 
