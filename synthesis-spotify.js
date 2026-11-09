@@ -51,22 +51,38 @@
 	const SEARCH_DEBOUNCE_MS = 700;
 
 	const DEFAULT_CONFIG = {
-		// Wisp proxy servers, tried in order. A local one (your own IP) is far more reliable with YouTube
-		// than the shared public one. Traffic stays end-to-end TLS encrypted.
-		wispServers: ["ws://localhost:6001/", "wss://wisp.mercurywork.shop/"],
+		// Public (shared) Wisp proxies, tried in order. They are enough for search, but YouTube rejects
+		// their data center IPs for playback. Traffic stays end-to-end TLS encrypted.
+		wispServers: ["wss://wisp.mercurywork.shop/"],
+		// Local Wisp server (your own IP). Only used while playback is enabled.
+		localWisp: "ws://localhost:6001/",
+		// Playback needs the local Wisp server, so it is opt-in.
+		playbackEnabled: false,
 		// InnerTube clients tried in order to obtain a directly playable audio URL.
 		clients: ["visionos", "tv_samsung"],
 		resultLimit: 8,
 		prefetchNext: true,
 	};
 
-	const CONFIG_VERSION = 4;
+	const CONFIG_VERSION = 5;
+	const LOCAL_WISP_RE = /^wss?:\/\/(localhost|127\.0\.0\.1|\[::1\])/;
 
 	function loadConfig() {
 		try {
 			const stored = JSON.parse(localStorage.getItem(CONFIG_KEY) || "{}");
 			// v4 changed the default client list; drop an older saved list so the new defaults apply.
 			if (stored.configVersion !== CONFIG_VERSION) delete stored.clients;
+			// v5 split the local Wisp server out of wispServers and made playback opt-in. Anyone who saved a
+			// local address before is treated as having set it up, so their playback keeps working.
+			if ((stored.configVersion ?? 0) < 5 && Array.isArray(stored.wispServers)) {
+				const local = stored.wispServers.find((url) => LOCAL_WISP_RE.test(url));
+				stored.wispServers = stored.wispServers.filter((url) => !LOCAL_WISP_RE.test(url));
+				if (!stored.wispServers.length) delete stored.wispServers;
+				if (local) {
+					stored.localWisp = local;
+					stored.playbackEnabled = true;
+				}
+			}
 			return { ...DEFAULT_CONFIG, ...stored, configVersion: CONFIG_VERSION };
 		} catch {
 			return { ...DEFAULT_CONFIG };
@@ -117,7 +133,7 @@
 			addedNext: "次に再生します",
 			playFailed: (m) => `再生に失敗しました: ${m}`,
 			settingsTitle: "Synthesis Spotify 設定",
-			wispLabel: "Wisp プロキシ (1行に1つ、上から順に試行)",
+			wispLabel: "公開 Wisp プロキシ (1行に1つ、上から順に試行)",
 			clientsLabel: "InnerTube クライアント (visionos / tv_samsung、カンマ区切り、上から順に試行)",
 			save: "保存",
 			saved: "設定を保存しました",
@@ -126,7 +142,27 @@
 			cacheCleared: "音声キャッシュを削除しました",
 			privacyNote: "通信は libcurl.js により端末内で TLS 終端され、Wisp プロキシには接続先ホスト名のみ見えます。",
 			menu: "Synthesis Spotify 設定",
-			botHint: "共有Wispプロキシの出口IPがYouTubeに弾かれている可能性があります。自宅PCでローカルのWispサーバーを起動し、設定のWisp欄に ws://localhost:6001/ を指定してください。",
+			botHint: "共有Wispプロキシの出口IPがYouTubeに弾かれている可能性があります。自宅PCでローカルのWispサーバーを用意し、設定で「再生機能を有効化」をオンにしてください。",
+			playbackLabel: "再生機能を有効化",
+			playbackDesc: "オフの間は公開 Wisp だけを使い、検索結果の表示と「ブラウザで開く」のみ使えます。再生にはローカル Wisp サーバーが必要です。",
+			playbackOffNotice: "再生機能はオフです。検索結果の表示と「ブラウザで開く」のみ使えます。",
+			playbackDisabled: "再生機能がオフです。設定で「再生機能を有効化」をオンにしてください。",
+			playbackOnToast: "再生機能を有効にしました",
+			playbackOffToast: "再生機能を無効にしました",
+			showGuide: "セットアップ手順を見る",
+			guideTitle: "ローカル Wisp サーバーのセットアップ",
+			guideIntro: (url) => `再生機能は、自分の PC 上の Wisp サーバー (${url}) を経由して動きます。次の手順で用意してください。`,
+			guideStep1: "Python 3.9 以上、Node.js 22.18 以上 (または 24.11 以上)、npm を用意します (Linux は systemd も必要)。",
+			guideStep2: "このリポジトリを clone します。",
+			guideStep3: "リポジトリのフォルダでインストーラーを実行します。",
+			guideStep4: "終わったら、下のボタンで接続を確認します。確認できると再生機能が有効になります。",
+			guideCheck: "接続を確認",
+			guideReadme: "詳しい手順 (README)",
+			guideChecking: "ローカル Wisp を確認中...",
+			guideOk: "接続できました。",
+			guideFailed: (url) => `${url} に接続できませんでした。セットアップを済ませてから、もう一度確認してください。`,
+			copyHint: "クリックでコピー",
+			copied: "コピーしました",
 		},
 		en: {
 			sectionTitle: "Synthesis Spotify",
@@ -151,7 +187,7 @@
 			addedNext: "Will play next",
 			playFailed: (m) => `Playback failed: ${m}`,
 			settingsTitle: "Synthesis Spotify settings",
-			wispLabel: "Wisp proxies (one per line, tried in order)",
+			wispLabel: "Public Wisp proxies (one per line, tried in order)",
 			clientsLabel: "InnerTube clients (visionos / tv_samsung, comma separated, tried in order)",
 			save: "Save",
 			saved: "Settings saved",
@@ -160,7 +196,27 @@
 			cacheCleared: "Audio cache cleared",
 			privacyNote: "TLS is terminated inside this app by libcurl.js; the Wisp proxy only sees destination hostnames.",
 			menu: "Synthesis Spotify settings",
-			botHint: "The shared Wisp proxy's IP is probably flagged by YouTube. Run a local Wisp server on your PC and set ws://localhost:6001/ in the settings.",
+			botHint: "The shared Wisp proxy's IP is probably flagged by YouTube. Set up a local Wisp server on your PC and turn on \"Enable playback\" in the settings.",
+			playbackLabel: "Enable playback",
+			playbackDesc: "While off, only public Wisp proxies are used: you can search and open results in the browser, but not play them. Playback needs a local Wisp server.",
+			playbackOffNotice: "Playback is off. You can search and open results in the browser.",
+			playbackDisabled: "Playback is off. Turn on \"Enable playback\" in the settings.",
+			playbackOnToast: "Playback enabled",
+			playbackOffToast: "Playback disabled",
+			showGuide: "Show setup steps",
+			guideTitle: "Setting up the local Wisp server",
+			guideIntro: (url) => `Playback goes through a Wisp server on your own PC (${url}). Set it up with these steps.`,
+			guideStep1: "Get Python 3.9+, Node.js 22.18+ (or 24.11+) and npm (Linux also needs systemd).",
+			guideStep2: "Clone this repository.",
+			guideStep3: "Run the installer from the repository folder.",
+			guideStep4: "When it is done, check the connection with the button below. Playback is enabled once the check succeeds.",
+			guideCheck: "Check connection",
+			guideReadme: "Detailed steps (README)",
+			guideChecking: "Checking the local Wisp server...",
+			guideOk: "Connected.",
+			guideFailed: (url) => `Could not connect to ${url}. Finish the setup and check again.`,
+			copyHint: "Click to copy",
+			copied: "Copied",
 		},
 	};
 
@@ -233,7 +289,7 @@
 	let curlPromise = null;
 	let activeWisp = "";
 	let lastPlayerUserAgent = null;
-	const isLocalWisp = () => /^wss?:\/\/(localhost|127\.0\.0\.1|\[::1\])/.test(activeWisp);
+	const isLocalWisp = () => LOCAL_WISP_RE.test(activeWisp);
 
 	// Minimal cookie jar for *.youtube.com (libcurl.js has no cookie storage of its own).
 	const cookieJar = new Map();
@@ -252,9 +308,15 @@
 		}
 	}
 
+	// Playback needs a Wisp server on the user's own IP, so the local one is only tried when enabled.
+	function activeWispServers() {
+		if (!config.playbackEnabled) return config.wispServers;
+		return [config.localWisp, ...config.wispServers.filter((url) => url !== config.localWisp)];
+	}
+
 	async function pickWispServer(libcurl) {
 		const failures = [];
-		for (const url of config.wispServers) {
+		for (const url of activeWispServers()) {
 			try {
 				libcurl.set_websocket(url);
 				const res = await withTimeout(libcurl.fetch("https://www.gstatic.com/generate_204"), 10000, `Wisp ${url}`);
@@ -526,6 +588,7 @@
 	}
 
 	async function youtubeFetchAudio(track, { signal, onProgress } = {}) {
+		if (!config.playbackEnabled) throw new Error(t("playbackDisabled"));
 		const errors = [];
 
 		for (const client of config.clients) {
@@ -755,7 +818,14 @@
 		renderMini();
 	}
 
+	function requirePlayback() {
+		if (config.playbackEnabled) return true;
+		notify(t("playbackDisabled"), true);
+		return false;
+	}
+
 	function addToQueue(track, { next = false } = {}) {
+		if (!requirePlayback()) return;
 		const entry = { ...track, qid: ++qidCounter };
 		if (next) state.queue.unshift(entry);
 		else state.queue.push(entry);
@@ -771,6 +841,7 @@
 	}
 
 	function playNow(track) {
+		if (!requirePlayback()) return;
 		playTrack({ ...track });
 	}
 
@@ -905,6 +976,19 @@
 		.ss-settings button.ss-secondary { padding: 8px 16px; border: 1px solid rgba(128, 128, 128, 0.6); border-radius: 500px; background: transparent; color: var(--text-base, #fff); cursor: pointer; }
 		.ss-settings pre { margin: 12px 0 0; padding: 10px; max-height: 220px; overflow: auto; border-radius: 6px; background: rgba(0, 0, 0, 0.35); font-size: 11px; white-space: pre-wrap; }
 		.ss-settings small { display: block; margin-top: 10px; color: var(--text-subdued, #a7a7a7); }
+		.ss-settings label.ss-toggle { display: flex; align-items: center; gap: 12px; margin: 0; font-size: 15px; font-weight: 600; color: var(--text-base, #fff); cursor: pointer; }
+		.ss-switch { position: relative; width: 40px; height: 22px; flex: none; }
+		.ss-switch input { position: absolute; inset: 0; z-index: 1; margin: 0; opacity: 0; cursor: pointer; }
+		.ss-switch span { position: absolute; inset: 0; border-radius: 22px; background: rgba(128, 128, 128, 0.6); transition: background 0.15s; }
+		.ss-switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform 0.15s; }
+		.ss-switch input:checked + span { background: var(--essential-bright-accent, #1ed760); }
+		.ss-switch input:checked + span::after { transform: translateX(18px); }
+		.ss-settings .ss-desc { margin: 6px 0 0; font-size: 12px; color: var(--text-subdued, #a7a7a7); }
+		.ss-settings .ss-guide { margin-top: 12px; padding: 12px 14px; border-radius: 8px; background: rgba(128, 128, 128, 0.12); font-size: 13px; }
+		.ss-settings .ss-guide ol { margin: 8px 0 0; padding-left: 20px; }
+		.ss-settings .ss-guide li { margin: 8px 0; }
+		.ss-settings .ss-guide pre.ss-cmd { margin: 4px 0 0; max-height: none; cursor: pointer; user-select: all; }
+		.ss-settings .ss-guide-status { margin-top: 10px; font-size: 13px; }
 	`)
 	);
 
@@ -1069,22 +1153,24 @@
 	function trackRow(track) {
 		const img = h("img", { class: "ss-cover", alt: "", loading: "lazy" });
 		loadImage(img, track.thumbnail);
+		// Without playback enabled the rows only offer "open in browser".
+		const canPlay = config.playbackEnabled;
 		return h(
 			"div",
-			{ class: "ss-row", onDblclick: () => playNow(track) },
+			{ class: "ss-row", onDblclick: canPlay ? () => playNow(track) : null },
 			h(
 				"div",
 				{ class: "ss-cover-wrap" },
 				img,
-				h("button", { class: "ss-cover-play", title: t("play"), html: ICONS.play, onClick: () => playNow(track) })
+				canPlay && h("button", { class: "ss-cover-play", title: t("play"), html: ICONS.play, onClick: () => playNow(track) })
 			),
 			h("div", { class: "ss-meta" }, h("div", { class: "ss-title" }, track.title), h("div", { class: "ss-sub" }, track.artists.join(", "))),
 			h("div", { class: "ss-album" }, track.album),
 			h(
 				"div",
 				{ class: "ss-actions" },
-				h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
-				h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) }),
+				canPlay && h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
+				canPlay && h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) }),
 				h("button", { class: "ss-btn", title: t("openBrowser"), html: ICONS.external, onClick: () => openInBrowser(track) })
 			),
 			h("div", { class: "ss-dur" }, formatTime(track.durationMs))
@@ -1102,6 +1188,15 @@
 			);
 		}
 		return search.section;
+	}
+
+	function playbackNotice() {
+		return h(
+			"div",
+			{ class: "ss-status" },
+			h("span", {}, t("playbackOffNotice")),
+			h("button", { class: "ss-link", onClick: openSettings }, t("openSettings"))
+		);
 	}
 
 	function renderSearch() {
@@ -1122,7 +1217,7 @@
 		} else if (status === "done" && !search.results.length) {
 			search.body.replaceChildren(h("div", { class: "ss-status" }, t("noResults")));
 		} else if (status === "done") {
-			search.body.replaceChildren(...search.results.map(trackRow));
+			search.body.replaceChildren(...(config.playbackEnabled ? [] : [playbackNotice()]), ...search.results.map(trackRow));
 		}
 	}
 
@@ -1238,6 +1333,11 @@
 			return;
 		}
 
+		if (!config.playbackEnabled) {
+			log("Playback is disabled, so the player steps are skipped.");
+			return;
+		}
+
 		const working = [];
 		for (const client of config.clients) {
 			await step(`player response with ${client}`, async () => {
@@ -1273,6 +1373,56 @@
 		});
 	}
 
+	function resetNetwork() {
+		// Reset the lazily created singletons so new Wisp settings take effect.
+		curlPromise = null;
+		innertubes.plain = null;
+		innertubes.player = null;
+		warmUpPromise = null;
+		cookieJar.clear();
+	}
+
+	// Plain WebSocket handshake against the local Wisp server. With on-demand start this also wakes it up.
+	function probeLocalWisp(url, timeoutMs = 10000) {
+		return new Promise((resolve) => {
+			let ws = null;
+			let settled = false;
+			const finish = (ok) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				try {
+					ws?.close();
+				} catch {
+					// ignore
+				}
+				resolve(ok);
+			};
+			const timer = setTimeout(() => finish(false), timeoutMs);
+			try {
+				ws = new WebSocket(url);
+				ws.addEventListener("open", () => finish(true));
+				ws.addEventListener("error", () => finish(false));
+				ws.addEventListener("close", () => finish(false));
+			} catch {
+				finish(false);
+			}
+		});
+	}
+
+	async function copyText(text) {
+		try {
+			await navigator.clipboard.writeText(text);
+		} catch {
+			try {
+				Spicetify.Platform.ClipboardAPI.copy(text);
+			} catch {
+				return;
+			}
+		}
+		notify(t("copied"));
+	}
+
 	function openSettings() {
 		const wisp = h("textarea", { rows: "3" });
 		wisp.value = config.wispServers.join("\n");
@@ -1289,9 +1439,117 @@
 			clients: clients.value.split(",").map((s) => s.trim()).filter(Boolean),
 		});
 
+		// Playback toggle. The switch shows the saved state; turning it on only sticks once the local Wisp answers.
+		const playback = h("input", { type: "checkbox" });
+		playback.checked = config.playbackEnabled;
+		const guideStatus = h("div", { class: "ss-guide-status" });
+		const checkButton = h("button", { class: "ss-primary", onClick: () => checkLocalWisp() }, t("guideCheck"));
+		const command = (label, text) =>
+			h(
+				"div",
+				{},
+				label && h("div", { class: "ss-desc" }, label),
+				h("pre", { class: "ss-cmd", title: t("copyHint"), onClick: () => copyText(text) }, text)
+			);
+		const guide = h(
+			"div",
+			{ class: "ss-guide", style: "display:none" },
+			h("strong", {}, t("guideTitle")),
+			h("div", { class: "ss-desc" }, t("guideIntro", config.localWisp)),
+			h(
+				"ol",
+				{},
+				h("li", {}, t("guideStep1")),
+				h(
+					"li",
+					{},
+					t("guideStep2"),
+					command("", "git clone https://github.com/kagamiomochi/Synthesis-Spotify.git\ncd Synthesis-Spotify")
+				),
+				h(
+					"li",
+					{},
+					t("guideStep3"),
+					command("Linux / macOS", "python3 wisp-launcher/portable/wisp_ondemand.py install"),
+					command("Windows", "py -3 wisp-launcher\\portable\\wisp_ondemand.py install")
+				),
+				h("li", {}, t("guideStep4"))
+			),
+			h(
+				"div",
+				{ class: "ss-buttons" },
+				checkButton,
+				h(
+					"button",
+					{
+						class: "ss-secondary",
+						onClick: () =>
+							window.open("https://github.com/kagamiomochi/Synthesis-Spotify#setting-up-the-local-wisp-server", "_blank", "noopener,noreferrer"),
+					},
+					t("guideReadme")
+				)
+			),
+			guideStatus
+		);
+
+		let checkToken = 0;
+		const setPlayback = (enabled) => {
+			saveConfig({ playbackEnabled: enabled });
+			playback.checked = enabled;
+			if (!enabled) {
+				if (state.status !== "idle") stopYT(true);
+				state.queue.length = 0;
+				renderQueueModal();
+			}
+			resetNetwork();
+			renderSearch();
+			notify(t(enabled ? "playbackOnToast" : "playbackOffToast"));
+		};
+		const checkLocalWisp = async () => {
+			const token = ++checkToken;
+			guideStatus.textContent = t("guideChecking");
+			checkButton.disabled = true;
+			const ok = await probeLocalWisp(config.localWisp);
+			if (token !== checkToken) return; // a newer check or the switch took over
+			checkButton.disabled = false;
+			if (ok) {
+				guideStatus.textContent = t("guideOk");
+				if (!config.playbackEnabled) setPlayback(true);
+			} else {
+				guideStatus.textContent = t("guideFailed", config.localWisp);
+				playback.checked = config.playbackEnabled;
+			}
+		};
+		playback.addEventListener("change", () => {
+			if (!playback.checked) {
+				checkToken++;
+				checkButton.disabled = false;
+				guide.style.display = "none";
+				guideStatus.textContent = "";
+				if (config.playbackEnabled) setPlayback(false);
+				return;
+			}
+			guide.style.display = "block";
+			checkLocalWisp();
+		});
+
 		const content = h(
 			"div",
 			{ class: "ss-settings" },
+			h("label", { class: "ss-toggle" }, h("span", { class: "ss-switch" }, playback, h("span", {})), t("playbackLabel")),
+			h("div", { class: "ss-desc" }, t("playbackDesc")),
+			h(
+				"button",
+				{
+					class: "ss-link",
+					style: "margin-top:6px",
+					onClick: () => {
+						guide.style.display = guide.style.display === "none" ? "block" : "none";
+					},
+				},
+				t("showGuide")
+			),
+			guide,
 			h("label", {}, t("wispLabel")),
 			wisp,
 			h("label", {}, t("clientsLabel")),
@@ -1306,12 +1564,7 @@
 						class: "ss-secondary",
 						onClick: async () => {
 							saveConfig(collect());
-							// Reset the lazily created singletons so the new settings take effect.
-							curlPromise = null;
-							innertubes.plain = null;
-							innertubes.player = null;
-							warmUpPromise = null;
-							cookieJar.clear();
+							resetNetwork();
 							output.textContent = "";
 							await runDiagnostics(log);
 						},

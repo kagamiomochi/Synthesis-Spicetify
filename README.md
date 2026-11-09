@@ -9,6 +9,7 @@ A [Spicetify](https://spicetify.app/) extension that brings YouTube Music into S
 - Queued tracks play between Spotify tracks (shown in the queue button on the playbar)
 - A small mini player appears while a YouTube track is active
 - Audio is downloaded into a Blob and played from a Blob URL, so there is no streaming proxy
+- Playback is opt-in: without the optional local Wisp server you can still search and open results in the browser
 
 Currently supported service: YouTube Music (YouTube). More services are planned.
 
@@ -30,14 +31,15 @@ Both libraries are loaded from jsDelivr on first use (pinned versions: libcurl.j
 ## Requirements
 
 - Spicetify (with the Spotify desktop app)
-- **A local Wisp server** (see below). This is required for playback.
+- **A local Wisp server** (see below), only if you want playback. Search and "Open in browser" work without it.
 
 ### Why a local Wisp server is needed
 
 libcurl.js sends its traffic through a Wisp proxy. TLS is terminated inside Spotify, so the proxy only sees
 destination hostnames, but YouTube judges the proxy's IP address. Shared public Wisp servers run on data center
 IPs, which YouTube rejects (`LOGIN_REQUIRED: Sign in to confirm you're not a bot`). Search still works through
-them, playback does not. A Wisp server on your own PC uses your own IP and works.
+them, playback does not. A Wisp server on your own PC uses your own IP and works. For this reason playback is off
+by default, and only public Wisp proxies are used until you turn on **Enable playback** in the settings.
 
 ## Installation
 
@@ -57,12 +59,15 @@ Open the Spicetify Marketplace in Spotify, search for "Synthesis Spotify" and in
 
 ## Setting up the local Wisp server
 
+When you turn on **Enable playback** in the settings, the extension shows these steps and checks the connection to the
+local server. Playback is enabled once the check succeeds.
+
 The steps are the same on Linux, macOS and Windows. One script, `wisp-launcher/portable/wisp_ondemand.py`, installs
 [wisp-js](https://github.com/MercuryWorkshop/wisp-js) (a Wisp server for Node.js) with npm, registers an on-demand
 start with the OS and starts it. It listens on `127.0.0.1:6001`, starts the Wisp server on `127.0.0.1:6002` at the first connection,
-forwards the connection, and stops the server again after 5 idle minutes. Spotify only connects to
-`ws://localhost:6001/`, which is the first address the extension tries, so nothing inside Spotify has to launch
-anything and no extension setting is needed.
+forwards the connection, and stops the server again after 5 idle minutes. Once **Enable playback** is on,
+the extension tries `ws://localhost:6001/` first, so nothing inside Spotify has to launch
+anything.
 
 Requirements: Python 3.9+ (the script itself uses only the standard library), Node.js 22.18+ (or 24.11+) and npm.
 On Linux you also need systemd (with `systemd-socket-proxyd`).
@@ -132,7 +137,12 @@ Starting a different playlist or album in Spotify stops the YouTube track.
 
 Open the profile menu in Spotify and choose "Synthesis Spotify settings".
 
-- **Wisp proxies**: one per line, tried in order. Default: `ws://localhost:6001/`, then a shared public server.
+- **Enable playback**: off by default. While it is off, only the public Wisp proxies below are used, so you can search
+  and open results in the browser, but not play them. Turning it on shows the local Wisp setup steps and checks the
+  connection to `ws://localhost:6001/`; playback is enabled once the check succeeds. Turning it off stops the current
+  YouTube track and clears the queue.
+- **Public Wisp proxies**: one per line, tried in order. Default: a shared public server. While playback is enabled,
+  the local server `ws://localhost:6001/` is tried first.
 - **InnerTube clients**: `visionos`, `tv_samsung`, tried in order. Defaults work without a PO token.
 - **Connection test**: runs the whole chain (libcurl, session, search, player request, audio download) and prints
   the result of each step.
@@ -142,16 +152,17 @@ Open the profile menu in Spotify and choose "Synthesis Spotify settings".
 
 | Message | Likely cause and fix |
 | --- | --- |
-| `LOGIN_REQUIRED: Sign in to confirm you're not a bot` | The Wisp proxy's IP is flagged. Use a local Wisp server (`ws://localhost:6001/`). |
-| `No usable Wisp server` | The local server is not running and the public one is unreachable. Start the local server. |
+| `LOGIN_REQUIRED: Sign in to confirm you're not a bot` | The Wisp proxy's IP is flagged. Turn on **Enable playback** in the settings and set up a local Wisp server. |
+| `No usable Wisp server` | No Wisp server is reachable. If playback is enabled, start the local server; otherwise check your network and the public Wisp URL in the settings. |
 | libcurl step fails right at the start | Spotify's CSP may be blocking WASM or the jsDelivr import. |
 | `EvalError` / CSP error in the player step | Spotify blocked `eval`, which is needed to decipher some stream URLs. Use `visionos` only. |
 | `player request failed: HTTP 400/403` or `LOGIN_REQUIRED` on a local Wisp | The client definitions are outdated. Update `CLIENT_DEFS` in `synthesis-spotify.js` from `INNERTUBE_CLIENTS` in yt-dlp (`yt_dlp/extractor/youtube/_base.py`). |
 
 ## Privacy and disclaimer
 
-- Requests to YouTube go through the Wisp proxy you configure. With a local server this is your own machine.
-  A shared public server sees which hostnames you connect to (TLS is terminated inside Spotify).
+- Requests to YouTube go through a Wisp proxy. Until you enable playback this is a shared public server, which sees
+  which hostnames you connect to (TLS is terminated inside Spotify). With playback enabled and a local server it is
+  your own machine.
 - Session cookies from YouTube are kept in memory only.
 - This extension uses unofficial YouTube APIs and may violate YouTube's Terms of Service. Use it at your own risk.
 - Not affiliated with Spotify, Google or YouTube.
@@ -174,17 +185,18 @@ Spotify に YouTube Music を統合する [Spicetify](https://spicetify.app/) �
 - キューに入れた曲は Spotify の曲の間に挟まって再生(プレイバーのキューボタンで確認)
 - YouTube の曲の再生中は小さなミニプレイヤーを表示
 - 音声は Blob にダウンロードして Blob URL で再生
+- 再生機能は任意でオンにする方式です。ローカル Wisp サーバーが無くても、検索と「ブラウザで開く」は使えます
 
 対応サービスは現在 YouTube Music(YouTube)のみです。
 
 ## 必要なもの
 
 - Spicetify(Spotify デスクトップアプリ)
-- **ローカルの Wisp サーバー**(再生に必須)
+- **ローカルの Wisp サーバー**(再生したい場合のみ。検索と「ブラウザで開く」は無くても使えます)
 
 ### ローカル Wisp が必要な理由
 
-libcurl.js は Wisp プロキシ経由で通信します。TLS は Spotify 内で終端されるので、プロキシには接続先のホスト名しか見えません。ただ、YouTube はプロキシの IP アドレスで判定します。公開されている共有 Wisp サーバーはデータセンターの IP で動いていて、YouTube に弾かれます(`LOGIN_REQUIRED: Sign in to confirm you're not a bot`)。検索は通りますが、再生はできません。自分の PC で動かす Wisp なら自分の IP が使われるので、再生できます。
+libcurl.js は Wisp プロキシ経由で通信します。TLS は Spotify 内で終端されるので、プロキシには接続先のホスト名しか見えません。ただ、YouTube はプロキシの IP アドレスで判定します。公開されている共有 Wisp サーバーはデータセンターの IP で動いていて、YouTube に弾かれます(`LOGIN_REQUIRED: Sign in to confirm you're not a bot`)。検索は通りますが、再生はできません。自分の PC で動かす Wisp なら自分の IP が使われるので、再生できます。このため、設定で「再生機能を有効化」をオンにするまでは再生機能はオフで、公開 Wisp だけを使います。
 
 ## インストール
 
@@ -201,7 +213,9 @@ Spotify の Spicetify Marketplace で「Synthesis Spotify」を検索してイ�
 
 ## ローカル Wisp サーバーの用意
 
-手順は Linux、macOS、Windows で共通です。`wisp-launcher/portable/wisp_ondemand.py` という 1 つのスクリプトが、[wisp-js](https://github.com/MercuryWorkshop/wisp-js) (Node.js 製の Wisp サーバー) の npm でのインストール、OS へのオンデマンド起動の登録、起動までを行います。`127.0.0.1:6001` で待ち受け、最初の接続で Wisp サーバーを `127.0.0.1:6002` に起動して接続を転送し、5 分間アイドルになるとサーバーを止めます。Spotify はこれまで通り `ws://localhost:6001/` (拡張が最初に試すアドレス) に接続するだけなので、Spotify の中から何かを起動する必要はなく、拡張の設定も不要です。
+設定で「再生機能を有効化」をオンにすると、拡張がこの手順を表示し、ローカルサーバーへの接続を確認します。確認できると再生機能が有効になります。
+
+手順は Linux、macOS、Windows で共通です。`wisp-launcher/portable/wisp_ondemand.py` という 1 つのスクリプトが、[wisp-js](https://github.com/MercuryWorkshop/wisp-js) (Node.js 製の Wisp サーバー) の npm でのインストール、OS へのオンデマンド起動の登録、起動までを行います。`127.0.0.1:6001` で待ち受け、最初の接続で Wisp サーバーを `127.0.0.1:6002` に起動して接続を転送し、5 分間アイドルになるとサーバーを止めます。「再生機能を有効化」がオンの間、拡張は `ws://localhost:6001/` を最初に試すので、Spotify の中から何かを起動する必要はありません。
 
 必要なもの: Python 3.9 以上 (スクリプト自体は標準ライブラリだけで動きます)、Node.js 22.18 以上 (または 24.11 以上)、npm。Linux では加えて systemd (`systemd-socket-proxyd` を含む) も必要です。
 
@@ -253,18 +267,19 @@ Spotify の Spicetify Marketplace で「Synthesis Spotify」を検索してイ�
 
 Spotify のプロフィールメニューから「Synthesis Spotify 設定」を開きます。
 
-- **Wisp プロキシ:** 1 行に 1 つ、上から順に試します。既定は `ws://localhost:6001/`、次に共有の公開サーバーです。
+- **再生機能を有効化:** 既定はオフです。オフの間は下の公開 Wisp プロキシだけを使い、検索結果の表示と「ブラウザで開く」のみ使えます (再生はできません)。オンにしようとするとローカル Wisp のセットアップ手順を表示し、`ws://localhost:6001/` への接続を確認します。確認できると有効になります。オフにすると、再生中の YouTube の曲を止めてキューを空にします。
+- **公開 Wisp プロキシ:** 1 行に 1 つ、上から順に試します。既定は共有の公開サーバーです。再生機能がオンの間は、ローカルの `ws://localhost:6001/` を最初に試します。
 - **InnerTube クライアント:** `visionos`、`tv_samsung` を上から順に試します。既定では PO Token は不要です。
 - **接続テスト:** libcurl、セッション、検索、プレイヤーリクエスト、音声ダウンロードまでを順に試し、各ステップの結果を表示します。
 - **音声キャッシュを削除:** ダウンロード済みの音声(直近の数曲をメモリにキャッシュ)を解放します。
 
 ## トラブルシューティング
 
-上の英語セクションの表を参照してください。特に `LOGIN_REQUIRED` が出る場合は、ローカル Wisp を使っているか確認してください。クライアントのバージョンが古くなった場合は、`synthesis-spotify.js` の `CLIENT_DEFS` を yt-dlp の `INNERTUBE_CLIENTS` に合わせて更新します。
+上の英語セクションの表を参照してください。特に `LOGIN_REQUIRED` が出る場合は、「再生機能を有効化」がオンで、ローカル Wisp が動いているか確認してください。クライアントのバージョンが古くなった場合は、`synthesis-spotify.js` の `CLIENT_DEFS` を yt-dlp の `INNERTUBE_CLIENTS` に合わせて更新します。
 
 ## プライバシーと免責
 
-- YouTube へのリクエストは、設定した Wisp プロキシ経由で送られます。ローカルサーバーなら自分の PC です。共有の公開サーバーには、接続先のホスト名が見えます。
+- YouTube へのリクエストは Wisp プロキシ経由で送られます。再生機能をオンにするまでは共有の公開サーバーで、接続先のホスト名が見えます。再生機能をオンにしてローカルサーバーを使う場合は自分の PC です。
 - YouTube のセッション Cookie はメモリ上にのみ保持します。
 - 非公式の YouTube API を使っており、YouTube の利用規約に反する可能性があります。自己責任で使ってください。
 - Spotify、Google、YouTube とは無関係です。
