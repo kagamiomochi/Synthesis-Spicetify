@@ -10,7 +10,8 @@
  *  - Data:     youtubei.js (YouTube.js) talks to YouTube Music through that custom fetch.
  *  - Audio:    the audio stream is downloaded into a Blob, played via a Blob URL on a hidden <audio>.
  *  - Spotify:  search page injection, a virtual queue interleaved with Spotify's own queue,
- *              and a small mini player that is shown while a non-Spotify track is active.
+ *              and Spotify's own player bar, which shows and controls a non-Spotify track while it is active
+ *              (a small mini player is only the fallback when the player bar cannot be used).
  *
  * Both libraries are loaded lazily from jsDelivr (pinned versions) on first use.
  */
@@ -709,6 +710,7 @@
 		status: "idle", // idle | loading | playing | paused
 		progress: 0, // download progress while loading (0..1)
 		queue: [], // virtual queue of non-Spotify tracks
+		history: [], // tracks already played from the virtual queue (for the previous button)
 		resumeSpotify: false, // resume Spotify once the virtual queue drains
 		suppressUntil: 0, // ignore Spotify events until this timestamp
 	};
@@ -752,10 +754,16 @@
 		}
 	}
 
-	async function playTrack(track) {
+	async function playTrack(track, { fromHistory = false } = {}) {
 		const token = ++playToken;
 		const previous = state.current;
-		if (previous && state.status === "loading") abortLoad(previous);
+		const previousStatus = state.status;
+		if (previous && previousStatus === "loading") abortLoad(previous);
+		// Remember tracks that actually played, so that the previous button can go back to them.
+		if (previous && !fromHistory && (previousStatus === "playing" || previousStatus === "paused")) {
+			state.history.push(previous);
+			if (state.history.length > 20) state.history.shift();
+		}
 
 		audio.pause();
 		state.current = track;
@@ -810,6 +818,7 @@
 		state.current = null;
 		state.status = "idle";
 		state.progress = 0;
+		state.history.length = 0;
 		renderMini();
 		if (resumeSpotify) resumeSpotifyIfNeeded();
 		else state.resumeSpotify = false;
@@ -824,6 +833,36 @@
 			state.status = "playing";
 		}
 		renderMini();
+	}
+
+	// Next button of Spotify's player bar while a non-Spotify track is active.
+	function skipNext() {
+		if (state.queue.length) {
+			playNextFromQueue();
+			return;
+		}
+		// The virtual queue is empty: hand control back to Spotify and skip to its next track.
+		const wasPlaying = state.resumeSpotify;
+		stopYT(false);
+		Spicetify.Player.next();
+		if (wasPlaying) {
+			setTimeout(() => {
+				if (!Spicetify.Player.isPlaying()) Spicetify.Player.play();
+			}, 400);
+		}
+	}
+
+	// Previous button of Spotify's player bar: restart the track, or go back to the one before it.
+	function skipPrev() {
+		if (state.status === "loading") return;
+		if (audio.currentTime > 3 || !state.history.length) {
+			audio.currentTime = 0;
+			return;
+		}
+		const previous = state.history.pop();
+		if (state.current) state.queue.unshift({ ...state.current, qid: ++qidCounter });
+		playTrack(previous, { fromHistory: true });
+		renderQueueModal();
 	}
 
 	function requirePlayback() {
@@ -974,6 +1013,24 @@
 		.ss-mini-seek { width: 100%; margin: 6px 0 0; accent-color: var(--essential-bright-accent, #1ed760); }
 		.ss-mini-ctrl { display: flex; gap: 2px; }
 
+		.ss-own { display: none; }
+		.ss-takeover [data-ss-host] > :not(.ss-own) { display: none !important; }
+		.ss-takeover .ss-np { display: flex; align-items: center; gap: 12px; min-width: 0; grid-column: 1 / -1; width: 100%; }
+		.ss-np-cover { width: 56px; height: 56px; flex: none; border-radius: 4px; object-fit: cover; background: rgba(128, 128, 128, 0.3); }
+		.ss-np-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+		.ss-np-title { padding: 0; border: 0; background: transparent; color: var(--text-base, #fff); font: inherit; font-size: 14px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+		.ss-np-title:hover { text-decoration: underline; }
+		.ss-np-sub { font-size: 12px; color: var(--text-subdued, #a7a7a7); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.ss-takeover .ss-pb { display: flex; align-items: center; gap: 8px; width: 100%; }
+		.ss-pb-time { flex: none; min-width: 40px; font-size: 11px; color: var(--text-subdued, #a7a7a7); font-variant-numeric: tabular-nums; }
+		.ss-pb-pos { text-align: right; }
+		.ss-pb-seek { --ss-fill: var(--text-base, #fff); flex: 1; min-width: 0; height: 4px; margin: 0; border-radius: 2px; cursor: pointer; -webkit-appearance: none; appearance: none; background: linear-gradient(to right, var(--ss-fill) var(--ss-pct, 0%), rgba(128, 128, 128, 0.4) var(--ss-pct, 0%)); }
+		.ss-pb-seek:hover { --ss-fill: var(--essential-bright-accent, #1ed760); }
+		.ss-pb-seek:disabled { cursor: progress; }
+		.ss-pb-seek::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%; background: #fff; opacity: 0; }
+		.ss-pb-seek:hover::-webkit-slider-thumb { opacity: 1; }
+		.ss-takeover .ss-pp-icon { display: inline-flex; align-items: center; justify-content: center; }
+
 		.ss-queue { display: flex; flex-direction: column; gap: 4px; min-width: 380px; max-height: 60vh; overflow-y: auto; }
 		.ss-queue .ss-row { grid-template-columns: 48px minmax(0, 1fr) auto; }
 		.ss-queue .ss-actions { opacity: 1; }
@@ -1066,7 +1123,9 @@
 	function renderMini() {
 		const ui = ensureMini();
 		const track = state.current;
-		ui.root.classList.toggle("ss-visible", Boolean(track) && state.status !== "idle");
+		// The mini player is only a fallback for when Spotify's own player bar cannot be used.
+		const takenOver = syncTakeover();
+		ui.root.classList.toggle("ss-visible", Boolean(track) && state.status !== "idle" && !takenOver);
 		if (!track) return;
 
 		ui.title.textContent = track.title;
@@ -1086,10 +1145,170 @@
 	}
 
 	function updateSeek() {
+		updateTakeoverProgress();
 		if (!mini || state.status === "loading") return;
 		const duration = Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
 		if (duration > 0) mini.seek.value = String(Math.round((audio.currentTime / duration) * 1000));
 	}
+
+	// ---------------------------------------------------------------------
+	// Player bar takeover
+	// While a non-Spotify track is active, Spotify's own player bar shows and controls it:
+	// the now playing widget, the progress bar and the play/pause, previous and next buttons.
+	// Spotify's React nodes are never modified: our elements are appended next to them and
+	// the originals are only hidden with CSS, so a re-render of Spotify cannot break anything.
+	// If a part of the player bar cannot be found, the mini player is shown instead.
+	// ---------------------------------------------------------------------
+	const PLAYBAR = {
+		// "-v2" is what current Spotify builds use; the plain name is kept for older builds.
+		widget: '[data-testid="now-playing-widget-v2"], [data-testid="now-playing-widget"]',
+		position: '[data-testid="playback-position"]',
+		bar: '[data-testid="playback-progressbar"]',
+		duration: '[data-testid="playback-duration"]',
+		playPause: '[data-testid="control-button-playpause"]',
+		skipForward: '[data-testid="control-button-skip-forward"]',
+		skipBack: '[data-testid="control-button-skip-back"]',
+	};
+	const takeover = { active: false, ui: null, widget: null, progressHost: null, playPause: null };
+
+	const isYTActive = () => Boolean(state.current) && state.status !== "idle";
+	const setText = (el, text) => {
+		if (el.textContent !== text) el.textContent = text;
+	};
+	const clock = (sec) => {
+		const total = Math.max(0, Math.floor(Number.isFinite(sec) ? sec : 0));
+		return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+	};
+
+	function trackDurationSec() {
+		return Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
+	}
+
+	function ensureTakeoverUi() {
+		if (takeover.ui) return takeover.ui;
+		const cover = h("img", { class: "ss-np-cover", alt: "" });
+		const title = h("button", {
+			class: "ss-np-title",
+			title: t("openBrowser"),
+			onClick: () => state.current && openInBrowser(state.current),
+		});
+		const sub = h("div", { class: "ss-np-sub" });
+		const np = h("div", { class: "ss-own ss-np" }, cover, h("div", { class: "ss-np-text" }, title, sub));
+
+		const pos = h("span", { class: "ss-pb-time ss-pb-pos" });
+		const dur = h("span", { class: "ss-pb-time" });
+		const seek = h("input", { class: "ss-pb-seek", type: "range", min: "0", max: "1000", value: "0" });
+		const ui = { np, cover, title, sub, pos, dur, seek, seeking: false, lastCoverUrl: "", lastIcon: "" };
+		seek.addEventListener("pointerdown", () => { ui.seeking = true; });
+		seek.addEventListener("pointerup", () => { ui.seeking = false; });
+		seek.addEventListener("input", () => {
+			const duration = trackDurationSec();
+			if (duration > 0) audio.currentTime = (Number(seek.value) / 1000) * duration;
+			seek.style.setProperty("--ss-pct", `${Number(seek.value) / 10}%`);
+		});
+		ui.pb = h("div", { class: "ss-own ss-pb" }, pos, seek, dur);
+		ui.icon = h("span", { class: "ss-own ss-pp-icon" });
+		takeover.ui = ui;
+		return ui;
+	}
+
+	// Find the smallest element that contains the position label, the bar and the duration label.
+	function findProgressHost() {
+		const pos = document.querySelector(PLAYBAR.position);
+		const bar = document.querySelector(PLAYBAR.bar);
+		const dur = document.querySelector(PLAYBAR.duration);
+		if (!pos || !bar || !dur) return null;
+		let el = pos.parentElement;
+		while (el && el !== document.body && !(el.contains(bar) && el.contains(dur))) el = el.parentElement;
+		return el && el !== document.body ? el : null;
+	}
+
+	// Cached lookups: renderMini() runs often while a track is loading.
+	function lookupHosts() {
+		if (!takeover.widget?.isConnected) takeover.widget = document.querySelector(PLAYBAR.widget);
+		if (!takeover.progressHost?.isConnected) takeover.progressHost = findProgressHost();
+		if (!takeover.playPause?.isConnected) takeover.playPause = document.querySelector(PLAYBAR.playPause);
+	}
+
+	function mountInto(host, own) {
+		host.dataset.ssHost = "1";
+		if (own.parentElement !== host) host.append(own);
+	}
+
+	// Returns true while Spotify's player bar is showing the active non-Spotify track.
+	function syncTakeover() {
+		if (!isYTActive()) {
+			if (takeover.active) {
+				takeover.active = false;
+				document.body.classList.remove("ss-takeover");
+			}
+			return false;
+		}
+		lookupHosts();
+		const { widget, progressHost, playPause } = takeover;
+		if (!widget || !progressHost) {
+			takeover.active = false;
+			document.body.classList.remove("ss-takeover");
+			return false;
+		}
+
+		const ui = ensureTakeoverUi();
+		mountInto(widget, ui.np);
+		mountInto(progressHost, ui.pb);
+		if (playPause) mountInto(playPause, ui.icon);
+
+		const track = state.current;
+		const providerLabel = providers[track.provider]?.label;
+		const artists = [track.artists.join(", "), providerLabel].filter(Boolean).join(" \u00b7 ");
+		setText(ui.title, track.title);
+		setText(ui.sub, state.status === "loading" ? `${t("loading", state.progress)}  -  ${artists}` : artists);
+		if (ui.lastCoverUrl !== track.thumbnail) {
+			ui.lastCoverUrl = track.thumbnail;
+			ui.cover.removeAttribute("data-fallback");
+			loadImage(ui.cover, track.thumbnail);
+		}
+		const icon = state.status === "playing" ? "pause" : "play";
+		if (ui.lastIcon !== icon) {
+			ui.lastIcon = icon;
+			ui.icon.innerHTML = ICONS[icon];
+		}
+
+		document.body.classList.add("ss-takeover");
+		takeover.active = true;
+		updateTakeoverProgress();
+		return true;
+	}
+
+	function updateTakeoverProgress() {
+		const ui = takeover.ui;
+		if (!ui || !takeover.active || ui.seeking) return;
+		const loading = state.status === "loading";
+		const duration = trackDurationSec();
+		const fraction = loading ? state.progress : duration > 0 ? Math.min(1, audio.currentTime / duration) : 0;
+		ui.seek.disabled = loading;
+		ui.seek.value = String(Math.round(fraction * 1000));
+		ui.seek.style.setProperty("--ss-pct", `${(fraction * 100).toFixed(1)}%`);
+		setText(ui.pos, loading ? "" : clock(audio.currentTime));
+		setText(ui.dur, duration > 0 ? clock(duration) : "");
+	}
+
+	// Route the buttons of Spotify's player bar to our track while it is taken over. This runs in the
+	// capture phase on the document, before React sees the click, so Spotify never starts its own track.
+	document.addEventListener(
+		"click",
+		(event) => {
+			if (!takeover.active || !(event.target instanceof Element)) return;
+			let action = null;
+			if (event.target.closest(PLAYBAR.playPause)) action = toggleYT;
+			else if (event.target.closest(PLAYBAR.skipForward)) action = skipNext;
+			else if (event.target.closest(PLAYBAR.skipBack)) action = skipPrev;
+			if (!action) return;
+			event.preventDefault();
+			event.stopImmediatePropagation();
+			action();
+		},
+		true
+	);
 
 	// ---------------------------------------------------------------------
 	// Queue popup
@@ -1301,12 +1520,15 @@
 
 	// Spotify re-renders the search page and may drop our section; re-attach when needed.
 	let attachScheduled = false;
-	new MutationObserver(() => {
-		if (attachScheduled || !search.query) return;
+	new MutationObserver((mutations) => {
+		if (attachScheduled || (!search.query && !isYTActive())) return;
+		// Ignore changes made by this extension to its own player bar elements.
+		if (mutations.every((m) => m.target.closest?.(".ss-own"))) return;
 		attachScheduled = true;
 		requestAnimationFrame(() => {
 			attachScheduled = false;
 			attachSection();
+			if (isYTActive()) syncTakeover();
 		});
 	}).observe(document.body, { childList: true, subtree: true });
 

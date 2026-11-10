@@ -7,7 +7,8 @@ A [Spicetify](https://spicetify.app/) extension that brings YouTube Music into S
 - A "Synthesis Spotify" section with YouTube Music results appears on Spotify's search results page
 - Play a result, add it to the queue, or play it next
 - Queued tracks play between Spotify tracks (shown in the queue button on the playbar)
-- A small mini player appears while a YouTube track is active
+- While a YouTube track is active, Spotify's own player bar shows it (cover, title, progress bar) and its play/pause,
+  previous and next buttons control it. A small mini player is only shown if the player bar cannot be used
 - Audio is downloaded into a Blob and played from a Blob URL, so there is no streaming proxy
 - Playback is opt-in: without the optional local Wisp server you can still search and open results in the browser
 
@@ -183,7 +184,8 @@ Spotify に YouTube Music を統合する [Spicetify](https://spicetify.app/) �
 - Spotify の検索結果ページに、YouTube Music の結果を「Synthesis Spotify」セクションとして表示
 - 結果から再生、次に再生、キューに追加
 - キューに入れた曲は Spotify の曲の間に挟まって再生(プレイバーのキューボタンで確認)
-- YouTube の曲の再生中は小さなミニプレイヤーを表示
+- YouTube の曲の再生中は、Spotify 本体のプレイヤーバー(カバー・曲名・シークバー)にその曲を表示し、
+  再生/一時停止・前へ・次へボタンでそのまま操作できます。プレイヤーバーを使えない場合だけ、小さなミニプレイヤーを表示します
 - 音声は Blob にダウンロードして Blob URL で再生
 - 再生機能は任意でオンにする方式です。ローカル Wisp サーバーが無くても、検索と「ブラウザで開く」は使えます
 
