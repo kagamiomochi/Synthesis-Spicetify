@@ -992,6 +992,9 @@
 		.ss-switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform 0.15s; }
 		.ss-switch input:checked + span { background: var(--essential-bright-accent, #1ed760); }
 		.ss-switch input:checked + span::after { transform: translateX(18px); }
+		.ss-switch.ss-checking input { cursor: progress; }
+		.ss-switch.ss-checking span::after { left: 11px; box-sizing: border-box; background: transparent; border: 2px solid #fff; border-top-color: transparent; animation: ss-spin 0.8s linear infinite; }
+		@keyframes ss-spin { to { transform: rotate(360deg); } }
 		.ss-settings .ss-desc { margin: 6px 0 0; font-size: 12px; color: var(--text-subdued, #a7a7a7); }
 		.ss-settings .ss-guide { margin-top: 12px; padding: 12px 14px; border-radius: 8px; background: rgba(128, 128, 128, 0.12); font-size: 13px; }
 		.ss-settings .ss-guide ol { margin: 8px 0 0; padding-left: 20px; }
@@ -1456,6 +1459,7 @@
 		// Playback toggle. The switch shows the saved state; turning it on only sticks once the local Wisp answers.
 		const playback = h("input", { type: "checkbox" });
 		playback.checked = config.playbackEnabled;
+		const playbackSwitch = h("span", { class: "ss-switch" }, playback, h("span", {}));
 		const guideStatus = h("div", { class: "ss-guide-status" });
 		const checkButton = h("button", { class: "ss-primary", onClick: () => checkLocalWisp() }, t("guideCheck"));
 		const command = (label, text) =>
@@ -1507,6 +1511,13 @@
 		);
 
 		let checkToken = 0;
+		let checking = false;
+		// While the connection is being verified the switch stays off and shows a spinner instead of the knob.
+		const setChecking = (value) => {
+			checking = value;
+			playbackSwitch.classList.toggle("ss-checking", value);
+			checkButton.disabled = value;
+		};
 		const setPlayback = (enabled) => {
 			saveConfig({ playbackEnabled: enabled });
 			playback.checked = enabled;
@@ -1522,10 +1533,13 @@
 		const checkLocalWisp = async () => {
 			const token = ++checkToken;
 			guideStatus.textContent = t("guideChecking");
-			checkButton.disabled = true;
+			guide.style.display = "block";
+			// Do not show the switch as on until the connection is confirmed.
+			if (!config.playbackEnabled) playback.checked = false;
+			setChecking(true);
 			const ok = await probeLocalWisp(config.localWisp);
 			if (token !== checkToken) return; // a newer check or the switch took over
-			checkButton.disabled = false;
+			setChecking(false);
 			if (ok) {
 				guideStatus.textContent = t("guideOk");
 				if (!config.playbackEnabled) setPlayback(true);
@@ -1537,20 +1551,27 @@
 		playback.addEventListener("change", () => {
 			if (!playback.checked) {
 				checkToken++;
-				checkButton.disabled = false;
+				setChecking(false);
 				guide.style.display = "none";
 				guideStatus.textContent = "";
 				if (config.playbackEnabled) setPlayback(false);
 				return;
 			}
-			guide.style.display = "block";
+			if (checking) {
+				// Clicked again while verifying: cancel the check and keep the switch off.
+				checkToken++;
+				setChecking(false);
+				guideStatus.textContent = "";
+				playback.checked = config.playbackEnabled;
+				return;
+			}
 			checkLocalWisp();
 		});
 
 		const content = h(
 			"div",
 			{ class: "ss-settings" },
-			h("label", { class: "ss-toggle" }, h("span", { class: "ss-switch" }, playback, h("span", {})), t("playbackLabel")),
+			h("label", { class: "ss-toggle" }, playbackSwitch, t("playbackLabel")),
 			h("div", { class: "ss-desc" }, t("playbackDesc")),
 			h(
 				"button",
