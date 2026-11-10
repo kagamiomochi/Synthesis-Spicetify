@@ -44,6 +44,7 @@
 	// Constants and configuration
 	// ---------------------------------------------------------------------
 	/* VERSION */ const VERSION = "v0.4.2";
+	const WISP_SCRIPT_URL = "https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spotify/main/wisp-launcher/portable/wisp_ondemand.py";
 	const LIBCURL_URL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.5/libcurl_full.mjs";
 	const YTJS_URL = "https://cdn.jsdelivr.net/npm/youtubei.js@18.3.0/bundle/browser.js";
 	const CONFIG_KEY = "synthesis-spotify:config";
@@ -153,9 +154,8 @@
 			guideTitle: "ローカル Wisp サーバーのセットアップ",
 			guideIntro: (url) => `再生機能は、自分の PC 上の Wisp サーバー (${url}) を経由して動きます。次の手順で用意してください。`,
 			guideStep1: "Python 3.9 以上、Node.js 22.18 以上 (または 24.11 以上)、npm を用意します (Linux は systemd も必要)。",
-			guideStep2: "このリポジトリを clone します。",
-			guideStep3: "リポジトリのフォルダでインストーラーを実行します。",
-			guideStep4: "終わったら、下のボタンで接続を確認します。確認できると再生機能が有効になります。",
+			guideStep2: "ターミナルで次のコマンドを実行します (クリックでコピーできます)。セットアップスクリプトをダウンロードしてインストールを行います。完了したらダウンロードしたファイルは削除しても構いません。",
+			guideStep3: "終わったら、下のボタンで接続を確認します。確認できると再生機能が有効になります。",
 			guideCheck: "接続を確認",
 			guideReadme: "詳しい手順 (README)",
 			guideChecking: "ローカル Wisp を確認中...",
@@ -207,9 +207,8 @@
 			guideTitle: "Setting up the local Wisp server",
 			guideIntro: (url) => `Playback goes through a Wisp server on your own PC (${url}). Set it up with these steps.`,
 			guideStep1: "Get Python 3.9+, Node.js 22.18+ (or 24.11+) and npm (Linux also needs systemd).",
-			guideStep2: "Clone this repository.",
-			guideStep3: "Run the installer from the repository folder.",
-			guideStep4: "When it is done, check the connection with the button below. Playback is enabled once the check succeeds.",
+			guideStep2: "Run the following command in the terminal (you can click to copy it). Download the setup script and run the installation. Once complete, you may delete the downloaded file.",
+			guideStep3: "When it is done, check the connection with the button below. Playback is enabled once the check succeeds.",
 			guideCheck: "Check connection",
 			guideReadme: "Detailed steps (README)",
 			guideChecking: "Checking the local Wisp server...",
@@ -1482,16 +1481,10 @@
 					"li",
 					{},
 					t("guideStep2"),
-					command("", "git clone https://github.com/kagamiomochi/Synthesis-Spotify.git\ncd Synthesis-Spotify")
+					command("Linux / macOS", `curl -fsSLO ${WISP_SCRIPT_URL} && python3 wisp_ondemand.py install`),
+					command("Windows (PowerShell)", `curl.exe -fsSLO ${WISP_SCRIPT_URL}; py -3 wisp_ondemand.py install`)
 				),
-				h(
-					"li",
-					{},
-					t("guideStep3"),
-					command("Linux / macOS", "python3 wisp-launcher/portable/wisp_ondemand.py install"),
-					command("Windows", "py -3 wisp-launcher\\portable\\wisp_ondemand.py install")
-				),
-				h("li", {}, t("guideStep4"))
+				h("li", {}, t("guideStep3"))
 			),
 			h(
 				"div",

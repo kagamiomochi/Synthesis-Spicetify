@@ -81,6 +81,31 @@ def pid_file(install_dir):
     return state_dir(install_dir) / "wisp-backend.pid"
 
 
+def fixed_script_path(install_dir):
+    # The autostart entries (launchd, Task Scheduler) record the path of this script,
+    # so it has to live at a path that never changes.
+    return state_dir(install_dir) / "wisp_ondemand.py"
+
+
+def install_self(install_dir):
+    """Copy this script to its fixed path and return that path.
+
+    Autostart entries must not point at a download folder or a clone that may be moved
+    or deleted. Does nothing when this script already is the fixed copy.
+    """
+    source = Path(__file__).resolve()
+    target = fixed_script_path(install_dir)
+    if target.exists() and os.path.samefile(source, target):
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Copy to a temporary name first, so an interrupted copy never leaves a broken script.
+    tmp = target.with_name(target.name + ".tmp")
+    shutil.copyfile(source, tmp)
+    os.replace(tmp, target)
+    print(f"Copied this script to {target}")
+    return target
+
+
 # ---------------------------------------------------------------------------
 # Setup: install wisp-js with npm
 # ---------------------------------------------------------------------------
@@ -417,7 +442,7 @@ def macos_plist_path():
 
 
 def macos_plist(args):
-    script = [sys.executable, str(Path(__file__).resolve())]
+    script = [sys.executable, str(args.script)]
     if args.resident:
         # Fallback: a launcher that stays resident and only starts the Wisp server on demand.
         return {
@@ -476,7 +501,7 @@ def install_windows(args):
     python = Path(sys.executable)
     pythonw = python.with_name("pythonw.exe")  # no console window
     command = str(pythonw if pythonw.is_file() else python)
-    arguments = subprocess.list2cmdline([str(Path(__file__).resolve())] + run_arguments(args))
+    arguments = subprocess.list2cmdline([str(args.script)] + run_arguments(args))
     user = escape(windows_user())
     xml = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -644,13 +669,18 @@ def uninstall_linux(args):
 def cmd_install(args):
     if sys.platform == "darwin":
         cmd_setup(args)
+        args.script = install_self(args.install_dir)
         install_macos(args)
     elif IS_WINDOWS:
         cmd_setup(args)
+        args.script = install_self(args.install_dir)
         install_windows(args)
     elif sys.platform.startswith("linux"):
         proxyd = check_linux(args)
         cmd_setup(args)
+        # The systemd units do not reference this script, but keep the same fixed copy
+        # on every OS so that `run` can always be started from the same path.
+        args.script = install_self(args.install_dir)
         install_linux(args, proxyd)
     else:
         raise SystemExit(f"Unsupported platform: {sys.platform}. "
