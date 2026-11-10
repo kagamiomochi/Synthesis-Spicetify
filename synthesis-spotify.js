@@ -607,7 +607,9 @@
 				});
 				return { blob, mime: format.mimeType };
 			} catch (error) {
-				if (error?.name === "AbortError") throw error;
+				// libcurl.js rejects aborted requests with a DOMException named "Error" (or errors the body
+				// stream with a plain string), so check the signal instead of relying on error.name.
+				if (signal?.aborted || error?.name === "AbortError") throw new DOMException("Aborted", "AbortError");
 				errors.push(`${client}: ${error?.message || error}`);
 			}
 		}
@@ -662,13 +664,16 @@
 		}
 
 		let job = inflight.get(key);
+		// A job that was aborted may still be listed until its request settles. Joining it would make this
+		// request fail with an abort error, so start a fresh job instead.
+		if (job?.controller.signal.aborted) job = null;
 		if (!job) {
 			const controller = new AbortController();
-			job = { controller, listeners: new Set(), promise: null };
-			job.promise = providers[track.provider]
+			const created = { controller, listeners: new Set(), promise: null };
+			created.promise = providers[track.provider]
 				.fetchAudio(track, {
 					signal: controller.signal,
-					onProgress: (p) => job.listeners.forEach((fn) => fn(p)),
+					onProgress: (p) => created.listeners.forEach((fn) => fn(p)),
 				})
 				.then(({ blob }) => {
 					const url = URL.createObjectURL(blob);
@@ -676,8 +681,12 @@
 					evictCache();
 					return url;
 				})
-				.finally(() => inflight.delete(key));
-			inflight.set(key, job);
+				.finally(() => {
+					// Do not remove a newer job that replaced this one under the same key.
+					if (inflight.get(key) === created) inflight.delete(key);
+				});
+			inflight.set(key, created);
+			job = created;
 		}
 		if (onProgress) job.listeners.add(onProgress);
 		return job.promise;
@@ -1434,10 +1443,15 @@
 			output.textContent += `${line}\n`;
 			output.scrollTop = output.scrollHeight;
 		};
-		const collect = () => ({
-			wispServers: wisp.value.split("\n").map((s) => s.trim()).filter(Boolean),
-			clients: clients.value.split(",").map((s) => s.trim()).filter(Boolean),
-		});
+		const collect = () => {
+			const wispList = wisp.value.split("\n").map((s) => s.trim()).filter(Boolean);
+			const clientList = clients.value.split(",").map((s) => s.trim()).filter(Boolean);
+			// An empty list would leave no usable Wisp server / client, so fall back to the defaults.
+			return {
+				wispServers: wispList.length ? wispList : DEFAULT_CONFIG.wispServers,
+				clients: clientList.length ? clientList : DEFAULT_CONFIG.clients,
+			};
+		};
 
 		// Playback toggle. The switch shows the saved state; turning it on only sticks once the local Wisp answers.
 		const playback = h("input", { type: "checkbox" });
@@ -1557,7 +1571,7 @@
 			h(
 				"div",
 				{ class: "ss-buttons" },
-				h("button", { class: "ss-primary", onClick: () => { saveConfig(collect()); notify(t("saved")); } }, t("save")),
+				h("button", { class: "ss-primary", onClick: () => { saveConfig(collect()); resetNetwork(); notify(t("saved")); } }, t("save")),
 				h(
 					"button",
 					{
