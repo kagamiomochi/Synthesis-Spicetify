@@ -1,4 +1,9 @@
-# Synthesis Spotify
+<div align="center">
+  <h1>Synthesis Spotify</h1>
+  <p>Transcending all musical boundaries.</p>
+  <img src="./preview.png" alt="logo" width="300">
+</div>
+
 
 [![Latest Tag](https://img.shields.io/github/v/tag/kagamiomochi/Synthesis-Spotify?sort=semver)](https://github.com/kagamiomochi/Synthesis-Spotify/tags)
 
