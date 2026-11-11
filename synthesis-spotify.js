@@ -387,6 +387,19 @@
 	// ---------------------------------------------------------------------
 	// Provider: YouTube Music (youtubei.js)
 	// ---------------------------------------------------------------------
+	// "gl" must be a two-letter ISO 3166-1 region. navigator.language may be "ja" (no region),
+	// "en-001" / "es-419" (numeric UN M.49 area) or "zh-Hans-CN" (script subtag), and passing those
+	// through as-is makes InnerTube answer HTTP 400 INVALID_ARGUMENT.
+	function detectRegion() {
+		try {
+			const region = new Intl.Locale(navigator.language || "en-US").region;
+			if (region && /^[A-Z]{2}$/.test(region)) return region;
+		} catch {
+			// Malformed locale tag: fall through to the default.
+		}
+		return "US";
+	}
+
 	const innertubes = { plain: null, player: null };
 	function getInnertube(withPlayer = false) {
 		const slot = withPlayer ? "player" : "plain";
@@ -394,7 +407,7 @@
 			const mod = await import(YTJS_URL);
 			// The web build has no JS evaluator; it is required to decipher signatures and "n" params.
 			mod.Platform.shim.eval = async (data) => new Function(data.output)();
-			const region = (navigator.language || "en-US").split("-")[1]?.toUpperCase() || "US";
+			const region = detectRegion();
 			const base = {
 				fetch: curlFetch,
 				cache: new mod.UniversalCache(false),
@@ -1609,6 +1622,13 @@
 			if (!tracks.length) throw new Error("0 results");
 			return `${tracks.length} results`;
 		}))) {
+			// Show the locale-dependent values that went into the request, to make HTTP 400 easier to trace.
+			try {
+				const client = (await getInnertube()).session.context.client;
+				log(`Session context: gl=${client.gl}, hl=${client.hl}, timeZone=${client.timeZone}, navigator.language=${navigator.language}`);
+			} catch (error) {
+				log(`Session context unavailable: ${error?.message || error}`);
+			}
 			return;
 		}
 
