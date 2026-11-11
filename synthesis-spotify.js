@@ -62,18 +62,20 @@
 		playbackEnabled: false,
 		// InnerTube clients tried in order to obtain a directly playable audio URL.
 		clients: ["visionos", "tv_samsung"],
-		resultLimit: 8,
+		resultLimit: 20,
 		prefetchNext: true,
 	};
 
-	const CONFIG_VERSION = 5;
+	const CONFIG_VERSION = 6;
 	const LOCAL_WISP_RE = /^wss?:\/\/(localhost|127\.0\.0\.1|\[::1\])/;
 
 	function loadConfig() {
 		try {
 			const stored = JSON.parse(localStorage.getItem(CONFIG_KEY) || "{}");
 			// v4 changed the default client list; drop an older saved list so the new defaults apply.
-			if (stored.configVersion !== CONFIG_VERSION) delete stored.clients;
+			if ((stored.configVersion ?? 0) < 4) delete stored.clients;
+			// v6 raised the default result limit and now merges songs and videos; drop the old saved limit.
+			if ((stored.configVersion ?? 0) < 6) delete stored.resultLimit;
 			// v5 split the local Wisp server out of wispServers and made playback opt-in. Anyone who saved a
 			// local address before is treated as having set it up, so their playback keeps working.
 			if ((stored.configVersion ?? 0) < 5 && Array.isArray(stored.wispServers)) {
@@ -419,27 +421,71 @@
 		return url.replace(/=w\d+-h\d+[^&]*$/, `=w${size}-h${size}-l90-rj`);
 	}
 
+	// Fold width/case differences and drop punctuation so "Ado" / "ＡＤＯ" / "ado!" compare equal.
+	function normalizeText(text) {
+		return String(text ?? "")
+			.normalize("NFKC")
+			.toLowerCase()
+			.replace(/[^\p{L}\p{N}]+/gu, " ")
+			.trim();
+	}
+
+	function toTrack(item) {
+		if (!item?.id || !item.title) return null;
+		// Songs expose "artists"; videos (official MVs, uploads, covers) expose "authors" instead.
+		const people = item.artists ?? item.authors ?? [];
+		const thumbs = item.thumbnail?.contents ?? [];
+		return {
+			provider: "youtube",
+			id: item.id,
+			title: item.title,
+			artists: people.map((person) => person.name).filter(Boolean),
+			album: item.album?.name || "",
+			durationMs: (item.duration?.seconds ?? 0) * 1000,
+			thumbnail: resizeThumbnail(thumbs[thumbs.length - 1]?.url || thumbs[0]?.url),
+		};
+	}
+
+	async function searchByType(yt, query, type) {
+		const res = await yt.music.search(query, { type });
+		const shelf = res.contents?.find((node) => node.type === "MusicShelf");
+		return (shelf?.contents ?? []).map(toTrack).filter(Boolean);
+	}
+
+	// Songs only (the old behaviour) hides covers, live versions, remixes and uploads that exist only as
+	// videos, which is why many tracks never showed up. Query both and merge the two result lists.
 	async function youtubeSearch(query, limit) {
 		const yt = await getInnertube();
-		const res = await yt.music.search(query, { type: "song" });
-		const shelf = res.contents?.find((node) => node.type === "MusicShelf");
-		const items = shelf?.contents ?? [];
-		const tracks = [];
-		for (const item of items) {
-			if (!item?.id || !item.title) continue;
-			const thumbs = item.thumbnail?.contents ?? [];
-			tracks.push({
-				provider: "youtube",
-				id: item.id,
-				title: item.title,
-				artists: (item.artists ?? []).map((artist) => artist.name).filter(Boolean),
-				album: item.album?.name || "",
-				durationMs: (item.duration?.seconds ?? 0) * 1000,
-				thumbnail: resizeThumbnail(thumbs[thumbs.length - 1]?.url || thumbs[0]?.url),
-			});
-			if (tracks.length >= limit) break;
+		const settled = await Promise.allSettled([searchByType(yt, query, "song"), searchByType(yt, query, "video")]);
+		if (settled.every((r) => r.status === "rejected")) throw settled[0].reason;
+		const [songs, videos] = settled.map((r) => (r.status === "fulfilled" ? r.value : []));
+
+		// Interleave by rank so neither list drowns the other, then drop duplicates (same id, or the same
+		// title and first artist, which is typically a song and its own music video).
+		const merged = [];
+		const seen = new Set();
+		for (let i = 0; i < Math.max(songs.length, videos.length); i++) {
+			for (const track of [songs[i], videos[i]]) {
+				if (!track) continue;
+				const key = `${normalizeText(track.title)}|${normalizeText(track.artists[0])}`;
+				if (seen.has(track.id) || seen.has(key)) continue;
+				seen.add(track.id);
+				seen.add(key);
+				merged.push(track);
+			}
 		}
-		return tracks;
+
+		// Stable partition: tracks whose title/artist/album contain every query word go first. Everything
+		// else keeps YouTube's own order, so a mismatch (e.g. localized artist names) never reorders results.
+		const words = normalizeText(query).split(" ").filter(Boolean);
+		const matches = (track) => {
+			const haystack = normalizeText([track.title, ...track.artists, track.album].join(" "));
+			return words.every((word) => haystack.includes(word));
+		};
+		const hit = [];
+		const rest = [];
+		for (const track of merged) (words.length && matches(track) ? hit : rest).push(track);
+		return [...hit, ...rest].slice(0, limit);
 	}
 
 	// ---- Audio download through libcurl (ranged requests, like YouTube's own player) ----
