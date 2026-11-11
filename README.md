@@ -186,10 +186,24 @@ Spotify に YouTube Music を統合する [Spicetify](https://spicetify.app/) �
 - キューに入れた曲は Spotify の曲の間に挟まって再生(プレイバーのキューボタンで確認)
 - YouTube の曲の再生中は、Spotify 本体のプレイヤーバー(カバー・曲名・シークバー)にその曲を表示し、
   再生/一時停止・前へ・次へボタンでそのまま操作できます。プレイヤーバーを使えない場合だけ、小さなミニプレイヤーを表示します
-- 音声は Blob にダウンロードして Blob URL で再生
+- 音声は Blob にダウンロードして Blob URL で再生するため、ストリーミング用のプロキシは不要
 - 再生機能は任意でオンにする方式です。ローカル Wisp サーバーが無くても、検索と「ブラウザで開く」は使えます
 
-対応サービスは現在 YouTube Music(YouTube)のみです。
+対応サービスは現在 YouTube Music(YouTube)のみです。今後ほかのサービスにも対応する予定です。
+
+[English](#synthesis-spotify)
+
+## 仕組み
+
+| 部分 | ライブラリ |
+| --- | --- |
+| YouTube Music の検索 | [YouTube.js](https://github.com/LuanRT/YouTube.js) (youtubei.js) |
+| CORS を回避するリクエスト | [libcurl.js](https://github.com/ading2210/libcurl.js) (WASM 版 libcurl) を Wisp WebSocket プロキシ経由で使用 |
+| 再生 | 音声を `Blob` にダウンロードし、`URL.createObjectURL` で再生 |
+
+プレイヤーリクエスト(クライアント定義、ヘッダー、Cookie)は yt-dlp と同じ方法で組み立てています。YouTube.js がアプリ系クライアント向けに送るリクエストの形は、現在「Sign in to confirm you're not a bot」で拒否されるためです。
+
+どちらのライブラリも初回利用時に jsDelivr から読み込みます (バージョン固定: libcurl.js 0.7.5、youtubei.js 18.3.0)。
 
 ## 必要なもの
 
@@ -277,7 +291,13 @@ Spotify のプロフィールメニューから「Synthesis Spotify 設定」を
 
 ## トラブルシューティング
 
-上の英語セクションの表を参照してください。特に `LOGIN_REQUIRED` が出る場合は、「再生機能を有効化」がオンで、ローカル Wisp が動いているか確認してください。クライアントのバージョンが古くなった場合は、`synthesis-spotify.js` の `CLIENT_DEFS` を yt-dlp の `INNERTUBE_CLIENTS` に合わせて更新します。
+| メッセージ | 考えられる原因と対処 |
+| --- | --- |
+| `LOGIN_REQUIRED: Sign in to confirm you're not a bot` | Wisp プロキシの IP が弾かれています。設定で「再生機能を有効化」をオンにして、ローカル Wisp サーバーを用意してください。 |
+| `No usable Wisp server` | 使える Wisp サーバーがありません。再生機能がオンならローカルサーバーを起動してください。オフなら、ネットワークと設定の公開 Wisp の URL を確認してください。 |
+| libcurl のステップが最初で失敗する | Spotify の CSP が WASM や jsDelivr からの import をブロックしている可能性があります。 |
+| プレイヤーのステップで `EvalError` / CSP エラー | 一部のストリーム URL の復号に必要な `eval` を Spotify がブロックしています。`visionos` だけを使ってください。 |
+| ローカル Wisp で `player request failed: HTTP 400/403` または `LOGIN_REQUIRED` | クライアント定義が古くなっています。`synthesis-spotify.js` の `CLIENT_DEFS` を、yt-dlp の `INNERTUBE_CLIENTS` (`yt_dlp/extractor/youtube/_base.py`) に合わせて更新してください。 |
 
 ## プライバシーと免責
 
@@ -285,3 +305,10 @@ Spotify のプロフィールメニューから「Synthesis Spotify 設定」を
 - YouTube のセッション Cookie はメモリ上にのみ保持します。
 - 非公式の YouTube API を使っており、YouTube の利用規約に反する可能性があります。自己責任で使ってください。
 - Spotify、Google、YouTube とは無関係です。
+
+## クレジット
+
+- [YouTube.js](https://github.com/LuanRT/YouTube.js) (LuanRT)
+- [libcurl.js](https://github.com/ading2210/libcurl.js) (ading2210)
+- [wisp-js](https://github.com/MercuryWorkshop/wisp-js) (MercuryWorkshop、ローカル Wisp サーバー)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (プレイヤーリクエストの参照元として、そのクライアント定義を利用)
