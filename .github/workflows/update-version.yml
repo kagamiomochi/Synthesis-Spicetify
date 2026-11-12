@@ -17,15 +17,15 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update VERSION in synthesis-spotify.js
+      - name: Update VERSION in synthesis-spicetify.js
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          sed -i "s|/\* VERSION \*/ const VERSION = \"[^\"]*\";|/* VERSION */ const VERSION = \"${TAG}\";|" synthesis-spotify.js
+          sed -i "s|/\* VERSION \*/ const VERSION = \"[^\"]*\";|/* VERSION */ const VERSION = \"${TAG}\";|" synthesis-spicetify.js
 
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add synthesis-spotify.js
+          git add synthesis-spicetify.js
           git diff --cached --quiet || git commit -m "chore: update VERSION to ${GITHUB_REF#refs/tags/}"
           git push origin HEAD:main --force-with-lease

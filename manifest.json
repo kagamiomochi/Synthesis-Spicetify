@@ -1,9 +1,9 @@
 [
   {
-    "name": "Synthesis Spotify",
+    "name": "Synthesis Spicetify",
     "description": "Transcending all musical boundaries.",
     "preview": "preview.png",
-    "main": "synthesis-spotify.js",
+    "main": "synthesis-spicetify.js",
     "readme": "README.md",
     "authors": [
       {

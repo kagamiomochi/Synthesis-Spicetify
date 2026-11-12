@@ -1,15 +1,15 @@
 <div align="center">
-  <h1>Synthesis Spotify</h1>
+  <h1>Synthesis Spicetify</h1>
   <p>Transcending all musical boundaries.</p>
-  <img src="./preview.png" alt="logo" width="300">
+  <img src="./logo.png" alt="logo" width="300">
 </div>
 
 
-[![Latest Tag](https://img.shields.io/github/v/tag/kagamiomochi/Synthesis-Spotify?sort=semver)](https://github.com/kagamiomochi/Synthesis-Spotify/tags)
+[![Latest Tag](https://img.shields.io/github/v/tag/kagamiomochi/Synthesis-Spicetify?sort=semver)](https://github.com/kagamiomochi/Synthesis-Spicetify/tags)
 
 A [Spicetify](https://spicetify.app/) extension that brings YouTube Music into Spotify.
 
-- A "Synthesis Spotify" section with YouTube Music results appears on Spotify's search results page
+- A "Synthesis Spicetify" section with YouTube Music results appears on Spotify's search results page
 - Play a result, add it to the queue, or play it next
 - Queued tracks play between Spotify tracks (shown in the queue button on the playbar)
 - While a YouTube track is active, Spotify's own player bar shows it (cover, title, progress bar) and its play/pause,
@@ -51,15 +51,15 @@ by default, and only public Wisp proxies are used until you turn on **Enable pla
 
 ### Marketplace
 
-Open the Spicetify Marketplace in Spotify, search for "Synthesis Spotify" and install it.
+Open the Spicetify Marketplace in Spotify, search for "Synthesis Spicetify" and install it.
 
 ### Manual
 
-1. Copy `synthesis-spotify.js` into the Spicetify `Extensions` folder.
+1. Copy `synthesis-spicetify.js` into the Spicetify `Extensions` folder.
 2. Run:
 
    ```sh
-   spicetify config extensions synthesis-spotify.js
+   spicetify config extensions synthesis-spicetify.js
    spicetify apply
    ```
 
@@ -90,8 +90,8 @@ On Linux you also need systemd (with `systemd-socket-proxyd`).
    py -3 wisp-launcher\portable\wisp_ondemand.py install
    ```
 
-   wisp-js (pinned to one version) is installed into `~/.local/share/synthesis-spotify/wisp-js` (Windows:
-   `%LOCALAPPDATA%\synthesis-spotify\wisp-js`). Use `--install-dir PATH` to change it, `--node PATH` to choose the
+   wisp-js (pinned to one version) is installed into `~/.local/share/synthesis-spicetify/wisp-js` (Windows:
+   `%LOCALAPPDATA%\synthesis-spicetify\wisp-js`). Use `--install-dir PATH` to change it, `--node PATH` to choose the
    Node.js binary, and `--idle-minutes N` to change the idle time. The Node.js path is recorded at install time, so run
    `install` again after you move or replace Node.js (for example with a version manager). On macOS, `--resident`
    keeps a resident launcher instead of using socket activation.
@@ -106,7 +106,7 @@ What gets registered:
 | macOS | LaunchAgent (launchd socket activation) | None. launchd owns port 6001, and the launcher exits again when idle. |
 | Windows | Scheduled task that runs at login | A small launcher process. Only the Wisp server runs on demand. |
 
-Logs: on Linux, use `journalctl --user -u synthesis-spotify-wisp-backend.service -u synthesis-spotify-wisp-proxy.service`.
+Logs: on Linux, use `journalctl --user -u synthesis-spicetify-wisp-backend.service -u synthesis-spicetify-wisp-proxy.service`.
 On macOS and Windows, logs are written next to the wisp-js directory (`wisp-ondemand.log` for the launcher,
 `wisp-backend.log` for the Wisp server).
 
@@ -117,8 +117,8 @@ Other commands:
   Linux without systemd.
 - Older versions of this script used the Python Wisp server from libcurl.js. Run `install` again to switch to wisp-js;
   the old `libcurl.js` directory is no longer used and can be deleted.
-- If an older version of this README had you enable `synthesis-spotify-wisp.service` (the always-on service), disable it
-  first with `systemctl --user disable --now synthesis-spotify-wisp.service`. It uses port 6001 too, and the installer
+- If an older version of this README had you enable `synthesis-spicetify-wisp.service` (the always-on service), disable it
+  first with `systemctl --user disable --now synthesis-spicetify-wisp.service`. It uses port 6001 too, and the installer
   stops with a message when it finds it.
 
 The proxy, on-demand start and idle stop were tested on Linux. The macOS socket activation was only simulated on
@@ -127,7 +127,7 @@ tested on real machines yet.
 
 ## Usage
 
-1. Search in Spotify as usual. The "Synthesis Spotify" section appears on the search results page.
+1. Search in Spotify as usual. The "Synthesis Spicetify" section appears on the search results page.
 2. Hover a result:
    - Play button on the cover: play now
    - "Play next" / "Add to queue" buttons on the right
@@ -141,7 +141,7 @@ Starting a different playlist or album in Spotify stops the YouTube track.
 
 ## Settings
 
-Open the profile menu in Spotify and choose "Synthesis Spotify settings".
+Open the profile menu in Spotify and choose "Synthesis Spicetify settings".
 
 - **Enable playback**: off by default. While it is off, only the public Wisp proxies below are used, so you can search
   and open results in the browser, but not play them. Turning it on shows the local Wisp setup steps and checks the
@@ -162,7 +162,7 @@ Open the profile menu in Spotify and choose "Synthesis Spotify settings".
 | `No usable Wisp server` | No Wisp server is reachable. If playback is enabled, start the local server; otherwise check your network and the public Wisp URL in the settings. |
 | libcurl step fails right at the start | Spotify's CSP may be blocking WASM or the jsDelivr import. |
 | `EvalError` / CSP error in the player step | Spotify blocked `eval`, which is needed to decipher some stream URLs. Use `visionos` only. |
-| `player request failed: HTTP 400/403` or `LOGIN_REQUIRED` on a local Wisp | The client definitions are outdated. Update `CLIENT_DEFS` in `synthesis-spotify.js` from `INNERTUBE_CLIENTS` in yt-dlp (`yt_dlp/extractor/youtube/_base.py`). |
+| `player request failed: HTTP 400/403` or `LOGIN_REQUIRED` on a local Wisp | The client definitions are outdated. Update `CLIENT_DEFS` in `synthesis-spicetify.js` from `INNERTUBE_CLIENTS` in yt-dlp (`yt_dlp/extractor/youtube/_base.py`). |
 
 ## Privacy and disclaimer
 
@@ -186,7 +186,7 @@ Open the profile menu in Spotify and choose "Synthesis Spotify settings".
 
 Spotify に YouTube Music を統合する [Spicetify](https://spicetify.app/) 拡張機能です。
 
-- Spotify の検索結果ページに、YouTube Music の結果を「Synthesis Spotify」セクションとして表示
+- Spotify の検索結果ページに、YouTube Music の結果を「Synthesis Spicetify」セクションとして表示
 - 結果から再生、次に再生、キューに追加
 - キューに入れた曲は Spotify の曲の間に挟まって再生(プレイバーのキューボタンで確認)
 - YouTube の曲の再生中は、Spotify 本体のプレイヤーバー(カバー・曲名・シークバー)にその曲を表示し、
@@ -196,7 +196,7 @@ Spotify に YouTube Music を統合する [Spicetify](https://spicetify.app/) �
 
 対応サービスは現在 YouTube Music(YouTube)のみです。今後ほかのサービスにも対応する予定です。
 
-[English](#synthesis-spotify)
+[English](#synthesis-spicetify)
 
 ## 仕組み
 
@@ -222,13 +222,13 @@ libcurl.js は Wisp プロキシ経由で通信します。TLS は Spotify 内�
 ## インストール
 
 ### Marketplace
-Spotify の Spicetify Marketplace で「Synthesis Spotify」を検索してインストールします。
+Spotify の Spicetify Marketplace で「Synthesis Spicetify」を検索してインストールします。
 
 ### 手動
-`synthesis-spotify.js` を Spicetify の `Extensions` フォルダに置き、次を実行します。
+`synthesis-spicetify.js` を Spicetify の `Extensions` フォルダに置き、次を実行します。
 
   ```sh
-  spicetify config extensions synthesis-spotify.js
+  spicetify config extensions synthesis-spicetify.js
   spicetify apply
   ```
 
@@ -252,7 +252,7 @@ Spotify の Spicetify Marketplace で「Synthesis Spotify」を検索してイ�
    py -3 wisp-launcher\portable\wisp_ondemand.py install
    ```
 
-   wisp-js (バージョン固定) は `~/.local/share/synthesis-spotify/wisp-js` にインストールされます (Windows は `%LOCALAPPDATA%\synthesis-spotify\wisp-js`)。`--install-dir パス` で場所を、`--node パス` で使う Node.js を、`--idle-minutes 分` でアイドル時間を変えられます。Node.js のパスはインストール時に記録されるので、Node.js を移動したり (バージョン管理ツールなどで) 入れ替えたりしたら、もう一度 `install` を実行してください。macOS では `--resident` を付けると、ソケットアクティベーションではなく常駐型のランチャーになります。
+   wisp-js (バージョン固定) は `~/.local/share/synthesis-spicetify/wisp-js` にインストールされます (Windows は `%LOCALAPPDATA%\synthesis-spicetify\wisp-js`)。`--install-dir パス` で場所を、`--node パス` で使う Node.js を、`--idle-minutes 分` でアイドル時間を変えられます。Node.js のパスはインストール時に記録されるので、Node.js を移動したり (バージョン管理ツールなどで) 入れ替えたりしたら、もう一度 `install` を実行してください。macOS では `--resident` を付けると、ソケットアクティベーションではなく常駐型のランチャーになります。
 
 2. 削除は `uninstall` で行います (上と同じ Python コマンドの `install` を `uninstall` に変えます)。
 
@@ -264,20 +264,20 @@ Spotify の Spicetify Marketplace で「Synthesis Spotify」を検索してイ�
 | macOS | LaunchAgent (launchd のソケットアクティベーション) | なし。6001 番ポートは launchd が保持し、アイドルになるとランチャーも終了します。 |
 | Windows | ログイン時に実行するタスクスケジューラのタスク | 小さなランチャーのプロセス。Wisp サーバーだけがオンデマンドで動きます。 |
 
-ログ: Linux は `journalctl --user -u synthesis-spotify-wisp-backend.service -u synthesis-spotify-wisp-proxy.service` で見ます。macOS と Windows は wisp-js ディレクトリの隣に出ます (ランチャーは `wisp-ondemand.log`、Wisp サーバーは `wisp-backend.log`)。
+ログ: Linux は `journalctl --user -u synthesis-spicetify-wisp-backend.service -u synthesis-spicetify-wisp-proxy.service` で見ます。macOS と Windows は wisp-js ディレクトリの隣に出ます (ランチャーは `wisp-ondemand.log`、Wisp サーバーは `wisp-backend.log`)。
 
 そのほかのコマンド:
 
 - `wisp_ondemand.py setup` は wisp-js の npm でのインストールだけを行います。
 - `wisp_ondemand.py run` はランチャーをフォアグラウンドで実行します。どの OS でも使えるので、systemd を使わない Linux ではこれを使います。
 - 以前のバージョンのスクリプトは libcurl.js 付属の Python 製 Wisp サーバーを使っていました。wisp-js に切り替えるには、もう一度 `install` を実行してください。古い `libcurl.js` ディレクトリは使われなくなるので削除して構いません。
-- 以前の README の手順で常時起動サービス `synthesis-spotify-wisp.service` を有効にしている場合は、先に `systemctl --user disable --now synthesis-spotify-wisp.service` で無効にしてください。同じ 6001 番ポートを使うため、インストーラーは見つけるとメッセージを出して止まります。
+- 以前の README の手順で常時起動サービス `synthesis-spicetify-wisp.service` を有効にしている場合は、先に `systemctl --user disable --now synthesis-spicetify-wisp.service` で無効にしてください。同じ 6001 番ポートを使うため、インストーラーは見つけるとメッセージを出して止まります。
 
 転送、オンデマンド起動、アイドル停止は Linux で確認しています。macOS のソケットアクティベーションは Linux 上で模擬しただけで (`launch_activate_socket` の呼び出し自体は macOS が必要です)、macOS と Windows の自動起動の登録は実機では確認していません。
 
 ## 使い方
 
-1. Spotify で普通に検索すると、検索結果ページに「Synthesis Spotify」セクションが出ます。
+1. Spotify で普通に検索すると、検索結果ページに「Synthesis Spicetify」セクションが出ます。
 2. 結果にカーソルを合わせて、カバー画像の再生ボタンで再生、右側のボタンで「次に再生」「キューに追加」ができます。
 3. プレイバーのキューボタンで、キュー中の YouTube 曲を確認、再生、削除できます。
 4. YouTube の曲の再生中は、Spotify の再生ボタンがその曲の再生/一時停止になります(Spotify 自体は無音のままです)。次へ/前へは、キュー中の次の YouTube 曲に進み、キューが空なら Spotify に戻ります。
@@ -286,7 +286,7 @@ Spotify の Spicetify Marketplace で「Synthesis Spotify」を検索してイ�
 
 ## 設定
 
-Spotify のプロフィールメニューから「Synthesis Spotify 設定」を開きます。
+Spotify のプロフィールメニューから「Synthesis Spicetify 設定」を開きます。
 
 - **再生機能を有効化:** 既定はオフです。オフの間は下の公開 Wisp プロキシだけを使い、検索結果の表示と「ブラウザで開く」のみ使えます (再生はできません)。オンにしようとするとローカル Wisp のセットアップ手順を表示し、`ws://localhost:6001/` への接続を確認します。確認できると有効になります。オフにすると、再生中の YouTube の曲を止めてキューを空にします。
 - **公開 Wisp プロキシ:** 1 行に 1 つ、上から順に試します。既定は共有の公開サーバーです。再生機能がオンの間は、ローカルの `ws://localhost:6001/` を最初に試します。
@@ -302,7 +302,7 @@ Spotify のプロフィールメニューから「Synthesis Spotify 設定」を
 | `No usable Wisp server` | 使える Wisp サーバーがありません。再生機能がオンならローカルサーバーを起動してください。オフなら、ネットワークと設定の公開 Wisp の URL を確認してください。 |
 | libcurl のステップが最初で失敗する | Spotify の CSP が WASM や jsDelivr からの import をブロックしている可能性があります。 |
 | プレイヤーのステップで `EvalError` / CSP エラー | 一部のストリーム URL の復号に必要な `eval` を Spotify がブロックしています。`visionos` だけを使ってください。 |
-| ローカル Wisp で `player request failed: HTTP 400/403` または `LOGIN_REQUIRED` | クライアント定義が古くなっています。`synthesis-spotify.js` の `CLIENT_DEFS` を、yt-dlp の `INNERTUBE_CLIENTS` (`yt_dlp/extractor/youtube/_base.py`) に合わせて更新してください。 |
+| ローカル Wisp で `player request failed: HTTP 400/403` または `LOGIN_REQUIRED` | クライアント定義が古くなっています。`synthesis-spicetify.js` の `CLIENT_DEFS` を、yt-dlp の `INNERTUBE_CLIENTS` (`yt_dlp/extractor/youtube/_base.py`) に合わせて更新してください。 |
 
 ## プライバシーと免責
 

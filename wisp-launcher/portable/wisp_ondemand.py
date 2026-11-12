@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-platform on-demand launcher for the Wisp server used by Synthesis Spotify.
+"""Cross-platform on-demand launcher for the Wisp server used by Synthesis Spicetify.
 
 It listens on 127.0.0.1:6001 and starts the real Wisp server (127.0.0.1:6002) when
 the first connection arrives. Connections are forwarded to the backend, and the
@@ -43,9 +43,9 @@ import time
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-APP_NAME = "synthesis-spotify"
-TASK_NAME = "SynthesisSpotifyWisp"
-LAUNCHD_LABEL = "io.github.kagamiomochi.synthesis-spotify-wisp"
+APP_NAME = "synthesis-spicetify"
+TASK_NAME = "SynthesisSpicetifyWisp"
+LAUNCHD_LABEL = "io.github.kagamiomochi.synthesis-spicetify-wisp"
 WISP_PACKAGE = "@mercuryworkshop/wisp-js"
 WISP_VERSION = "0.5.3"  # pinned; bump deliberately
 HOST = "127.0.0.1"
@@ -617,7 +617,7 @@ def linux_units(args, proxyd):
     wait = (f"for i in $$(seq 150); do (exec 3<>/dev/tcp/{HOST}/{args.backend_port}) "
             "2>/dev/null && exit 0; sleep 0.2; done; exit 1")
     backend = f"""[Unit]
-Description=Wisp server for Synthesis Spotify (backend on {HOST}:{args.backend_port})
+Description=Wisp server for Synthesis Spicetify (backend on {HOST}:{args.backend_port})
 # Stop as soon as the proxy service that needs this unit is gone.
 StopWhenUnneeded=yes
 
@@ -626,7 +626,7 @@ ExecStart={node} {entry} -H {HOST} -P {args.backend_port} -L WARN
 ExecStartPost=/usr/bin/env bash -c '{wait}'
 """
     proxy = f"""[Unit]
-Description=Wisp proxy for Synthesis Spotify (starts the backend on demand)
+Description=Wisp proxy for Synthesis Spicetify (starts the backend on demand)
 Requires={SYSTEMD_BACKEND}
 After={SYSTEMD_BACKEND}
 
@@ -635,7 +635,7 @@ After={SYSTEMD_BACKEND}
 ExecStart={systemd_quote(proxyd)} --exit-idle-time={idle}s {HOST}:{args.backend_port}
 """
     socket_unit = f"""[Unit]
-Description=Wisp socket for Synthesis Spotify ({HOST}:{args.listen_port})
+Description=Wisp socket for Synthesis Spicetify ({HOST}:{args.listen_port})
 
 [Socket]
 ListenStream={HOST}:{args.listen_port}
@@ -702,7 +702,7 @@ def cmd_uninstall(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="On-demand Wisp launcher for Synthesis Spotify")
+    parser = argparse.ArgumentParser(description="On-demand Wisp launcher for Synthesis Spicetify")
     sub = parser.add_subparsers(dest="command", required=True)
     commands = {"run": cmd_run, "setup": cmd_setup, "install": cmd_install,
                 "uninstall": cmd_uninstall}

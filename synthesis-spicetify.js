@@ -1,9 +1,9 @@
-// NAME: Synthesis Spotify
+// NAME: Synthesis Spicetify
 // AUTHOR: kagamiomochi
 // DESCRIPTION: Transcending all musical boundaries.
 
 /*
- * Synthesis Spotify
+ * Synthesis Spicetify
  *
  * Architecture overview:
  *  - Network:  libcurl.js (WASM libcurl + Wisp websocket proxy) replaces fetch() to bypass CORS.
@@ -16,7 +16,7 @@
  * Both libraries are loaded lazily from jsDelivr (pinned versions) on first use.
  */
 
-(async function SynthesisSpotify() {
+(async function SynthesisSpicetify() {
 	"use strict";
 
 	// ---------------------------------------------------------------------
@@ -37,7 +37,7 @@
 		await sleep(200);
 	}
 	if (!window.Spicetify?.Platform?.History) {
-		console.error("[Synthesis Spotify] Spicetify did not become ready, aborting.");
+		console.error("[Synthesis Spicetify] Spicetify did not become ready, aborting.");
 		return;
 	}
 
@@ -45,10 +45,10 @@
 	// Constants and configuration
 	// ---------------------------------------------------------------------
 	/* VERSION */ const VERSION = "v0.4.4";
-	const WISP_SCRIPT_URL = "https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spotify/main/wisp-launcher/portable/wisp_ondemand.py";
+	const WISP_SCRIPT_URL = "https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/main/wisp-launcher/portable/wisp_ondemand.py";
 	const LIBCURL_URL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.5/libcurl_full.mjs";
 	const YTJS_URL = "https://cdn.jsdelivr.net/npm/youtubei.js@18.3.0/bundle/browser.js";
-	const CONFIG_KEY = "synthesis-spotify:config";
+	const CONFIG_KEY = "synthesis-spicetify:config";
 	const MAX_CACHED_TRACKS = 4;
 	const SEARCH_DEBOUNCE_MS = 700;
 
@@ -100,7 +100,7 @@
 		try {
 			localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
 		} catch (error) {
-			console.warn("[Synthesis Spotify] Failed to save config", error);
+			console.warn("[Synthesis Spicetify] Failed to save config", error);
 		}
 	}
 
@@ -115,7 +115,7 @@
 
 	const STRINGS = {
 		ja: {
-			sectionTitle: "Synthesis Spotify",
+			sectionTitle: "Synthesis Spicetify",
 			sectionSub: "YouTube Music の検索結果",
 			searching: "YouTube Music を検索中...",
 			noResults: "YouTube Music に該当する曲が見つかりませんでした。",
@@ -126,7 +126,7 @@
 			addQueue: "キューに追加",
 			playNext: "次に再生",
 			openBrowser: "ブラウザで開く",
-			queueTitle: "Synthesis Spotify キュー",
+			queueTitle: "Synthesis Spicetify キュー",
 			queueEmpty: "キューは空です。",
 			remove: "削除",
 			clear: "すべて削除",
@@ -136,7 +136,7 @@
 			addedQueue: "キューに追加しました",
 			addedNext: "次に再生します",
 			playFailed: (m) => `再生に失敗しました: ${m}`,
-			settingsTitle: "Synthesis Spotify 設定",
+			settingsTitle: "Synthesis Spicetify 設定",
 			wispLabel: "公開 Wisp プロキシ (1行に1つ、上から順に試行)",
 			clientsLabel: "InnerTube クライアント (visionos / tv_samsung、カンマ区切り、上から順に試行)",
 			save: "保存",
@@ -145,7 +145,7 @@
 			clearCache: "音声キャッシュを削除",
 			cacheCleared: "音声キャッシュを削除しました",
 			privacyNote: "通信は libcurl.js により端末内で TLS 終端され、Wisp プロキシには接続先ホスト名のみ見えます。",
-			menu: "Synthesis Spotify 設定",
+			menu: "Synthesis Spicetify 設定",
 			botHint: "共有Wispプロキシの出口IPがYouTubeに弾かれている可能性があります。自宅PCでローカルのWispサーバーを用意し、設定で「再生機能を有効化」をオンにしてください。",
 			playbackLabel: "再生機能を有効化",
 			playbackDesc: "オフの間は公開 Wisp だけを使い、検索結果の表示と「ブラウザで開く」のみ使えます。再生にはローカル Wisp サーバーが必要です。",
@@ -168,7 +168,7 @@
 			copied: "コピーしました",
 		},
 		en: {
-			sectionTitle: "Synthesis Spotify",
+			sectionTitle: "Synthesis Spicetify",
 			sectionSub: "YouTube Music results",
 			searching: "Searching YouTube Music...",
 			noResults: "No matching songs on YouTube Music.",
@@ -179,7 +179,7 @@
 			addQueue: "Add to queue",
 			playNext: "Play next",
 			openBrowser: "Open in browser",
-			queueTitle: "Synthesis Spotify queue",
+			queueTitle: "Synthesis Spicetify queue",
 			queueEmpty: "The queue is empty.",
 			remove: "Remove",
 			clear: "Clear all",
@@ -189,7 +189,7 @@
 			addedQueue: "Added to queue",
 			addedNext: "Will play next",
 			playFailed: (m) => `Playback failed: ${m}`,
-			settingsTitle: "Synthesis Spotify settings",
+			settingsTitle: "Synthesis Spicetify settings",
 			wispLabel: "Public Wisp proxies (one per line, tried in order)",
 			clientsLabel: "InnerTube clients (visionos / tv_samsung, comma separated, tried in order)",
 			save: "Save",
@@ -198,7 +198,7 @@
 			clearCache: "Clear audio cache",
 			cacheCleared: "Audio cache cleared",
 			privacyNote: "TLS is terminated inside this app by libcurl.js; the Wisp proxy only sees destination hostnames.",
-			menu: "Synthesis Spotify settings",
+			menu: "Synthesis Spicetify settings",
 			botHint: "The shared Wisp proxy's IP is probably flagged by YouTube. Set up a local Wisp server on your PC and turn on \"Enable playback\" in the settings.",
 			playbackLabel: "Enable playback",
 			playbackDesc: "While off, only public Wisp proxies are used: you can search and open results in the browser, but not play them. Playback needs a local Wisp server.",
@@ -419,7 +419,7 @@
 			try {
 				return await mod.Innertube.create(base);
 			} catch (error) {
-				console.warn("[Synthesis Spotify] Session bootstrap failed, retrying with a local session", error);
+				console.warn("[Synthesis Spicetify] Session bootstrap failed, retrying with a local session", error);
 				return await mod.Innertube.create({ ...base, generate_session_locally: true });
 			}
 		})().catch((error) => {
@@ -574,7 +574,7 @@
 			headers: { accept: "text/html,application/xhtml+xml,*/*;q=0.8", "accept-language": "en-US,en;q=0.5" },
 		})
 			.then((res) => res.arrayBuffer())
-			.catch((error) => console.warn("[Synthesis Spotify] session warm-up failed", error));
+			.catch((error) => console.warn("[Synthesis Spicetify] session warm-up failed", error));
 		return warmUpPromise;
 	}
 
@@ -852,7 +852,7 @@
 			}
 		} catch (error) {
 			if (token !== playToken || error?.name === "AbortError") return;
-			console.error("[Synthesis Spotify] playback failed", error);
+			console.error("[Synthesis Spicetify] playback failed", error);
 			notify(t("playFailed", error?.message || error), true);
 			playNextFromQueue();
 		}
@@ -1040,7 +1040,7 @@
 	// Styles
 	// ---------------------------------------------------------------------
 	document.head.append(
-		h("style", { id: "synthesis-spotify-style" }, `
+		h("style", { id: "synthesis-spicetify-style" }, `
 		.ss-section { margin: 8px 0 24px; padding: 0 var(--content-spacing, 32px); box-sizing: border-box; }
 		.ss-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
 		.ss-head h2 { margin: 0; font-size: 24px; font-weight: 700; color: var(--text-base, #fff); }
@@ -1537,7 +1537,7 @@
 			search.status = "done";
 		} catch (error) {
 			if (token !== search.token) return;
-			console.error("[Synthesis Spotify] search failed", error);
+			console.error("[Synthesis Spicetify] search failed", error);
 			search.error = error?.message || String(error);
 			search.status = "error";
 		}
@@ -1783,7 +1783,7 @@
 					{
 						class: "ss-secondary",
 						onClick: () =>
-							window.open("https://github.com/kagamiomochi/Synthesis-Spotify#setting-up-the-local-wisp-server", "_blank", "noopener,noreferrer"),
+							window.open("https://github.com/kagamiomochi/Synthesis-Spicetify#setting-up-the-local-wisp-server", "_blank", "noopener,noreferrer"),
 					},
 					t("guideReadme")
 				)
@@ -1901,19 +1901,19 @@
 	try {
 		new Spicetify.Menu.Item(t("menu"), false, () => openSettings()).register();
 	} catch (error) {
-		console.warn("[Synthesis Spotify] Failed to register menu item", error);
+		console.warn("[Synthesis Spicetify] Failed to register menu item", error);
 	}
 	try {
 		new Spicetify.Playbar.Button(t("queueTitle"), "queue", () => openQueue());
 	} catch (error) {
-		console.warn("[Synthesis Spotify] Failed to register playbar button", error);
+		console.warn("[Synthesis Spicetify] Failed to register playbar button", error);
 	}
 
 	// Warm up the heavy libraries while the app is idle so the first search feels fast.
 	(window.requestIdleCallback || ((fn) => setTimeout(fn, 4000)))(() => {
-		getInnertube().catch((error) => console.warn("[Synthesis Spotify] warm-up failed", error));
+		getInnertube().catch((error) => console.warn("[Synthesis Spicetify] warm-up failed", error));
 	});
 
-	window.SynthesisSpotify = { version: VERSION, state, get config() { return config; }, providers, runDiagnostics };
-	console.log(`[Synthesis Spotify] ${VERSION} loaded`);
+	window.SynthesisSpicetify = { version: VERSION, state, get config() { return config; }, providers, runDiagnostics };
+	console.log(`[Synthesis Spicetify] ${VERSION} loaded`);
 })();
