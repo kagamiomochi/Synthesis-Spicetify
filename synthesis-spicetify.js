@@ -131,6 +131,8 @@
 			remove: "削除",
 			clear: "すべて削除",
 			playNow: "今すぐ再生",
+			queueNowPlaying: "Synthesis Spicetify で再生中",
+			queueSynthesisHead: "Synthesis Spicetify のキュー",
 			loading: (p) => `読み込み中 ${Math.round(p * 100)}%`,
 			preparing: "準備中...",
 			addedQueue: "キューに追加しました",
@@ -184,6 +186,8 @@
 			remove: "Remove",
 			clear: "Clear all",
 			playNow: "Play now",
+			queueNowPlaying: "Playing from Synthesis Spicetify",
+			queueSynthesisHead: "Synthesis Spicetify queue",
 			loading: (p) => `Loading ${Math.round(p * 100)}%`,
 			preparing: "Preparing...",
 			addedQueue: "Added to queue",
@@ -860,7 +864,7 @@
 
 	function playNextFromQueue() {
 		const next = state.queue.shift();
-		renderQueueModal();
+		renderQueueSection();
 		if (next) {
 			playTrack(next);
 		} else {
@@ -921,7 +925,7 @@
 		const previous = state.history.pop();
 		if (state.current) state.queue.unshift({ ...state.current, qid: ++qidCounter });
 		playTrack(previous, { fromHistory: true });
-		renderQueueModal();
+		renderQueueSection();
 	}
 
 	function requirePlayback() {
@@ -935,7 +939,7 @@
 		const entry = { ...track, qid: ++qidCounter };
 		if (next) state.queue.unshift(entry);
 		else state.queue.push(entry);
-		renderQueueModal();
+		renderQueueSection();
 
 		// Nothing is playing at all: start right away instead of leaving the track stranded.
 		if (state.status === "idle" && !Spicetify.Player.isPlaying()) {
@@ -1090,9 +1094,12 @@
 		.ss-pb-seek:hover::-webkit-slider-thumb { opacity: 1; }
 		.ss-takeover .ss-pp-icon { display: inline-flex; align-items: center; justify-content: center; }
 
-		.ss-queue { display: flex; flex-direction: column; gap: 4px; min-width: 380px; max-height: 60vh; overflow-y: auto; }
-		.ss-queue .ss-row { grid-template-columns: 48px minmax(0, 1fr) auto; }
-		.ss-queue .ss-actions { opacity: 1; }
+		.ss-queue-block { display: flex; flex-direction: column; gap: 4px; padding: 0 var(--content-spacing, 32px) 16px; box-sizing: border-box; }
+		.ss-queue-block .ss-row { grid-template-columns: 48px minmax(0, 1fr) auto; }
+		.ss-queue-block .ss-actions { opacity: 1; }
+		.ss-queue-block.ss-panel { padding: 0 8px 8px; }
+		.ss-queue-block .ss-link { align-self: flex-start; margin: 4px 8px 0; }
+		.ss-queue-head { margin: 10px 8px 2px; font-size: 16px; font-weight: 700; color: var(--text-base, #fff); }
 		.ss-settings label { display: block; margin: 12px 0 4px; font-size: 13px; color: var(--text-subdued, #a7a7a7); }
 		.ss-settings textarea, .ss-settings input[type="text"] { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 6px; border: 1px solid rgba(128, 128, 128, 0.5); background: rgba(128, 128, 128, 0.15); color: var(--text-base, #fff); font-family: monospace; font-size: 12px; }
 		.ss-settings .ss-buttons { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
@@ -1370,10 +1377,8 @@
 	);
 
 	// ---------------------------------------------------------------------
-	// Queue popup
+	// Queue (injected into Spotify's own queue page)
 	// ---------------------------------------------------------------------
-	let queueModalBody = null;
-
 	function renderQueueRow(track, index) {
 		const img = h("img", { class: "ss-cover", alt: "" });
 		loadImage(img, track.thumbnail);
@@ -1392,7 +1397,7 @@
 					onClick: () => {
 						state.queue.splice(index, 1);
 						playTrack(track);
-						renderQueueModal();
+						renderQueueSection();
 					},
 				}),
 				h("button", {
@@ -1401,30 +1406,131 @@
 					html: ICONS.close,
 					onClick: () => {
 						state.queue.splice(index, 1);
-						renderQueueModal();
+						renderQueueSection();
 					},
 				})
 			)
 		);
 	}
 
-	function renderQueueModal() {
-		if (!queueModalBody || !queueModalBody.isConnected) return;
-		queueModalBody.replaceChildren(
-			...(state.queue.length
-				? [
-						...state.queue.map(renderQueueRow),
-						h("button", { class: "ss-link", onClick: () => { state.queue.length = 0; renderQueueModal(); } }, t("clear")),
-				  ]
-				: [h("div", { class: "ss-status" }, t("queueEmpty"))])
+	// Read-only row for the Synthesis track that is currently playing.
+	function renderStaticRow(track) {
+		const img = h("img", { class: "ss-cover", alt: "" });
+		loadImage(img, track.thumbnail);
+		return h(
+			"div",
+			{ class: "ss-row" },
+			h("div", { class: "ss-cover-wrap" }, img),
+			h("div", { class: "ss-meta" }, h("div", { class: "ss-title" }, track.title), h("div", { class: "ss-sub" }, track.artists.join(", "))),
+			h("div", { class: "ss-actions" })
 		);
 	}
 
-	function openQueue() {
-		queueModalBody = h("div", { class: "ss-queue" });
-		Spicetify.PopupModal.display({ title: t("queueTitle"), content: queueModalBody });
-		renderQueueModal();
+	const queuePage = { active: false, block: null };
+	const QUEUE_BUTTON = '[data-testid="control-button-queue"]';
+
+	const isQueuePath = () => /^\/queue(\/|$)/.test(Spicetify.Platform.History.location?.pathname || "");
+
+	// The queue is shown either in the right-hand panel (queue button pressed) or on the /queue page.
+	function isQueueOpen() {
+		return document.querySelector(QUEUE_BUTTON)?.getAttribute("aria-pressed") === "true" || isQueuePath();
 	}
+
+	// Section headings of Spotify's own queue ("Now playing", "Next in queue", ...), used as anchors.
+	// Nothing here depends on obfuscated class names, except the stable "tab-panel" fragment of the panel.
+	function findQueueHeadings() {
+		const main = document.querySelector(".main-view-container__scroll-node-child");
+		const usable = (el) => !el.closest(".ss-queue-block");
+
+		const inPanel = [...document.querySelectorAll('[class*="tab-panel"] h2')].filter((el) => usable(el) && !main?.contains(el));
+		if (inPanel.length) {
+			const panel = inPanel[0].closest('[class*="tab-panel"]');
+			return { headings: inPanel.filter((el) => panel.contains(el)), panel: true };
+		}
+		if (main && isQueuePath()) return { headings: [...main.querySelectorAll("h2")].filter(usable), panel: false };
+		return { headings: [], panel: false };
+	}
+
+	// Rebuild our block for Spotify's queue: the active Synthesis track and the virtual queue.
+	function renderQueueSection() {
+		if (!queuePage.active) return;
+		if (!queuePage.block) queuePage.block = h("div", { class: "ss-queue-block" });
+		const children = [];
+		if (state.current) children.push(h("div", { class: "ss-queue-head" }, t("queueNowPlaying")), renderStaticRow(state.current));
+		if (state.queue.length) {
+			children.push(
+				h("div", { class: "ss-queue-head" }, t("queueSynthesisHead")),
+				...state.queue.map(renderQueueRow),
+				h("button", { class: "ss-link", onClick: () => { state.queue.length = 0; renderQueueSection(); } }, t("clear"))
+			);
+		}
+		queuePage.block.replaceChildren(...children);
+		attachQueueSection();
+	}
+
+	// While Spotify is the active player the block goes between the "Now playing" and "Next in queue"
+	// sections (the order in which tracks play); while a Synthesis track is active it goes first.
+	function attachQueueSection() {
+		const block = queuePage.block;
+		if (!block) return;
+		if (!queuePage.active || !block.childElementCount) {
+			block.remove();
+			return;
+		}
+		const { headings, panel } = findQueueHeadings();
+		block.classList.toggle("ss-panel", panel);
+
+		let parent = null;
+		let before = null; // insert before this node; null means append to parent
+
+		if (headings.length >= 2) {
+			// The lowest common ancestor of the first two headings holds the queue's sections.
+			parent = headings[0];
+			while (parent && !parent.contains(headings[1])) parent = parent.parentElement;
+			if (parent) {
+				const sectionOf = (heading) => {
+					let node = heading;
+					while (node.parentElement && node.parentElement !== parent) node = node.parentElement;
+					return node;
+				};
+				before = sectionOf(state.current ? headings[0] : headings[1]);
+			}
+		} else if (headings.length === 1) {
+			parent = headings[0].parentElement?.parentElement || headings[0].parentElement;
+			before = state.current ? headings[0].parentElement : headings[0].parentElement?.nextElementSibling || null;
+			if (before && before.parentElement !== parent) before = null;
+		}
+		if (!parent) {
+			// Fallback for the /queue page only; never put the block into an unrelated page.
+			const scroll = document.querySelector(".main-view-container__scroll-node-child");
+			if (panel || !scroll || !isQueuePath()) {
+				block.remove();
+				return;
+			}
+			parent = scroll.firstElementChild || scroll;
+			before = parent.firstElementChild;
+		}
+
+		// Already in place: do nothing, so the MutationObserver does not loop on our own change.
+		if (block.parentElement === parent && (before ? block.nextElementSibling === before : block.nextElementSibling === null)) return;
+		parent.insertBefore(block, before);
+	}
+
+	// Our playback state can change without a render call (e.g. a track ends) and the panel can be opened or
+	// closed at any time, so poll; this also re-attaches the block if Spotify re-rendered the panel.
+	let queueSignature = "";
+	setInterval(() => {
+		const active = isQueueOpen();
+		const signature = [active, state.status, state.current?.title, state.queue.length].join("|");
+		if (signature === queueSignature) {
+			if (active) attachQueueSection();
+			return;
+		}
+		queueSignature = signature;
+		queuePage.active = active;
+		if (active) renderQueueSection();
+		else queuePage.block?.remove();
+	}, 500);
 
 	// ---------------------------------------------------------------------
 	// Search page integration
@@ -1580,13 +1686,14 @@
 	// Spotify re-renders the search page and may drop our section; re-attach when needed.
 	let attachScheduled = false;
 	new MutationObserver((mutations) => {
-		if (attachScheduled || (!search.query && !isYTActive())) return;
+		if (attachScheduled || (!search.query && !isYTActive() && !queuePage.active)) return;
 		// Ignore changes made by this extension to its own player bar elements.
 		if (mutations.every((m) => m.target.closest?.(".ss-own"))) return;
 		attachScheduled = true;
 		requestAnimationFrame(() => {
 			attachScheduled = false;
 			attachSection();
+			attachQueueSection();
 			if (isYTActive()) syncTakeover();
 		});
 	}).observe(document.body, { childList: true, subtree: true });
@@ -1805,7 +1912,7 @@
 			if (!enabled) {
 				if (state.status !== "idle") stopYT(true);
 				state.queue.length = 0;
-				renderQueueModal();
+				renderQueueSection();
 			}
 			resetNetwork();
 			renderSearch();
@@ -1903,12 +2010,6 @@
 	} catch (error) {
 		console.warn("[Synthesis Spicetify] Failed to register menu item", error);
 	}
-	try {
-		new Spicetify.Playbar.Button(t("queueTitle"), "queue", () => openQueue());
-	} catch (error) {
-		console.warn("[Synthesis Spicetify] Failed to register playbar button", error);
-	}
-
 	// Warm up the heavy libraries while the app is idle so the first search feels fast.
 	(window.requestIdleCallback || ((fn) => setTimeout(fn, 4000)))(() => {
 		getInnertube().catch((error) => console.warn("[Synthesis Spicetify] warm-up failed", error));

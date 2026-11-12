@@ -11,7 +11,7 @@ A [Spicetify](https://spicetify.app/) extension that brings YouTube Music into S
 
 - A "Synthesis Spicetify" section with YouTube Music results appears on Spotify's search results page
 - Play a result, add it to the queue, or play it next
-- Queued tracks play between Spotify tracks (shown in the queue button on the playbar)
+- Queued tracks play between Spotify tracks (shown on Spotify's own queue page)
 - While a YouTube track is active, Spotify's own player bar shows it (cover, title, progress bar) and its play/pause,
   previous and next buttons control it. A small mini player is only shown if the player bar cannot be used
 - Audio is downloaded into a Blob and played from a Blob URL, so there is no streaming proxy
@@ -131,7 +131,7 @@ tested on real machines yet.
 2. Hover a result:
    - Play button on the cover: play now
    - "Play next" / "Add to queue" buttons on the right
-3. Open the queue button on the playbar to see, play or remove queued YouTube tracks.
+3. Open Spotify's queue page (the queue button on the playbar) to see, play or remove queued YouTube tracks.
 4. While a YouTube track is active, Spotify's play button toggles play/pause of that track and Spotify itself stays
    silent. Spotify's next/previous buttons move on to the next queued YouTube track, or back to Spotify when the
    queue is empty.
