@@ -64,6 +64,9 @@
 		clients: ["visionos", "tv_samsung"],
 		resultLimit: 20,
 		prefetchNext: true,
+		// End Spotify's playback session (not just pause) while a non-Spotify track plays, so that
+		// the OS media controls and Discord RPC stop showing the Spotify track. Uses an internal API.
+		stopSpotify: true,
 	};
 
 	const CONFIG_VERSION = 6;
@@ -776,6 +779,7 @@
 		history: [], // tracks already played from the virtual queue (for the previous button)
 		resumeSpotify: false, // resume Spotify once the virtual queue drains
 		suppressUntil: 0, // ignore Spotify events until this timestamp
+		spotifySnapshot: null, // where Spotify was before its session was stopped ({ uri, ctx, position })
 	};
 	let playToken = 0;
 	let qidCounter = 0;
@@ -788,16 +792,54 @@
 		};
 	}
 
-	function pauseSpotify() {
-		if (Spicetify.Player.isPlaying()) {
-			state.resumeSpotify = true;
-			Spicetify.Player.pause();
+	// Ends Spotify's playback session through the internal context player. Returns false when the
+	// method is unavailable (Spotify update) or throws, so the caller can fall back to a plain pause.
+	function stopSpotifySession() {
+		try {
+			const player = Spicetify.Platform?.PlayerAPI?._contextPlayer;
+			if (typeof player?.stop !== "function") return false;
+			const result = player.stop();
+			if (result && typeof result.catch === "function") result.catch(() => {});
+			return true;
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] failed to stop Spotify session", error);
+			return false;
 		}
+	}
+
+	function pauseSpotify() {
+		if (!Spicetify.Player.isPlaying()) return;
+		state.resumeSpotify = true;
+		const { uri, ctx } = readSpotify();
+		const position = Spicetify.Player.getProgress();
+		Spicetify.Player.pause();
+		if (!config.stopSpotify || !uri) return;
+		state.suppressUntil = Date.now() + 1000;
+		if (stopSpotifySession()) state.spotifySnapshot = { uri, ctx, position };
+	}
+
+	// A stopped session cannot be resumed with play(), so start the saved track again.
+	async function restoreSpotifySession(snapshot) {
+		state.suppressUntil = Date.now() + 3000;
+		try {
+			await Spicetify.Player.playUri(snapshot.ctx || snapshot.uri, {}, { skipTo: { uri: snapshot.uri } });
+			if (snapshot.position > 1000) Spicetify.Player.seek(snapshot.position);
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] failed to restore Spotify session", error);
+			Spicetify.Player.play();
+		}
+		state.suppressUntil = Date.now() + 1000;
 	}
 
 	function resumeSpotifyIfNeeded() {
 		if (!state.resumeSpotify) return;
 		state.resumeSpotify = false;
+		const snapshot = state.spotifySnapshot;
+		state.spotifySnapshot = null;
+		if (snapshot) {
+			restoreSpotifySession(snapshot);
+			return;
+		}
 		state.suppressUntil = Date.now() + 1000;
 		Spicetify.Player.play();
 	}
@@ -883,8 +925,12 @@
 		state.progress = 0;
 		state.history.length = 0;
 		renderMini();
-		if (resumeSpotify) resumeSpotifyIfNeeded();
-		else state.resumeSpotify = false;
+		if (resumeSpotify) {
+			resumeSpotifyIfNeeded();
+		} else {
+			state.resumeSpotify = false;
+			state.spotifySnapshot = null;
+		}
 	}
 
 	function toggleYT() {
@@ -906,7 +952,15 @@
 		}
 		// The virtual queue is empty: hand control back to Spotify and skip to its next track.
 		const wasPlaying = state.resumeSpotify;
+		const snapshot = state.spotifySnapshot;
 		stopYT(false);
+		if (snapshot) {
+			// The session was stopped: bring the saved track back, then skip it.
+			restoreSpotifySession(snapshot).then(() => {
+				Spicetify.Player.next();
+			});
+			return;
+		}
 		Spicetify.Player.next();
 		if (wasPlaying) {
 			setTimeout(() => {
