@@ -1164,12 +1164,20 @@
 		.ss-pb-seek:hover::-webkit-slider-thumb { opacity: 1; }
 		.ss-takeover .ss-pp-icon { display: inline-flex; align-items: center; justify-content: center; }
 
-		.ss-queue-block { display: flex; flex-direction: column; gap: 4px; padding: 0 var(--content-spacing, 32px) 16px; box-sizing: border-box; }
-		.ss-queue-block .ss-row { grid-template-columns: 48px minmax(0, 1fr) auto; }
-		.ss-queue-block .ss-actions { opacity: 1; }
-		.ss-queue-block.ss-panel { padding: 0 8px 8px; }
-		.ss-queue-block .ss-link { align-self: flex-start; margin: 4px 8px 0; }
-		.ss-queue-head { margin: 10px 8px 2px; font-size: 16px; font-weight: 700; color: var(--text-base, #fff); }
+		.ss-queue-block { display: flex; flex-direction: column; gap: 0; padding: 0 0 8px; box-sizing: border-box; }
+		/* Rows look like Spotify's own queue rows: 48px cover, 16px title, 14px subtitle, hover highlight bleeding 8px outwards */
+		.ss-queue-block .ss-row { grid-template-columns: 48px minmax(0, 1fr) auto; gap: 12px; margin: 0 -8px; padding: 8px; border-radius: 4px; }
+		.ss-queue-block .ss-row:hover, .ss-queue-block .ss-row:focus-within { background: rgba(255, 255, 255, 0.1); }
+		.ss-queue-block .ss-cover-wrap, .ss-queue-block .ss-cover { width: 48px; height: 48px; }
+		.ss-queue-block .ss-cover-play { background: rgba(0, 0, 0, 0.5); }
+		.ss-queue-block .ss-row:focus-within .ss-cover-play { display: flex; }
+		.ss-queue-block .ss-title { font-size: 16px; line-height: 24px; }
+		.ss-queue-block .ss-sub { font-size: 14px; line-height: 20px; }
+		.ss-queue-block .ss-row.ss-current .ss-title { color: var(--text-bright-accent, var(--essential-bright-accent, #1ed760)); }
+		.ss-queue-block .ss-actions { opacity: 0; }
+		.ss-queue-block .ss-row:hover .ss-actions, .ss-queue-block .ss-row:focus-within .ss-actions { opacity: 1; }
+		.ss-queue-block .ss-link { align-self: flex-start; margin: 8px 0 0; font-size: 14px; }
+		.ss-queue-head { margin: 16px 0 8px; font-size: 16px; line-height: 24px; font-weight: 700; color: var(--text-base, #fff); }
 		.ss-settings label { display: block; margin: 12px 0 4px; font-size: 13px; color: var(--text-subdued, #a7a7a7); }
 		.ss-settings textarea, .ss-settings input[type="text"] { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 6px; border: 1px solid rgba(128, 128, 128, 0.5); background: rgba(128, 128, 128, 0.15); color: var(--text-base, #fff); font-family: monospace; font-size: 12px; }
 		.ss-settings .ss-buttons { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
@@ -1452,24 +1460,19 @@
 	function renderQueueRow(track, index) {
 		const img = h("img", { class: "ss-cover", alt: "" });
 		loadImage(img, track.thumbnail);
+		const playHere = () => {
+			state.queue.splice(index, 1);
+			playTrack(track);
+			renderQueueSection();
+		};
 		return h(
 			"div",
-			{ class: "ss-row" },
-			h("div", { class: "ss-cover-wrap" }, img),
+			{ class: "ss-row", onDblclick: playHere },
+			h("div", { class: "ss-cover-wrap" }, img, h("button", { class: "ss-cover-play", title: t("playNow"), html: ICONS.play, onClick: playHere })),
 			h("div", { class: "ss-meta" }, h("div", { class: "ss-title" }, track.title), h("div", { class: "ss-sub" }, track.artists.join(", "))),
 			h(
 				"div",
 				{ class: "ss-actions" },
-				h("button", {
-					class: "ss-btn",
-					title: t("playNow"),
-					html: ICONS.play,
-					onClick: () => {
-						state.queue.splice(index, 1);
-						playTrack(track);
-						renderQueueSection();
-					},
-				}),
 				h("button", {
 					class: "ss-btn",
 					title: t("remove"),
@@ -1489,42 +1492,35 @@
 		loadImage(img, track.thumbnail);
 		return h(
 			"div",
-			{ class: "ss-row" },
+			{ class: "ss-row ss-current" },
 			h("div", { class: "ss-cover-wrap" }, img),
 			h("div", { class: "ss-meta" }, h("div", { class: "ss-title" }, track.title), h("div", { class: "ss-sub" }, track.artists.join(", "))),
 			h("div", { class: "ss-actions" })
 		);
 	}
 
-	const queuePage = { active: false, block: null };
+	const queuePanel = { active: false, block: null };
 	const QUEUE_BUTTON = '[data-testid="control-button-queue"]';
 
-	const isQueuePath = () => /^\/queue(\/|$)/.test(Spicetify.Platform.History.location?.pathname || "");
-
-	// The queue is shown either in the right-hand panel (queue button pressed) or on the /queue page.
+	// The queue lives in the right-hand panel; it is open while the queue button is pressed.
 	function isQueueOpen() {
-		return document.querySelector(QUEUE_BUTTON)?.getAttribute("aria-pressed") === "true" || isQueuePath();
+		return document.querySelector(QUEUE_BUTTON)?.getAttribute("aria-pressed") === "true";
 	}
 
 	// Section headings of Spotify's own queue ("Now playing", "Next in queue", ...), used as anchors.
 	// Nothing here depends on obfuscated class names, except the stable "tab-panel" fragment of the panel.
 	function findQueueHeadings() {
-		const main = document.querySelector(".main-view-container__scroll-node-child");
 		const usable = (el) => !el.closest(".ss-queue-block");
-
-		const inPanel = [...document.querySelectorAll('[class*="tab-panel"] h2')].filter((el) => usable(el) && !main?.contains(el));
-		if (inPanel.length) {
-			const panel = inPanel[0].closest('[class*="tab-panel"]');
-			return { headings: inPanel.filter((el) => panel.contains(el)), panel: true };
-		}
-		if (main && isQueuePath()) return { headings: [...main.querySelectorAll("h2")].filter(usable), panel: false };
-		return { headings: [], panel: false };
+		const headings = [...document.querySelectorAll('[class*="tab-panel"] h2')].filter(usable);
+		if (!headings.length) return [];
+		const panel = headings[0].closest('[class*="tab-panel"]');
+		return headings.filter((el) => panel.contains(el));
 	}
 
-	// Rebuild our block for Spotify's queue: the active Synthesis track and the virtual queue.
+	// Rebuild our block for Spotify's queue panel: the active Synthesis track and the virtual queue.
 	function renderQueueSection() {
-		if (!queuePage.active) return;
-		if (!queuePage.block) queuePage.block = h("div", { class: "ss-queue-block" });
+		if (!queuePanel.active) return;
+		if (!queuePanel.block) queuePanel.block = h("div", { class: "ss-queue-block" });
 		const children = [];
 		if (state.current) children.push(h("div", { class: "ss-queue-head" }, t("queueNowPlaying")), renderStaticRow(state.current));
 		if (state.queue.length) {
@@ -1534,21 +1530,20 @@
 				h("button", { class: "ss-link", onClick: () => { state.queue.length = 0; renderQueueSection(); } }, t("clear"))
 			);
 		}
-		queuePage.block.replaceChildren(...children);
+		queuePanel.block.replaceChildren(...children);
 		attachQueueSection();
 	}
 
 	// While Spotify is the active player the block goes between the "Now playing" and "Next in queue"
 	// sections (the order in which tracks play); while a Synthesis track is active it goes first.
 	function attachQueueSection() {
-		const block = queuePage.block;
+		const block = queuePanel.block;
 		if (!block) return;
-		if (!queuePage.active || !block.childElementCount) {
+		if (!queuePanel.active || !block.childElementCount) {
 			block.remove();
 			return;
 		}
-		const { headings, panel } = findQueueHeadings();
-		block.classList.toggle("ss-panel", panel);
+		const headings = findQueueHeadings();
 
 		let parent = null;
 		let before = null; // insert before this node; null means append to parent
@@ -1570,15 +1565,10 @@
 			before = state.current ? headings[0].parentElement : headings[0].parentElement?.nextElementSibling || null;
 			if (before && before.parentElement !== parent) before = null;
 		}
+		// Never put the block anywhere but into Spotify's queue panel.
 		if (!parent) {
-			// Fallback for the /queue page only; never put the block into an unrelated page.
-			const scroll = document.querySelector(".main-view-container__scroll-node-child");
-			if (panel || !scroll || !isQueuePath()) {
-				block.remove();
-				return;
-			}
-			parent = scroll.firstElementChild || scroll;
-			before = parent.firstElementChild;
+			block.remove();
+			return;
 		}
 
 		// Already in place: do nothing, so the MutationObserver does not loop on our own change.
@@ -1597,9 +1587,9 @@
 			return;
 		}
 		queueSignature = signature;
-		queuePage.active = active;
+		queuePanel.active = active;
 		if (active) renderQueueSection();
-		else queuePage.block?.remove();
+		else queuePanel.block?.remove();
 	}, 500);
 
 	// ---------------------------------------------------------------------
@@ -1756,7 +1746,7 @@
 	// Spotify re-renders the search page and may drop our section; re-attach when needed.
 	let attachScheduled = false;
 	new MutationObserver((mutations) => {
-		if (attachScheduled || (!search.query && !isYTActive() && !queuePage.active)) return;
+		if (attachScheduled || (!search.query && !isYTActive() && !queuePanel.active)) return;
 		// Ignore changes made by this extension to its own player bar elements.
 		if (mutations.every((m) => m.target.closest?.(".ss-own"))) return;
 		attachScheduled = true;
