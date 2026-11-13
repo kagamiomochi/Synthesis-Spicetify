@@ -107,6 +107,16 @@
 		}
 	}
 
+	// Drop the saved settings entirely and go back to the defaults.
+	function resetConfig() {
+		try {
+			localStorage.removeItem(CONFIG_KEY);
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] Failed to remove config", error);
+		}
+		config = { ...DEFAULT_CONFIG, configVersion: CONFIG_VERSION };
+	}
+
 	// ---------------------------------------------------------------------
 	// i18n (ja / en)
 	// ---------------------------------------------------------------------
@@ -149,6 +159,9 @@
 			test: "接続テスト",
 			clearCache: "音声キャッシュを削除",
 			cacheCleared: "音声キャッシュを削除しました",
+			resetSettings: "設定をリセット",
+			resetConfirm: "もう一度押すとリセットします",
+			resetDone: "設定を初期値に戻しました",
 			privacyNote: "通信は libcurl.js により端末内で TLS 終端され、Wisp プロキシには接続先ホスト名のみ見えます。",
 			menu: "Synthesis Spicetify 設定",
 			botHint: "共有Wispプロキシの出口IPがYouTubeに弾かれている可能性があります。自宅PCでローカルのWispサーバーを用意し、設定で「再生機能を有効化」をオンにしてください。",
@@ -204,6 +217,9 @@
 			test: "Connection test",
 			clearCache: "Clear audio cache",
 			cacheCleared: "Audio cache cleared",
+			resetSettings: "Reset settings",
+			resetConfirm: "Click again to reset",
+			resetDone: "Settings restored to defaults",
 			privacyNote: "TLS is terminated inside this app by libcurl.js; the Wisp proxy only sees destination hostnames.",
 			menu: "Synthesis Spicetify settings",
 			botHint: "The shared Wisp proxy's IP is probably flagged by YouTube. Set up a local Wisp server on your PC and turn on \"Enable playback\" in the settings.",
@@ -2010,6 +2026,55 @@
 			checkLocalWisp();
 		});
 
+		// Reset button. The first click arms it, the second click within a few seconds actually resets.
+		let resetArmed = false;
+		let resetTimer = null;
+		const disarmReset = () => {
+			resetArmed = false;
+			clearTimeout(resetTimer);
+			resetButton.textContent = t("resetSettings");
+		};
+		const performReset = () => {
+			// Cancel any running connection check and hide the setup guide.
+			checkToken++;
+			setChecking(false);
+			guide.style.display = "none";
+			guideStatus.textContent = "";
+			output.style.display = "none";
+			output.textContent = "";
+			// Defaults have playback off, so stop the current YouTube track and clear the queue like the switch does.
+			if (config.playbackEnabled) {
+				if (state.status !== "idle") stopYT(true);
+				state.queue.length = 0;
+				renderQueueSection();
+			}
+			resetConfig();
+			// Sync the form with the restored defaults.
+			wisp.value = config.wispServers.join("\n");
+			clients.value = config.clients.join(", ");
+			playback.checked = config.playbackEnabled;
+			resetNetwork();
+			renderSearch();
+			notify(t("resetDone"));
+		};
+		const resetButton = h(
+			"button",
+			{
+				class: "ss-secondary",
+				onClick: () => {
+					if (!resetArmed) {
+						resetArmed = true;
+						resetButton.textContent = t("resetConfirm");
+						resetTimer = setTimeout(disarmReset, 4000);
+						return;
+					}
+					disarmReset();
+					performReset();
+				},
+			},
+			t("resetSettings")
+		);
+
 		const content = h(
 			"div",
 			{ class: "ss-settings" },
@@ -2048,7 +2113,8 @@
 					},
 					t("test")
 				),
-				h("button", { class: "ss-secondary", onClick: () => { clearAudioCache(); notify(t("cacheCleared")); } }, t("clearCache"))
+				h("button", { class: "ss-secondary", onClick: () => { clearAudioCache(); notify(t("cacheCleared")); } }, t("clearCache")),
+				resetButton
 			),
 			output,
 			h("small", {}, `${t("privacyNote")}  ${VERSION}`)

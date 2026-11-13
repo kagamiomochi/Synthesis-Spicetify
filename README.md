@@ -153,6 +153,7 @@ Open the profile menu in Spotify and choose "Synthesis Spicetify settings".
 - **Connection test**: runs the whole chain (libcurl, session, search, player request, audio download) and prints
   the result of each step.
 - **Clear audio cache**: frees the downloaded audio (the last few tracks are cached in memory).
+- **Reset settings**: restores every setting to its default (playback off, default Wisp proxies and clients). Click it twice to confirm. Turning playback off this way stops the current YouTube track and clears the queue.
 
 ## Troubleshooting
 
@@ -293,6 +294,7 @@ Spotify のプロフィールメニューから「Synthesis Spicetify 設定」�
 - **InnerTube クライアント:** `visionos`、`tv_samsung` を上から順に試します。既定では PO Token は不要です。
 - **接続テスト:** libcurl、セッション、検索、プレイヤーリクエスト、音声ダウンロードまでを順に試し、各ステップの結果を表示します。
 - **音声キャッシュを削除:** ダウンロード済みの音声(直近の数曲をメモリにキャッシュ)を解放します。
+- **設定をリセット:** すべての設定を初期値(再生機能オフ、既定の Wisp プロキシとクライアント)に戻します。確認のため 2 回押す必要があります。再生機能がオンだった場合は、再生中の YouTube の曲を止めてキューを空にします。
 
 ## トラブルシューティング
 
