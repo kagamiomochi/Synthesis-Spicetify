@@ -907,31 +907,22 @@
 	let activeStream = null; // { job, sink, cancel } of the track that is currently being streamed
 
 	// Feeds downloaded chunks into a MediaSource attached to the shared <audio> element.
-	function createMseSink({ expectedSec, onAttached, onError }) {
+	function createMseSink({ expectedSec, onAttached, onError, onBlocked }) {
 		const MAX_APPEND_BYTES = 512 * 1024;
 		let mediaSource = null;
 		let buffer = null;
 		let objectUrl = "";
 		let pending = [];
+		let stalled = null; // a merged chunk that the browser refused for lack of space
+		let blocked = false;
 		let ended = false;
 		let dead = false;
 
 		function fail(error) {
 			dead = true;
 			pending = [];
+			stalled = null;
 			onError(error);
-		}
-
-		// Drops already played data to make room when the browser's buffer quota is hit.
-		function trimPlayed() {
-			const keepFrom = audio.currentTime - 15;
-			if (keepFrom <= 0 || !buffer.buffered.length || buffer.buffered.start(0) >= keepFrom) return false;
-			try {
-				buffer.remove(0, keepFrom);
-				return true;
-			} catch {
-				return false;
-			}
 		}
 
 		// Some containers (fragmented MP4) report no duration up front. Use the track's known length.
@@ -947,7 +938,7 @@
 
 		function pump() {
 			if (dead || !buffer || buffer.updating || mediaSource.readyState !== "open") return;
-			if (!pending.length) {
+			if (!stalled && !pending.length) {
 				if (ended) {
 					try {
 						mediaSource.endOfStream();
@@ -958,24 +949,35 @@
 				return;
 			}
 
-			// Merge small network chunks, so that there are fewer appendBuffer calls.
-			let count = 0;
-			let size = 0;
-			while (count < pending.length && size < MAX_APPEND_BYTES) size += pending[count++].byteLength;
-			const merged = new Uint8Array(size);
-			let offset = 0;
-			for (const part of pending.splice(0, count)) {
-				merged.set(part, offset);
-				offset += part.byteLength;
+			let chunk = stalled;
+			if (!chunk) {
+				// Merge small network chunks, so that there are fewer appendBuffer calls.
+				let count = 0;
+				let size = 0;
+				while (count < pending.length && size < MAX_APPEND_BYTES) size += pending[count++].byteLength;
+				chunk = new Uint8Array(size);
+				let offset = 0;
+				for (const part of pending.splice(0, count)) {
+					chunk.set(part, offset);
+					offset += part.byteLength;
+				}
 			}
 			try {
-				buffer.appendBuffer(merged);
+				buffer.appendBuffer(chunk);
+				stalled = null;
+				blocked = false;
 			} catch (error) {
-				if (error?.name === "QuotaExceededError" && trimPlayed()) {
-					pending.unshift(merged); // retried by the updateend of the removal
+				if (error?.name !== "QuotaExceededError") {
+					fail(error);
 					return;
 				}
-				fail(error);
+				// The browser's buffer is full of data ahead of the playhead (long tracks). Keep the chunk and
+				// retry as playback advances: the browser then drops what has been played to make room.
+				stalled = chunk;
+				if (!blocked) {
+					blocked = true;
+					onBlocked?.();
+				}
 			}
 		}
 
@@ -1018,9 +1020,17 @@
 				ended = true;
 				pump();
 			},
+			// Retries a refused chunk. Called while playback advances.
+			poke() {
+				if (blocked) pump();
+			},
+			isBlocked: () => blocked,
+			// True once everything has been handed to the browser, so that nothing is left to wait for.
+			isComplete: () => ended && !stalled && !pending.length && Boolean(buffer) && !buffer.updating,
 			dispose() {
 				dead = true;
 				pending = [];
+				stalled = null;
 				if (objectUrl) URL.revokeObjectURL(objectUrl);
 			},
 		};
@@ -1054,8 +1064,15 @@
 					if (!settled) settle(reject, error);
 					else console.error("[Synthesis Spicetify] stream error", error);
 				},
+				onBlocked: () => switchIfBlocked(),
 			});
-			activeStream = { job, sink, cancel: () => settle(reject, new DOMException("Aborted", "AbortError")) };
+			activeStream = { job, sink, track, token, cancel: () => settle(reject, new DOMException("Aborted", "AbortError")) };
+
+			// A long track does not fit into the browser's buffer. Once the whole file has been downloaded,
+			// continue from the finished Blob at the current position.
+			function switchIfBlocked() {
+				if (settled && job.finished && sink.isBlocked() && activeStream?.sink === sink) switchToBlob(track, token);
+			}
 
 			// Join the download: replay what has arrived so far, then follow it.
 			job.sinks.add(sink);
@@ -1064,7 +1081,7 @@
 			if (job.finished) sink.end();
 
 			job.promise.then(
-				() => {},
+				() => switchIfBlocked(),
 				(error) => {
 					if (!settled) {
 						settle(reject, error);
@@ -1088,11 +1105,51 @@
 		cancel();
 	}
 
-	// While the download is still running, do not seek past the data that is available.
+	// Replaces the stream by the finished download, keeping the position and the play state.
+	function switchToBlob(track, token, position = audio.currentTime) {
+		const url = peekAudioUrl(track);
+		if (!url || token !== playToken) return false;
+		const wasPlaying = !audio.paused;
+		detachStream();
+		audio.src = url;
+		audio.addEventListener(
+			"loadedmetadata",
+			() => {
+				if (token !== playToken) return;
+				audio.currentTime = position;
+				if (wasPlaying) audio.play().catch(() => {});
+			},
+			{ once: true }
+		);
+		return true;
+	}
+
+	// Fraction (0..1) of the track that can actually be played right now.
+	function loadedFraction(duration) {
+		if (!(duration > 0)) return 0;
+		// Not streaming means the track plays from a finished download.
+		if (!activeStream || activeStream.sink.isComplete()) return 1;
+		const ranges = audio.buffered;
+		if (!ranges.length) return 0;
+		return Math.min(1, ranges.end(ranges.length - 1) / duration);
+	}
+
+	// While streaming, only positions inside the buffered data can be played.
 	function seekAudio(seconds) {
-		if (activeStream && !activeStream.job.finished && audio.buffered.length) {
-			const bufferedEnd = audio.buffered.end(audio.buffered.length - 1);
-			seconds = Math.min(seconds, Math.max(0, bufferedEnd - 1));
+		if (activeStream && !activeStream.sink.isComplete()) {
+			const ranges = audio.buffered;
+			let inside = false;
+			for (let i = 0; i < ranges.length; i++) {
+				if (seconds >= ranges.start(i) && seconds <= ranges.end(i)) inside = true;
+			}
+			if (!inside) {
+				// Data behind the playhead may have been dropped on a long track. The finished download has it all.
+				if (activeStream.job.finished && switchToBlob(activeStream.track, activeStream.token, seconds)) return;
+				if (ranges.length) {
+					const first = ranges.start(0);
+					seconds = Math.min(Math.max(seconds, first), Math.max(first, ranges.end(ranges.length - 1) - 1));
+				}
+			}
 		}
 		audio.currentTime = seconds;
 	}
@@ -1246,7 +1303,7 @@
 	function skipPrev() {
 		if (state.status === "loading") return;
 		if (audio.currentTime > 3 || !state.history.length) {
-			audio.currentTime = 0;
+			seekAudio(0);
 			return;
 		}
 		const previous = state.history.pop();
@@ -1289,7 +1346,11 @@
 		notify(t("playFailed", audio.error?.message || "media error"), true);
 		playNextFromQueue();
 	});
-	audio.addEventListener("timeupdate", () => updateSeek());
+	audio.addEventListener("timeupdate", () => {
+		activeStream?.sink.poke();
+		updateSeek();
+	});
+	audio.addEventListener("progress", () => updateTakeoverProgress());
 
 	// Keep the volume in sync with Spotify's volume slider.
 	function syncVolume() {
@@ -1414,7 +1475,7 @@
 		.ss-takeover .ss-pb { display: flex; align-items: center; gap: 8px; width: 100%; }
 		.ss-pb-time { flex: none; min-width: 40px; font-size: 11px; color: var(--text-subdued, #a7a7a7); font-variant-numeric: tabular-nums; }
 		.ss-pb-pos { text-align: right; }
-		.ss-pb-seek { --ss-fill: var(--text-base, #fff); flex: 1; min-width: 0; height: 4px; margin: 0; border-radius: 2px; cursor: pointer; -webkit-appearance: none; appearance: none; background: linear-gradient(to right, var(--ss-fill) var(--ss-pct, 0%), rgba(128, 128, 128, 0.4) var(--ss-pct, 0%)); }
+		.ss-pb-seek { --ss-fill: var(--text-base, #fff); flex: 1; min-width: 0; height: 4px; margin: 0; border-radius: 2px; cursor: pointer; -webkit-appearance: none; appearance: none; background: linear-gradient(to right, var(--ss-fill) var(--ss-pct, 0%), rgba(128, 128, 128, 0.45) var(--ss-pct, 0%), rgba(128, 128, 128, 0.45) var(--ss-buf, 0%), rgba(128, 128, 128, 0.12) var(--ss-buf, 0%)); }
 		.ss-pb-seek:hover { --ss-fill: var(--essential-bright-accent, #1ed760); }
 		.ss-pb-seek:disabled { cursor: progress; }
 		.ss-pb-seek::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%; background: #fff; opacity: 0; }
@@ -1689,6 +1750,8 @@
 		ui.seek.disabled = loading;
 		ui.seek.value = String(Math.round(fraction * 1000));
 		ui.seek.style.setProperty("--ss-pct", `${(fraction * 100).toFixed(1)}%`);
+		const loaded = loading ? 0 : loadedFraction(duration);
+		ui.seek.style.setProperty("--ss-buf", `${(loaded * 100).toFixed(1)}%`);
 		setText(ui.pos, loading ? "" : clock(audio.currentTime));
 		setText(ui.dur, duration > 0 ? clock(duration) : "");
 	}
