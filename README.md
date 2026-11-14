@@ -14,7 +14,7 @@ A [Spicetify](https://spicetify.app/) extension that brings YouTube Music into S
 - Queued tracks play between Spotify tracks (shown in Spotify's own queue panel)
 - While a YouTube track is active, Spotify's own player bar shows it (cover, title, progress bar) and its play/pause,
   previous and next buttons control it. A small mini player is only shown if the player bar cannot be used
-- Audio is downloaded into a Blob and played from a Blob URL, so there is no streaming proxy
+- Audio is downloaded in chunks and played progressively through Media Source Extensions (playback starts before the download finishes); the finished download is cached as a Blob URL, so there is no streaming proxy
 - Playback is opt-in: without the optional local Wisp server you can still search and open results in the browser
 
 Currently supported service: YouTube Music (YouTube). More services are planned.
@@ -27,7 +27,7 @@ Currently supported service: YouTube Music (YouTube). More services are planned.
 | --- | --- |
 | YouTube Music search | [YouTube.js](https://github.com/LuanRT/YouTube.js) (youtubei.js) |
 | Requests that bypass CORS | [libcurl.js](https://github.com/ading2210/libcurl.js) (WASM libcurl) over a Wisp WebSocket proxy |
-| Playback | Audio is downloaded into a `Blob` and played via `URL.createObjectURL` |
+| Playback | Chunks are appended to a `MediaSource` while downloading (progressive playback); the finished `Blob` is cached and used as the fallback |
 
 The player request (client definitions, headers, cookies) is built the same way yt-dlp does it, because the
 request shape YouTube.js sends for app clients is currently rejected with "Sign in to confirm you're not a bot".
@@ -192,7 +192,7 @@ Spotify に YouTube Music を統合する [Spicetify](https://spicetify.app/) �
 - キューに入れた曲は Spotify の曲の間に挟まって再生(プレイバーのキューボタンで確認)
 - YouTube の曲の再生中は、Spotify 本体のプレイヤーバー(カバー・曲名・シークバー)にその曲を表示し、
   再生/一時停止・前へ・次へボタンでそのまま操作できます。プレイヤーバーを使えない場合だけ、小さなミニプレイヤーを表示します
-- 音声は Blob にダウンロードして Blob URL で再生するため、ストリーミング用のプロキシは不要
+- 音声はチャンクごとにダウンロードしながら Media Source Extensions で逐次再生します(ダウンロード完了を待たずに再生開始)。完了後は Blob URL としてキャッシュするため、ストリーミング用のプロキシは不要
 - 再生機能は任意でオンにする方式です。ローカル Wisp サーバーが無くても、検索と「ブラウザで開く」は使えます
 
 対応サービスは現在 YouTube Music(YouTube)のみです。今後ほかのサービスにも対応する予定です。
@@ -205,7 +205,7 @@ Spotify に YouTube Music を統合する [Spicetify](https://spicetify.app/) �
 | --- | --- |
 | YouTube Music の検索 | [YouTube.js](https://github.com/LuanRT/YouTube.js) (youtubei.js) |
 | CORS を回避するリクエスト | [libcurl.js](https://github.com/ading2210/libcurl.js) (WASM 版 libcurl) を Wisp WebSocket プロキシ経由で使用 |
-| 再生 | 音声を `Blob` にダウンロードし、`URL.createObjectURL` で再生 |
+| 再生 | ダウンロード中のチャンクを `MediaSource` に追加して逐次再生。完了した `Blob` はキャッシュとフォールバックに使用 |
 
 プレイヤーリクエスト(クライアント定義、ヘッダー、Cookie)は yt-dlp と同じ方法で組み立てています。YouTube.js がアプリ系クライアント向けに送るリクエストの形は、現在「Sign in to confirm you're not a bot」で拒否されるためです。
 

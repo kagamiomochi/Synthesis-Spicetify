@@ -8,7 +8,9 @@
  * Architecture overview:
  *  - Network:  libcurl.js (WASM libcurl + Wisp websocket proxy) replaces fetch() to bypass CORS.
  *  - Data:     youtubei.js (YouTube.js) talks to YouTube Music through that custom fetch.
- *  - Audio:    the audio stream is downloaded into a Blob, played via a Blob URL on a hidden <audio>.
+ *  - Audio:    the audio stream is downloaded in ranged chunks and fed to a hidden <audio> through
+ *              Media Source Extensions, so playback starts as soon as the first chunk has arrived.
+ *              The finished download is kept as a Blob URL cache (also the fallback without MSE).
  *  - Spotify:  search page injection, a virtual queue interleaved with Spotify's own queue,
  *              and Spotify's own player bar, which shows and controls a non-Spotify track while it is active
  *              (a small mini player is only the fallback when the player bar cannot be used).
@@ -525,11 +527,12 @@
 	}
 
 	// ---- Audio download through libcurl (ranged requests, like YouTube's own player) ----
-	async function downloadFormat(url, total, mime, { signal, onProgress, userAgent } = {}) {
+	async function downloadFormat(url, total, mime, { signal, onProgress, onStart, onChunk, userAgent } = {}) {
 		const CHUNK = 10 * 1024 * 1024;
 		const cpn = Array.from(crypto.getRandomValues(new Uint8Array(16)), (n) => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"[n % 64]).join("");
 		const parts = [];
 		let received = 0;
+		let started = false;
 
 		while (!total || received < total) {
 			throwIfAborted(signal);
@@ -540,6 +543,10 @@
 				signal,
 			});
 			if (!res.ok) throw new Error(`googlevideo returned HTTP ${res.status}`);
+			if (!started) {
+				started = true;
+				onStart?.();
+			}
 
 			const reader = res.body.getReader();
 			let chunkBytes = 0;
@@ -547,6 +554,7 @@
 				const { done, value } = await reader.read();
 				if (done) break;
 				parts.push(value);
+				onChunk?.(value);
 				chunkBytes += value.byteLength;
 				received += value.byteLength;
 				if (total) onProgress?.(Math.min(received / total, 1));
@@ -669,9 +677,10 @@
 		return yt.session.player.decipher(format.url, format.signatureCipher, format.cipher);
 	}
 
-	async function youtubeFetchAudio(track, { signal, onProgress } = {}) {
+	async function youtubeFetchAudio(track, { signal, onProgress, onStart, onChunk } = {}) {
 		if (!config.playbackEnabled) throw new Error(t("playbackDisabled"));
 		const errors = [];
+		let started = false;
 
 		for (const client of config.clients) {
 			throwIfAborted(signal);
@@ -685,6 +694,11 @@
 				const blob = await downloadFormat(url, Number(format.contentLength) || 0, format.mimeType, {
 					signal,
 					onProgress,
+					onChunk,
+					onStart: () => {
+						started = true;
+						onStart?.(format.mimeType);
+					},
 					userAgent: CLIENT_DEFS[client].client.userAgent,
 				});
 				return { blob, mime: format.mimeType };
@@ -692,6 +706,8 @@
 				// libcurl.js rejects aborted requests with a DOMException named "Error" (or errors the body
 				// stream with a plain string), so check the signal instead of relying on error.name.
 				if (signal?.aborted || error?.name === "AbortError") throw new DOMException("Aborted", "AbortError");
+				// Chunks already handed to the player cannot be taken back, so a failure mid-stream is final.
+				if (started) throw error;
 				errors.push(`${client}: ${error?.message || error}`);
 			}
 		}
@@ -707,6 +723,8 @@
 			label: "YouTube Music",
 			search: youtubeSearch,
 			fetchAudio: youtubeFetchAudio,
+			// fetchAudio reports onStart(mime) and onChunk(bytes) while downloading.
+			streamable: true,
 		},
 	};
 
@@ -736,40 +754,63 @@
 		}
 	}
 
-	function getAudioUrl(track, onProgress) {
+	// Returns the cached Blob URL of a finished download, or null.
+	function peekAudioUrl(track) {
 		const key = trackKey(track);
 		const cached = audioCache.get(key);
-		if (cached) {
-			audioCache.delete(key);
-			audioCache.set(key, cached); // refresh LRU order
-			return Promise.resolve(cached.url);
-		}
+		if (!cached) return null;
+		audioCache.delete(key);
+		audioCache.set(key, cached); // refresh LRU order
+		return cached.url;
+	}
 
+	// Starts (or joins) the download of a track. Besides the final Blob URL, a job lets "sinks" follow
+	// the download chunk by chunk. It keeps the chunks received so far, so a sink can join late.
+	function getAudioJob(track) {
+		const key = trackKey(track);
 		let job = inflight.get(key);
 		// A job that was aborted may still be listed until its request settles. Joining it would make this
 		// request fail with an abort error, so start a fresh job instead.
-		if (job?.controller.signal.aborted) job = null;
-		if (!job) {
-			const controller = new AbortController();
-			const created = { controller, listeners: new Set(), promise: null };
-			created.promise = providers[track.provider]
-				.fetchAudio(track, {
-					signal: controller.signal,
-					onProgress: (p) => created.listeners.forEach((fn) => fn(p)),
-				})
-				.then(({ blob }) => {
-					const url = URL.createObjectURL(blob);
-					audioCache.set(key, { url });
-					evictCache();
-					return url;
-				})
-				.finally(() => {
-					// Do not remove a newer job that replaced this one under the same key.
-					if (inflight.get(key) === created) inflight.delete(key);
-				});
-			inflight.set(key, created);
-			job = created;
-		}
+		if (job && !job.controller.signal.aborted) return job;
+
+		const controller = new AbortController();
+		const created = { controller, listeners: new Set(), sinks: new Set(), mime: "", parts: [], finished: false, promise: null };
+		created.promise = providers[track.provider]
+			.fetchAudio(track, {
+				signal: controller.signal,
+				onProgress: (p) => created.listeners.forEach((fn) => fn(p)),
+				onStart: (mime) => {
+					created.mime = mime;
+					created.sinks.forEach((sink) => sink.start(mime));
+				},
+				onChunk: (chunk) => {
+					created.parts.push(chunk);
+					created.sinks.forEach((sink) => sink.append(chunk));
+				},
+			})
+			.then(({ blob }) => {
+				created.finished = true;
+				created.parts = [];
+				created.sinks.forEach((sink) => sink.end());
+				const url = URL.createObjectURL(blob);
+				audioCache.set(key, { url });
+				evictCache();
+				return url;
+			})
+			.finally(() => {
+				// Do not remove a newer job that replaced this one under the same key.
+				if (inflight.get(key) === created) inflight.delete(key);
+			});
+		inflight.set(key, created);
+		return created;
+	}
+
+	// Resolves with the Blob URL once the whole track has been downloaded.
+	function getAudioUrl(track, onProgress) {
+		const cachedUrl = peekAudioUrl(track);
+		if (cachedUrl) return Promise.resolve(cachedUrl);
+
+		const job = getAudioJob(track);
 		if (onProgress) job.listeners.add(onProgress);
 		return job.promise;
 	}
@@ -860,6 +901,202 @@
 		Spicetify.Player.play();
 	}
 
+	// ---------------------------------------------------------------------
+	// Progressive playback (Media Source Extensions)
+	// ---------------------------------------------------------------------
+	let activeStream = null; // { job, sink, cancel } of the track that is currently being streamed
+
+	// Feeds downloaded chunks into a MediaSource attached to the shared <audio> element.
+	function createMseSink({ expectedSec, onAttached, onError }) {
+		const MAX_APPEND_BYTES = 512 * 1024;
+		let mediaSource = null;
+		let buffer = null;
+		let objectUrl = "";
+		let pending = [];
+		let ended = false;
+		let dead = false;
+
+		function fail(error) {
+			dead = true;
+			pending = [];
+			onError(error);
+		}
+
+		// Drops already played data to make room when the browser's buffer quota is hit.
+		function trimPlayed() {
+			const keepFrom = audio.currentTime - 15;
+			if (keepFrom <= 0 || !buffer.buffered.length || buffer.buffered.start(0) >= keepFrom) return false;
+			try {
+				buffer.remove(0, keepFrom);
+				return true;
+			} catch {
+				return false;
+			}
+		}
+
+		// Some containers (fragmented MP4) report no duration up front. Use the track's known length.
+		function applyDuration() {
+			if (!expectedSec || mediaSource.readyState !== "open") return;
+			if (Number.isFinite(mediaSource.duration) && mediaSource.duration >= expectedSec) return;
+			try {
+				mediaSource.duration = expectedSec;
+			} catch {
+				// Best effort only: the real duration becomes known once the stream ends.
+			}
+		}
+
+		function pump() {
+			if (dead || !buffer || buffer.updating || mediaSource.readyState !== "open") return;
+			if (!pending.length) {
+				if (ended) {
+					try {
+						mediaSource.endOfStream();
+					} catch (error) {
+						console.warn("[Synthesis Spicetify] endOfStream failed", error);
+					}
+				}
+				return;
+			}
+
+			// Merge small network chunks, so that there are fewer appendBuffer calls.
+			let count = 0;
+			let size = 0;
+			while (count < pending.length && size < MAX_APPEND_BYTES) size += pending[count++].byteLength;
+			const merged = new Uint8Array(size);
+			let offset = 0;
+			for (const part of pending.splice(0, count)) {
+				merged.set(part, offset);
+				offset += part.byteLength;
+			}
+			try {
+				buffer.appendBuffer(merged);
+			} catch (error) {
+				if (error?.name === "QuotaExceededError" && trimPlayed()) {
+					pending.unshift(merged); // retried by the updateend of the removal
+					return;
+				}
+				fail(error);
+			}
+		}
+
+		return {
+			start(mime) {
+				if (dead || mediaSource) return;
+				if (typeof MediaSource === "undefined" || !MediaSource.isTypeSupported(mime)) {
+					const error = new Error(`MediaSource does not support ${mime}`);
+					error.streamUnsupported = true;
+					fail(error);
+					return;
+				}
+				mediaSource = new MediaSource();
+				objectUrl = URL.createObjectURL(mediaSource);
+				mediaSource.addEventListener("sourceopen", () => {
+					// The MediaSource also reopens after endOfStream() (e.g. on a seek), so create the buffer once.
+					if (dead || buffer) return;
+					try {
+						buffer = mediaSource.addSourceBuffer(mime);
+					} catch (error) {
+						fail(error);
+						return;
+					}
+					buffer.addEventListener("updateend", () => {
+						applyDuration();
+						pump();
+					});
+					buffer.addEventListener("error", () => fail(new Error("SourceBuffer error")));
+					pump();
+				});
+				audio.src = objectUrl;
+				onAttached();
+			},
+			append(chunk) {
+				if (dead) return;
+				pending.push(chunk);
+				pump();
+			},
+			end() {
+				ended = true;
+				pump();
+			},
+			dispose() {
+				dead = true;
+				pending = [];
+				if (objectUrl) URL.revokeObjectURL(objectUrl);
+			},
+		};
+	}
+
+	// Plays a track while it is still downloading. Resolves once playback has started. Rejects with an
+	// error whose streamUnsupported flag is set when the caller should fall back to a full download.
+	function streamTrack(track, token, onProgress) {
+		return new Promise((resolve, reject) => {
+			const job = getAudioJob(track);
+			if (onProgress) job.listeners.add(onProgress);
+
+			let settled = false;
+			const settle = (fn, value) => {
+				if (settled) return;
+				settled = true;
+				fn(value);
+			};
+
+			const sink = createMseSink({
+				expectedSec: (track.durationMs ?? 0) / 1000,
+				onAttached: () => {
+					syncVolume();
+					// Resolves as soon as enough data is buffered to start, not when the download is done.
+					audio.play().then(
+						() => settle(resolve),
+						(error) => settle(reject, error)
+					);
+				},
+				onError: (error) => {
+					if (!settled) settle(reject, error);
+					else console.error("[Synthesis Spicetify] stream error", error);
+				},
+			});
+			activeStream = { job, sink, cancel: () => settle(reject, new DOMException("Aborted", "AbortError")) };
+
+			// Join the download: replay what has arrived so far, then follow it.
+			job.sinks.add(sink);
+			if (job.mime) sink.start(job.mime);
+			for (const chunk of job.parts) sink.append(chunk);
+			if (job.finished) sink.end();
+
+			job.promise.then(
+				() => {},
+				(error) => {
+					if (!settled) {
+						settle(reject, error);
+						return;
+					}
+					// The download died after playback had started: nothing more will arrive.
+					if (token !== playToken || error?.name === "AbortError") return;
+					notify(t("playFailed", error?.message || error), true);
+					playNextFromQueue();
+				}
+			);
+		});
+	}
+
+	function detachStream() {
+		if (!activeStream) return;
+		const { job, sink, cancel } = activeStream;
+		activeStream = null;
+		job.sinks.delete(sink);
+		sink.dispose();
+		cancel();
+	}
+
+	// While the download is still running, do not seek past the data that is available.
+	function seekAudio(seconds) {
+		if (activeStream && !activeStream.job.finished && audio.buffered.length) {
+			const bufferedEnd = audio.buffered.end(audio.buffered.length - 1);
+			seconds = Math.min(seconds, Math.max(0, bufferedEnd - 1));
+		}
+		audio.currentTime = seconds;
+	}
+
 	function updateMediaSession(track) {
 		if (!("mediaSession" in navigator) || !track) return;
 		try {
@@ -886,6 +1123,7 @@
 			if (state.history.length > 20) state.history.shift();
 		}
 
+		detachStream();
 		audio.pause();
 		state.current = track;
 		state.status = "loading";
@@ -894,17 +1132,35 @@
 		renderMini();
 
 		try {
-			const url = await getAudioUrl(track, (p) => {
-				if (token !== playToken) return;
+			// The progress is only shown while loading; after playback has started it is no longer needed.
+			const onProgress = (p) => {
+				if (token !== playToken || state.status !== "loading") return;
 				state.progress = p;
 				renderMini();
-			});
+			};
+
+			let url = peekAudioUrl(track);
+			let streamed = false;
+			if (!url && providers[track.provider].streamable) {
+				try {
+					await streamTrack(track, token, onProgress);
+					streamed = true;
+				} catch (error) {
+					// Without MSE support for this format, wait for the whole download instead.
+					if (!error?.streamUnsupported) throw error;
+					detachStream();
+				}
+			}
 			if (token !== playToken) return;
 
-			audio.src = url;
-			syncVolume();
-			await audio.play();
-			if (token !== playToken) return;
+			if (!streamed) {
+				url ??= await getAudioUrl(track, onProgress);
+				if (token !== playToken) return;
+				audio.src = url;
+				syncVolume();
+				await audio.play();
+				if (token !== playToken) return;
+			}
 
 			state.status = "playing";
 			updateMediaSession(track);
@@ -933,6 +1189,7 @@
 	function stopYT(resumeSpotify) {
 		playToken++;
 		abortLoad(state.current);
+		detachStream();
 		audio.pause();
 		audio.removeAttribute("src");
 		audio.load();
@@ -1247,7 +1504,7 @@
 		const seek = h("input", { class: "ss-mini-seek", type: "range", min: "0", max: "1000", value: "0" });
 		seek.addEventListener("input", () => {
 			const duration = Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
-			if (duration > 0) audio.currentTime = (Number(seek.value) / 1000) * duration;
+			if (duration > 0) seekAudio((Number(seek.value) / 1000) * duration);
 		});
 		const toggle = h("button", { class: "ss-btn", onClick: toggleYT });
 		const next = h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.next, onClick: playNextFromQueue });
@@ -1347,7 +1604,7 @@
 		seek.addEventListener("pointerup", () => { ui.seeking = false; });
 		seek.addEventListener("input", () => {
 			const duration = trackDurationSec();
-			if (duration > 0) audio.currentTime = (Number(seek.value) / 1000) * duration;
+			if (duration > 0) seekAudio((Number(seek.value) / 1000) * duration);
 			seek.style.setProperty("--ss-pct", `${Number(seek.value) / 10}%`);
 		});
 		ui.pb = h("div", { class: "ss-own ss-pb" }, pos, seek, dur);
