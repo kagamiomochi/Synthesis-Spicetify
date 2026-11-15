@@ -130,8 +130,6 @@
 
 	const STRINGS = {
 		ja: {
-			sectionTitle: "Synthesis Spicetify",
-			sectionSub: "YouTube Music の検索結果",
 			tabSpotify: "Spotify",
 			tabYouTubeMusic: "YouTube Music",
 			searching: "YouTube Music を検索中...",
@@ -192,8 +190,6 @@
 			copied: "コピーしました",
 		},
 		en: {
-			sectionTitle: "Synthesis Spicetify",
-			sectionSub: "YouTube Music results",
 			tabSpotify: "Spotify",
 			tabYouTubeMusic: "YouTube Music",
 			searching: "Searching YouTube Music...",
@@ -1497,16 +1493,13 @@
 	document.head.append(
 		h("style", { id: "synthesis-spicetify-style" }, `
 		.ss-section { margin: 8px 0 24px; padding: 0 var(--content-spacing, 32px); box-sizing: border-box; }
-		.ss-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
-		.ss-head h2 { margin: 0; font-size: 24px; font-weight: 700; color: var(--text-base, #fff); }
-		.ss-head span { font-size: 13px; color: var(--text-subdued, #a7a7a7); }
 		.ss-tabs { display: flex; gap: 8px; margin: 8px 0 16px; }
 		.ss-tab { appearance: none; border: 0; cursor: pointer; padding: 6px 14px; border-radius: 999px; font-size: 14px; font-weight: 500; font-family: inherit; background: rgba(128, 128, 128, 0.22); color: var(--text-base, #fff); }
 		.ss-tab:hover { background: rgba(128, 128, 128, 0.36); }
 		.ss-tab[aria-selected="true"] { background: var(--text-base, #fff); color: var(--background-base, #121212); }
 		/* While the YouTube Music tab is active, hide everything Spotify rendered next to our section */
 		.ss-native-hidden > :not(.ss-section) { display: none !important; }
-		.ss-section.ss-tab-spotify > .ss-head, .ss-section.ss-tab-spotify > .ss-body { display: none; }
+		.ss-section.ss-tab-spotify > .ss-body { display: none; }
 		.ss-status { padding: 16px 8px; color: var(--text-subdued, #a7a7a7); font-size: 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 		.ss-more { min-height: 48px; }
 		.ss-row { display: grid; grid-template-columns: 48px minmax(0, 1fr) minmax(0, 0.6fr) auto 48px; gap: 12px; align-items: center; padding: 6px 8px; border-radius: 6px; }
@@ -1528,8 +1521,7 @@
 		@media (max-width: 900px) { .ss-row { grid-template-columns: 48px minmax(0, 1fr) auto 48px; } .ss-album { display: none; } }
 
 		/* Search results: match the look of Spotify's own search rows (centered column, 64px cover, 16px/14px text) */
-		.ss-head, .ss-body { max-width: 1152px; margin-left: auto; margin-right: auto; box-sizing: border-box; }
-		.ss-head { padding: 0 12px; }
+		.ss-body { max-width: 1152px; margin-left: auto; margin-right: auto; box-sizing: border-box; }
 		.ss-body .ss-row { grid-template-columns: 64px minmax(0, 1fr) minmax(0, 0.5fr) auto 48px; gap: 12px; padding: 8px 12px; border-radius: 4px; }
 		.ss-body .ss-row:hover, .ss-body .ss-row:focus-within { background: rgba(255, 255, 255, 0.1); }
 		.ss-body .ss-cover-wrap, .ss-body .ss-cover { width: 64px; height: 64px; }
@@ -1540,6 +1532,18 @@
 		.ss-body .ss-sub, .ss-body .ss-album, .ss-body .ss-dur { font-size: 14px; line-height: 20px; }
 		.ss-body .ss-status { padding-left: 12px; padding-right: 12px; }
 		@media (max-width: 900px) { .ss-body .ss-row { grid-template-columns: 64px minmax(0, 1fr) auto 48px; } }
+
+		/* Top result: highlighted card like Spotify's own "top result" (72px cover, 24px bold title, green play button) */
+		.ss-top { display: grid; grid-template-columns: 72px minmax(0, 1fr); grid-auto-flow: column; grid-auto-columns: auto; gap: 16px; align-items: center; margin: 0 0 24px; padding: 16px; border-radius: 8px; background: rgba(255, 255, 255, 0.07); }
+		.ss-top:hover, .ss-top:focus-within { background: rgba(255, 255, 255, 0.1); }
+		.ss-top-cover { width: 72px; height: 72px; border-radius: 4px; object-fit: cover; background: rgba(128, 128, 128, 0.3); }
+		.ss-top-title { font-size: 24px; line-height: 32px; font-weight: 700; color: var(--text-base, #fff); }
+		.ss-top-sub { font-size: 14px; line-height: 20px; color: var(--text-subdued, #a7a7a7); }
+		.ss-top-title, .ss-top-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.ss-top:hover .ss-actions, .ss-top:focus-within .ss-actions { opacity: 1; }
+		.ss-top-play { display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border: 0; border-radius: 50%; background: var(--essential-bright-accent, #1ed760); color: #000; cursor: pointer; }
+		.ss-top-play:hover { transform: scale(1.06); }
+		.ss-top-play:active { transform: scale(1); filter: brightness(0.7); }
 
 		.ss-mini { position: fixed; left: 16px; bottom: 104px; z-index: 9999; width: 340px; display: none; grid-template-columns: 48px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px; border-radius: 10px; background: var(--background-elevated-base, #242424); color: var(--text-base, #fff); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
 		.ss-mini.ss-visible { display: grid; }
@@ -2151,6 +2155,27 @@
 		);
 	}
 
+	// Highlighted card for the first search result
+	function topResultRow(track) {
+		const img = h("img", { class: "ss-top-cover", alt: "", loading: "lazy" });
+		loadImage(img, track.thumbnail);
+		const canPlay = config.playbackEnabled;
+		return h(
+			"div",
+			{ class: "ss-top", onDblclick: canPlay ? () => playNow(track) : null },
+			img,
+			h("div", { class: "ss-meta" }, h("div", { class: "ss-top-title" }, track.title), h("div", { class: "ss-top-sub" }, track.artists.join(", "))),
+			h(
+				"div",
+				{ class: "ss-actions" },
+				canPlay && h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
+				canPlay && h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) }),
+				h("button", { class: "ss-btn", title: t("openBrowser"), html: ICONS.external, onClick: () => openInBrowser(track) })
+			),
+			canPlay && h("button", { class: "ss-top-play", title: t("play"), html: ICONS.play, onClick: () => playNow(track) })
+		);
+	}
+
 	function ensureSection() {
 		if (!search.section) {
 			search.body = h("div", { class: "ss-body" });
@@ -2169,7 +2194,6 @@
 				"section",
 				{ class: "ss-section" },
 				search.tabs,
-				h("div", { class: "ss-head" }, h("h2", {}, t("sectionTitle")), h("span", {}, t("sectionSub"))),
 				search.body
 			);
 			applyTab();
@@ -2289,7 +2313,7 @@
 			search.body.replaceChildren(h("div", { class: "ss-status" }, t("noResults")));
 		} else if (status === "done") {
 			updateFooter();
-			search.body.replaceChildren(...(config.playbackEnabled ? [] : [playbackNotice()]), ...search.results.map(trackRow), search.footer);
+			search.body.replaceChildren(...(config.playbackEnabled ? [] : [playbackNotice()]), ...search.results.map((track, i) => (i === 0 ? topResultRow(track) : trackRow(track))), search.footer);
 			armObserver();
 		}
 	}
