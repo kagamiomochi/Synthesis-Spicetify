@@ -1527,6 +1527,20 @@
 		.ss-link { border: 0; background: transparent; color: var(--text-base, #fff); text-decoration: underline; cursor: pointer; font-size: 13px; padding: 0; }
 		@media (max-width: 900px) { .ss-row { grid-template-columns: 48px minmax(0, 1fr) auto 48px; } .ss-album { display: none; } }
 
+		/* Search results: match the look of Spotify's own search rows (centered column, 64px cover, 16px/14px text) */
+		.ss-head, .ss-body { max-width: 1152px; margin-left: auto; margin-right: auto; box-sizing: border-box; }
+		.ss-head { padding: 0 12px; }
+		.ss-body .ss-row { grid-template-columns: 64px minmax(0, 1fr) minmax(0, 0.5fr) auto 48px; gap: 12px; padding: 8px 12px; border-radius: 4px; }
+		.ss-body .ss-row:hover, .ss-body .ss-row:focus-within { background: rgba(255, 255, 255, 0.1); }
+		.ss-body .ss-cover-wrap, .ss-body .ss-cover { width: 64px; height: 64px; }
+		.ss-body .ss-cover-play { background: rgba(0, 0, 0, 0.5); }
+		.ss-body .ss-row:focus-within .ss-cover-play { display: flex; }
+		.ss-body .ss-row:focus-within .ss-actions { opacity: 1; }
+		.ss-body .ss-title { font-size: 16px; line-height: 24px; }
+		.ss-body .ss-sub, .ss-body .ss-album, .ss-body .ss-dur { font-size: 14px; line-height: 20px; }
+		.ss-body .ss-status { padding-left: 12px; padding-right: 12px; }
+		@media (max-width: 900px) { .ss-body .ss-row { grid-template-columns: 64px minmax(0, 1fr) auto 48px; } }
+
 		.ss-mini { position: fixed; left: 16px; bottom: 104px; z-index: 9999; width: 340px; display: none; grid-template-columns: 48px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px; border-radius: 10px; background: var(--background-elevated-base, #242424); color: var(--text-base, #fff); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
 		.ss-mini.ss-visible { display: grid; }
 		.ss-mini-cover { width: 48px; height: 48px; border-radius: 6px; object-fit: cover; background: rgba(128, 128, 128, 0.3); }
