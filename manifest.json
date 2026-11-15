@@ -1,7 +1,7 @@
 [
   {
     "name": "Synthesis Spicetify",
-    "description": "Transcending all musical boundaries.",
+    "description": "The Spicetify extension integrates multiple music streaming services with Spotify, enabling seamless searching, playback, and queue management.",
     "preview": "preview.png",
     "main": "synthesis-spicetify.js",
     "readme": "README.md",
