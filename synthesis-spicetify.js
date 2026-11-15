@@ -138,6 +138,8 @@
 			noResults: "YouTube Music に該当する曲が見つかりませんでした。",
 			failed: "YouTube Music の検索に失敗しました。",
 			retry: "再試行",
+			loadingMore: "さらに読み込み中...",
+			loadMoreFailed: "続きの読み込みに失敗しました。",
 			openSettings: "設定を開く",
 			play: "再生",
 			addQueue: "キューに追加",
@@ -198,6 +200,8 @@
 			noResults: "No matching songs on YouTube Music.",
 			failed: "YouTube Music search failed.",
 			retry: "Retry",
+			loadingMore: "Loading more...",
+			loadMoreFailed: "Failed to load more results.",
 			openSettings: "Open settings",
 			play: "Play",
 			addQueue: "Add to queue",
@@ -491,46 +495,97 @@
 		};
 	}
 
-	async function searchByType(yt, query, type) {
-		const res = await yt.music.search(query, { type });
-		const shelf = res.contents?.find((node) => node.type === "MusicShelf");
-		return (shelf?.contents ?? []).map(toTrack).filter(Boolean);
+	// One result stream for a single search type. The first page comes from search(); every later page
+	// comes from getContinuation() (YouTube Music only offers continuations for filtered searches).
+	function createPagedSearch(yt, query, type) {
+		let page = null;
+		let done = false;
+		return {
+			get done() {
+				return done;
+			},
+			async next() {
+				if (done) return [];
+				// Assign state only after the request succeeded, so a failed call can simply be retried.
+				let nextPage;
+				let nodes;
+				if (!page) {
+					nextPage = await yt.music.search(query, { type });
+					nodes = nextPage.contents?.find((node) => node.type === "MusicShelf")?.contents ?? [];
+				} else {
+					nextPage = await page.getContinuation();
+					nodes = nextPage.contents?.contents ?? [];
+				}
+				page = nextPage;
+				done = !page.has_continuation;
+				return Array.from(nodes).map(toTrack).filter(Boolean);
+			}
+		};
 	}
 
 	// Songs only (the old behaviour) hides covers, live versions, remixes and uploads that exist only as
 	// videos, which is why many tracks never showed up. Query both and merge the two result lists.
-	async function youtubeSearch(query, limit) {
-		const yt = await getInnertube();
-		const settled = await Promise.allSettled([searchByType(yt, query, "song"), searchByType(yt, query, "video")]);
-		if (settled.every((r) => r.status === "rejected")) throw settled[0].reason;
-		const [songs, videos] = settled.map((r) => (r.status === "fulfilled" ? r.value : []));
-
-		// Interleave by rank so neither list drowns the other, then drop duplicates (same id, or the same
-		// title and first artist, which is typically a song and its own music video).
-		const merged = [];
+	// The returned session hands out results in pages (take) so the UI can load more while scrolling.
+	function createYoutubeSearch(query) {
+		const words = normalizeText(query).split(" ").filter(Boolean);
 		const seen = new Set();
-		for (let i = 0; i < Math.max(songs.length, videos.length); i++) {
-			for (const track of [songs[i], videos[i]]) {
-				if (!track) continue;
-				const key = `${normalizeText(track.title)}|${normalizeText(track.artists[0])}`;
-				if (seen.has(track.id) || seen.has(key)) continue;
-				seen.add(track.id);
-				seen.add(key);
-				merged.push(track);
-			}
-		}
+		const buffer = [];
+		let streams = null;
 
 		// Stable partition: tracks whose title/artist/album contain every query word go first. Everything
 		// else keeps YouTube's own order, so a mismatch (e.g. localized artist names) never reorders results.
-		const words = normalizeText(query).split(" ").filter(Boolean);
+		// This only reorders within one fetched batch, so rows that are already on screen never move.
 		const matches = (track) => {
 			const haystack = normalizeText([track.title, ...track.artists, track.album].join(" "));
 			return words.every((word) => haystack.includes(word));
 		};
-		const hit = [];
-		const rest = [];
-		for (const track of merged) (words.length && matches(track) ? hit : rest).push(track);
-		return [...hit, ...rest].slice(0, limit);
+
+		async function fillBuffer() {
+			const active = streams.filter((stream) => !stream.done);
+			const settled = await Promise.allSettled(active.map((stream) => stream.next()));
+			if (settled.every((r) => r.status === "rejected")) throw settled[0].reason;
+			const lists = settled.map((r) => (r.status === "fulfilled" ? r.value : []));
+
+			// Interleave by rank so neither list drowns the other, then drop duplicates (same id, or the same
+			// title and first artist, which is typically a song and its own music video). The seen set is shared
+			// across pages, so duplicates are also dropped between pages.
+			const merged = [];
+			for (let i = 0; i < Math.max(0, ...lists.map((list) => list.length)); i++) {
+				for (const track of lists.map((list) => list[i])) {
+					if (!track) continue;
+					const key = `${normalizeText(track.title)}|${normalizeText(track.artists[0])}`;
+					if (seen.has(track.id) || seen.has(key)) continue;
+					seen.add(track.id);
+					seen.add(key);
+					merged.push(track);
+				}
+			}
+			const hit = [];
+			const rest = [];
+			for (const track of merged) (words.length && matches(track) ? hit : rest).push(track);
+			buffer.push(...hit, ...rest);
+		}
+
+		return {
+			// True while there is anything left to hand out or to fetch.
+			get hasMore() {
+				return buffer.length > 0 || !streams || streams.some((stream) => !stream.done);
+			},
+			// Returns up to `count` tracks. Fetches further pages when the buffer runs dry.
+			async take(count) {
+				const yt = await getInnertube();
+				streams ??= ["song", "video"].map((type) => createPagedSearch(yt, query, type));
+				// A page can consist entirely of duplicates, so allow a few fetches before giving up.
+				for (let attempt = 0; attempt < 5 && buffer.length < count && streams.some((stream) => !stream.done); attempt++) {
+					await fillBuffer();
+				}
+				return buffer.splice(0, count);
+			}
+		};
+	}
+
+	async function youtubeSearch(query, limit) {
+		return createYoutubeSearch(query).take(limit);
 	}
 
 	// ---- Audio download through libcurl (ranged requests, like YouTube's own player) ----
@@ -729,6 +784,7 @@
 			id: "youtube",
 			label: "YouTube Music",
 			search: youtubeSearch,
+			createSearch: createYoutubeSearch,
 			fetchAudio: youtubeFetchAudio,
 			// fetchAudio reports onStart(mime) and onChunk(bytes) while downloading.
 			streamable: true,
@@ -1452,6 +1508,7 @@
 		.ss-native-hidden > :not(.ss-section) { display: none !important; }
 		.ss-section.ss-tab-spotify > .ss-head, .ss-section.ss-tab-spotify > .ss-body { display: none; }
 		.ss-status { padding: 16px 8px; color: var(--text-subdued, #a7a7a7); font-size: 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+		.ss-more { min-height: 48px; }
 		.ss-row { display: grid; grid-template-columns: 48px minmax(0, 1fr) minmax(0, 0.6fr) auto 48px; gap: 12px; align-items: center; padding: 6px 8px; border-radius: 6px; }
 		.ss-row:hover { background: rgba(128, 128, 128, 0.18); }
 		.ss-cover-wrap { position: relative; width: 40px; height: 40px; }
@@ -2031,7 +2088,27 @@
 		window.open(url, "_blank", "noopener,noreferrer");
 	}
 
-	const search = { query: "", token: 0, timer: null, section: null, body: null, tabs: null, tab: "spotify", host: null, status: "idle", results: [], error: null };
+	const search = {
+		query: "",
+		token: 0,
+		timer: null,
+		section: null,
+		body: null,
+		tabs: null,
+		tab: "spotify",
+		host: null,
+		status: "idle",
+		results: [],
+		error: null,
+		// Infinite scroll: the paged search session, a footer element that doubles as the scroll sentinel,
+		// and the observer that fires when the footer comes close to the visible area.
+		session: null,
+		hasMore: false,
+		loadingMore: false,
+		moreError: null,
+		footer: null,
+		observer: null
+	};
 
 	function trackRow(track) {
 		const img = h("img", { class: "ss-cover", alt: "", loading: "lazy" });
@@ -2113,9 +2190,75 @@
 		);
 	}
 
+	// Footer below the result rows: shows the loading state or a retry button, and is the sentinel that
+	// triggers loading the next page when it scrolls into view.
+	function updateFooter() {
+		if (!search.footer) search.footer = h("div", { class: "ss-more" });
+		const { footer } = search;
+		if (search.loadingMore) {
+			footer.replaceChildren(h("div", { class: "ss-status" }, t("loadingMore")));
+		} else if (search.moreError) {
+			footer.replaceChildren(
+				h(
+					"div",
+					{ class: "ss-status" },
+					h("span", {}, `${t("loadMoreFailed")} ${search.moreError}`),
+					h("button", { class: "ss-link", onClick: loadMore }, t("retry"))
+				)
+			);
+		} else {
+			footer.replaceChildren();
+		}
+	}
+
+	// (Re)start observing the footer. observe() reports the current state right away, so a footer that is
+	// already visible (few rows, tall window) immediately triggers the next page as well.
+	function armObserver() {
+		if (!search.observer) {
+			// rootMargin starts loading before the user actually reaches the bottom.
+			search.observer = new IntersectionObserver(
+				(entries) => {
+					if (entries.some((entry) => entry.isIntersecting)) loadMore();
+				},
+				{ rootMargin: "0px 0px 400px 0px" }
+			);
+		}
+		search.observer.disconnect();
+		if (search.footer && search.hasMore && !search.moreError) search.observer.observe(search.footer);
+	}
+
+	async function loadMore() {
+		const { session } = search;
+		if (!session || search.loadingMore || !search.hasMore || search.status !== "done") return;
+		const token = search.token;
+		search.loadingMore = true;
+		search.moreError = null;
+		updateFooter();
+		try {
+			const more = await session.take(config.resultLimit);
+			if (token !== search.token) return;
+			search.results.push(...more);
+			search.footer.before(...more.map(trackRow));
+			// An empty page means nothing new is left, even if YouTube still offers a continuation.
+			search.hasMore = more.length > 0 && session.hasMore;
+		} catch (error) {
+			if (token !== search.token) return;
+			console.error("[Synthesis Spicetify] loading more results failed", error);
+			search.moreError = error?.message || String(error);
+		} finally {
+			// A newer search resets these fields itself, so a stale call must not touch them.
+			if (token === search.token) {
+				search.loadingMore = false;
+				updateFooter();
+				armObserver();
+			}
+		}
+	}
+
 	function renderSearch() {
 		if (!search.body) return;
 		const { status } = search;
+		if (status !== "done") search.observer?.disconnect();
 		if (status === "loading") {
 			search.body.replaceChildren(h("div", { class: "ss-status" }, t("searching")));
 		} else if (status === "error") {
@@ -2131,7 +2274,9 @@
 		} else if (status === "done" && !search.results.length) {
 			search.body.replaceChildren(h("div", { class: "ss-status" }, t("noResults")));
 		} else if (status === "done") {
-			search.body.replaceChildren(...(config.playbackEnabled ? [] : [playbackNotice()]), ...search.results.map(trackRow));
+			updateFooter();
+			search.body.replaceChildren(...(config.playbackEnabled ? [] : [playbackNotice()]), ...search.results.map(trackRow), search.footer);
+			armObserver();
 		}
 	}
 
@@ -2147,6 +2292,7 @@
 	}
 
 	function detachSection() {
+		search.observer?.disconnect();
 		search.host?.classList.remove("ss-native-hidden");
 		search.host = null;
 		search.section?.remove();
@@ -2156,14 +2302,21 @@
 		const token = ++search.token;
 		search.query = query;
 		search.status = "loading";
+		search.session = null;
+		search.hasMore = false;
+		search.loadingMore = false;
+		search.moreError = null;
 		ensureSection();
 		renderSearch();
 		attachSection();
 
 		try {
-			const results = await providers.youtube.search(query, config.resultLimit);
+			const session = providers.youtube.createSearch(query);
+			const results = await session.take(config.resultLimit);
 			if (token !== search.token) return;
+			search.session = session;
 			search.results = results;
+			search.hasMore = session.hasMore;
 			search.status = "done";
 		} catch (error) {
 			if (token !== search.token) return;
