@@ -9,7 +9,7 @@
 
 A [Spicetify](https://spicetify.app/) extension that brings YouTube Music into Spotify.
 
-- A "Synthesis Spicetify" section with YouTube Music results appears on Spotify's search results page
+- Spotify's search results page gets "Spotify" and "YouTube Music" tabs, so you can switch between the standard results and the YouTube Music results
 - Play a result, add it to the queue, or play it next
 - Queued tracks play between Spotify tracks (shown in Spotify's own queue panel)
 - While a YouTube track is active, Spotify's own player bar shows it (cover, title, progress bar) and its play/pause,
@@ -127,7 +127,7 @@ tested on real machines yet.
 
 ## Usage
 
-1. Search in Spotify as usual. The "Synthesis Spicetify" section appears on the search results page.
+1. Search in Spotify as usual. "Spotify" and "YouTube Music" tabs appear at the top of the search results page. Spotify's own results are shown by default; click the "YouTube Music" tab to switch to the YouTube Music results (and back). The selected tab is kept while you change the search query.
 2. Hover a result:
    - Play button on the cover: play now
    - "Play next" / "Add to queue" buttons on the right
@@ -187,7 +187,7 @@ Open the profile menu in Spotify and choose "Synthesis Spicetify settings".
 
 Spotify に YouTube Music を統合する [Spicetify](https://spicetify.app/) 拡張機能です。
 
-- Spotify の検索結果ページに、YouTube Music の結果を「Synthesis Spicetify」セクションとして表示
+- Spotify の検索結果ページに「Spotify」「YouTube Music」のタブを追加し、標準の検索結果と YouTube Music の結果をタブで切り替えて表示
 - 結果から再生、次に再生、キューに追加
 - キューに入れた曲は Spotify の曲の間に挟まって再生(プレイバーのキューボタンで確認)
 - YouTube の曲の再生中は、Spotify 本体のプレイヤーバー(カバー・曲名・シークバー)にその曲を表示し、
@@ -278,7 +278,7 @@ Spotify の Spicetify Marketplace で「Synthesis Spicetify」を検索してイ
 
 ## 使い方
 
-1. Spotify で普通に検索すると、検索結果ページに「Synthesis Spicetify」セクションが出ます。
+1. Spotify で普通に検索すると、検索結果ページの上部に「Spotify」「YouTube Music」のタブが出ます。初期表示は Spotify の標準の検索結果で、「YouTube Music」タブをクリックすると YouTube Music の結果に切り替わります(「Spotify」タブで元に戻せます)。選んだタブは、検索ワードを変えても維持されます。
 2. 結果にカーソルを合わせて、カバー画像の再生ボタンで再生、右側のボタンで「次に再生」「キューに追加」ができます。
 3. プレイバーのキューボタンで、キュー中の YouTube 曲を確認、再生、削除できます。
 4. YouTube の曲の再生中は、Spotify の再生ボタンがその曲の再生/一時停止になります(Spotify 自体は無音のままです)。次へ/前へは、キュー中の次の YouTube 曲に進み、キューが空なら Spotify に戻ります。

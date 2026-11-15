@@ -132,6 +132,8 @@
 		ja: {
 			sectionTitle: "Synthesis Spicetify",
 			sectionSub: "YouTube Music の検索結果",
+			tabSpotify: "Spotify",
+			tabYouTubeMusic: "YouTube Music",
 			searching: "YouTube Music を検索中...",
 			noResults: "YouTube Music に該当する曲が見つかりませんでした。",
 			failed: "YouTube Music の検索に失敗しました。",
@@ -190,6 +192,8 @@
 		en: {
 			sectionTitle: "Synthesis Spicetify",
 			sectionSub: "YouTube Music results",
+			tabSpotify: "Spotify",
+			tabYouTubeMusic: "YouTube Music",
 			searching: "Searching YouTube Music...",
 			noResults: "No matching songs on YouTube Music.",
 			failed: "YouTube Music search failed.",
@@ -1437,6 +1441,13 @@
 		.ss-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
 		.ss-head h2 { margin: 0; font-size: 24px; font-weight: 700; color: var(--text-base, #fff); }
 		.ss-head span { font-size: 13px; color: var(--text-subdued, #a7a7a7); }
+		.ss-tabs { display: flex; gap: 8px; margin: 8px 0 16px; }
+		.ss-tab { appearance: none; border: 0; cursor: pointer; padding: 6px 14px; border-radius: 999px; font-size: 14px; font-weight: 500; font-family: inherit; background: rgba(128, 128, 128, 0.22); color: var(--text-base, #fff); }
+		.ss-tab:hover { background: rgba(128, 128, 128, 0.36); }
+		.ss-tab[aria-selected="true"] { background: var(--text-base, #fff); color: var(--background-base, #121212); }
+		/* While the YouTube Music tab is active, hide everything Spotify rendered next to our section */
+		.ss-native-hidden > :not(.ss-section) { display: none !important; }
+		.ss-section.ss-tab-spotify > .ss-head, .ss-section.ss-tab-spotify > .ss-body { display: none; }
 		.ss-status { padding: 16px 8px; color: var(--text-subdued, #a7a7a7); font-size: 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 		.ss-row { display: grid; grid-template-columns: 48px minmax(0, 1fr) minmax(0, 0.6fr) auto 48px; gap: 12px; align-items: center; padding: 6px 8px; border-radius: 6px; }
 		.ss-row:hover { background: rgba(128, 128, 128, 0.18); }
@@ -1923,7 +1934,7 @@
 		window.open(url, "_blank", "noopener,noreferrer");
 	}
 
-	const search = { query: "", token: 0, timer: null, section: null, body: null, status: "idle", results: [], error: null };
+	const search = { query: "", token: 0, timer: null, section: null, body: null, tabs: null, tab: "spotify", host: null, status: "idle", results: [], error: null };
 
 	function trackRow(track) {
 		const img = h("img", { class: "ss-cover", alt: "", loading: "lazy" });
@@ -1955,14 +1966,45 @@
 	function ensureSection() {
 		if (!search.section) {
 			search.body = h("div", { class: "ss-body" });
+			search.tabs = h(
+				"div",
+				{ class: "ss-tabs", role: "tablist" },
+				...["spotify", "youtube"].map((id) =>
+					h(
+						"button",
+						{ class: "ss-tab", role: "tab", "data-tab": id, onClick: () => setTab(id) },
+						t(id === "spotify" ? "tabSpotify" : "tabYouTubeMusic")
+					)
+				)
+			);
 			search.section = h(
 				"section",
 				{ class: "ss-section" },
+				search.tabs,
 				h("div", { class: "ss-head" }, h("h2", {}, t("sectionTitle")), h("span", {}, t("sectionSub"))),
 				search.body
 			);
+			applyTab();
 		}
 		return search.section;
+	}
+
+	// Reflect the selected tab on our section and on the Spotify results rendered next to it
+	function applyTab() {
+		if (!search.section) return;
+		const youtube = search.tab === "youtube";
+		search.section.classList.toggle("ss-tab-spotify", !youtube);
+		for (const btn of search.tabs.children) btn.setAttribute("aria-selected", String(btn.dataset.tab === search.tab));
+		const host = search.section.parentElement;
+		if (search.host && search.host !== host) search.host.classList.remove("ss-native-hidden");
+		search.host = host;
+		host?.classList.toggle("ss-native-hidden", youtube);
+	}
+
+	function setTab(id) {
+		if (search.tab === id) return;
+		search.tab = id;
+		applyTab();
 	}
 
 	function playbackNotice() {
@@ -1997,14 +2039,19 @@
 	}
 
 	function attachSection() {
-		if (!search.query || !search.section || search.section.isConnected) return;
-		const scroll = document.querySelector(".main-view-container__scroll-node-child");
-		if (!scroll) return;
-		const host = scroll.querySelector('[data-testid="search-body"]') || scroll.firstElementChild || scroll;
-		host.prepend(search.section);
+		if (!search.query || !search.section) return;
+		if (!search.section.isConnected) {
+			const scroll = document.querySelector(".main-view-container__scroll-node-child");
+			if (!scroll) return;
+			const host = scroll.querySelector('[data-testid="search-body"]') || scroll.firstElementChild || scroll;
+			host.prepend(search.section);
+		}
+		applyTab();
 	}
 
 	function detachSection() {
+		search.host?.classList.remove("ss-native-hidden");
+		search.host = null;
 		search.section?.remove();
 	}
 
