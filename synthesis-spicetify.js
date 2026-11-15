@@ -263,6 +263,9 @@
 	const ICONS = {
 		play: svg("M3 1.7v12.6a.7.7 0 0 0 1.05.6l10.5-6.3a.7.7 0 0 0 0-1.2L4.05 1.1A.7.7 0 0 0 3 1.7z"),
 		pause: svg("M2.7 1h3.6v14H2.7zM9.7 1h3.6v14H9.7z"),
+		// Same shapes as the icons of Spotify's own play/pause button (rounded bars, slightly larger triangle).
+		barPlay: svg("M3 1.713a.7.7 0 0 1 1.05-.607l10.89 6.288a.7.7 0 0 1 0 1.212L4.05 14.894A.7.7 0 0 1 3 14.288V1.713z"),
+		barPause: svg("M2.7 1a.7.7 0 0 0-.7.7v12.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V1.7a.7.7 0 0 0-.7-.7H2.7zm8 0a.7.7 0 0 0-.7.7v12.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V1.7a.7.7 0 0 0-.7-.7h-2.6z"),
 		next: svg("M12.7 1h1.6v14h-1.6zM1.7 1.6v12.8a.5.5 0 0 0 .8.4l8.6-6.4a.5.5 0 0 0 0-.8L2.5 1.2a.5.5 0 0 0-.8.4z"),
 		plus: svg("M15 7H9V1H7v6H1v2h6v6h2V9h6z"),
 		playNext: svg("M1 2h9v1.5H1zM1 6.25h9v1.5H1zM1 10.5h5v1.5H1zM10 9.5v5l4.5-2.5z"),
@@ -1486,12 +1489,28 @@
 		.ss-takeover .ss-pb { display: flex; align-items: center; gap: 8px; width: 100%; }
 		.ss-pb-time { flex: none; min-width: 40px; font-size: 11px; color: var(--text-subdued, #a7a7a7); font-variant-numeric: tabular-nums; }
 		.ss-pb-pos { text-align: right; }
-		.ss-pb-seek { --ss-fill: var(--text-base, #fff); flex: 1; min-width: 0; height: 4px; margin: 0; border-radius: 2px; cursor: pointer; -webkit-appearance: none; appearance: none; background: linear-gradient(to right, var(--ss-fill) var(--ss-pct, 0%), rgba(128, 128, 128, 0.45) var(--ss-pct, 0%), rgba(128, 128, 128, 0.45) var(--ss-buf, 0%), rgba(128, 128, 128, 0.12) var(--ss-buf, 0%)); }
-		.ss-pb-seek:hover { --ss-fill: var(--essential-bright-accent, #1ed760); }
-		.ss-pb-seek:disabled { cursor: progress; }
-		.ss-pb-seek::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%; background: #fff; opacity: 0; }
-		.ss-pb-seek:hover::-webkit-slider-thumb { opacity: 1; }
-		.ss-takeover .ss-pp-icon { display: inline-flex; align-items: center; justify-content: center; }
+		/* Progress bar that mimics Spotify's own: 12px hit area, 4px track, white fill that turns green on hover, thumb and time tooltip on hover */
+		.ss-pb-bar { --ss-fill: var(--text-base, #fff); --ss-pct: 0%; --ss-buf: 100%; --ss-prev: 0%; position: relative; display: flex; align-items: center; flex: 1; min-width: 0; height: 12px; cursor: pointer; touch-action: none; outline: none; }
+		.ss-pb-bar:hover, .ss-pb-bar.ss-seeking { --ss-fill: var(--essential-bright-accent, #1ed760); }
+		.ss-pb-bar.ss-disabled { cursor: progress; }
+		.ss-pb-bar.ss-disabled:hover { --ss-fill: var(--text-base, #fff); }
+		.ss-pb-track { position: relative; width: 100%; height: 4px; border-radius: 2px; overflow: hidden; background: #4d4d4d; }
+		.ss-pb-track > div { position: absolute; top: 0; bottom: 0; left: 0; }
+		/* Part of the track that cannot be played yet while the audio is still streaming */
+		.ss-pb-unloaded { left: var(--ss-buf) !important; right: 0; background: rgba(0, 0, 0, 0.35); }
+		/* Lighter highlight between the playhead and the mouse pointer */
+		.ss-pb-preview { width: var(--ss-prev); background: #cacaca; opacity: 0; }
+		.ss-pb-bar:hover:not(.ss-disabled) .ss-pb-preview, .ss-pb-bar.ss-seeking .ss-pb-preview { opacity: 1; }
+		.ss-pb-fill { width: var(--ss-pct); background: var(--ss-fill); }
+		.ss-pb-thumb { position: absolute; top: 50%; left: var(--ss-pct); width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: #fff; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5); opacity: 0; pointer-events: none; }
+		.ss-pb-bar:hover:not(.ss-disabled) .ss-pb-thumb, .ss-pb-bar.ss-seeking .ss-pb-thumb, .ss-pb-bar:focus-visible .ss-pb-thumb { opacity: 1; }
+		.ss-pb-tip { position: fixed; z-index: 100000; display: none; padding: 4px 8px; border-radius: 4px; background: #2a2a2a; color: #fff; font-size: 12px; font-weight: 700; line-height: 16px; font-variant-numeric: tabular-nums; white-space: nowrap; pointer-events: none; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4); }
+		.ss-pb-tip.ss-visible { display: block; }
+		/* Spotify's own play/pause circle lives in a child element that is hidden above, so draw the circle here */
+		.ss-takeover .ss-pp-icon { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 32px; height: 32px; border-radius: 50%; background: var(--text-base, #fff); color: var(--background-base, #000); transition: transform 0.03s linear; }
+		.ss-takeover .ss-pp-icon svg { display: block; width: 16px; height: 16px; }
+		.ss-takeover [data-ss-host]:hover > .ss-pp-icon { transform: scale(1.06); }
+		.ss-takeover [data-ss-host]:active > .ss-pp-icon { transform: scale(1); filter: brightness(0.7); }
 
 		.ss-queue-block { display: flex; flex-direction: column; gap: 0; padding: 0 0 8px; box-sizing: border-box; }
 		/* Rows look like Spotify's own queue rows: 48px cover, 16px title, 14px subtitle, hover highlight bleeding 8px outwards */
@@ -1670,14 +1689,87 @@
 
 		const pos = h("span", { class: "ss-pb-time ss-pb-pos" });
 		const dur = h("span", { class: "ss-pb-time" });
-		const seek = h("input", { class: "ss-pb-seek", type: "range", min: "0", max: "1000", value: "0" });
-		const ui = { np, cover, title, sub, pos, dur, seek, seeking: false, lastCoverUrl: "", lastIcon: "" };
-		seek.addEventListener("pointerdown", () => { ui.seeking = true; });
-		seek.addEventListener("pointerup", () => { ui.seeking = false; });
-		seek.addEventListener("input", () => {
+		const fill = h("div", { class: "ss-pb-fill" });
+		const preview = h("div", { class: "ss-pb-preview" });
+		const unloaded = h("div", { class: "ss-pb-unloaded" });
+		const track = h("div", { class: "ss-pb-track" }, unloaded, preview, fill);
+		const thumb = h("div", { class: "ss-pb-thumb" });
+		const tip = h("div", { class: "ss-pb-tip" });
+		const seek = h("div", { class: "ss-pb-bar", role: "slider", tabindex: "0", "aria-label": "Seek", "aria-valuemin": "0" }, track, thumb);
+		const ui = { np, cover, title, sub, pos, dur, seek, tip, seeking: false, dragFraction: 0, lastCoverUrl: "", lastIcon: "" };
+
+		// Fraction (0..1) of the bar under the pointer.
+		const fractionAt = (event) => {
+			const rect = seek.getBoundingClientRect();
+			return rect.width > 0 ? Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)) : 0;
+		};
+		// Show the time under the pointer in a tooltip above the bar. It is attached to the body so that
+		// no overflow rule of Spotify's player bar can clip it.
+		const showTip = (event, fraction) => {
 			const duration = trackDurationSec();
-			if (duration > 0) seekAudio((Number(seek.value) / 1000) * duration);
-			seek.style.setProperty("--ss-pct", `${Number(seek.value) / 10}%`);
+			if (!(duration > 0) || state.status === "loading") return hideTip();
+			if (!tip.isConnected) document.body.append(tip);
+			setText(tip, clock(fraction * duration));
+			tip.classList.add("ss-visible");
+			const rect = seek.getBoundingClientRect();
+			const half = tip.offsetWidth / 2;
+			const x = Math.min(Math.max(event.clientX, rect.left + half), rect.right - half);
+			tip.style.left = `${Math.round(x - half)}px`;
+			tip.style.top = `${Math.round(rect.top - tip.offsetHeight - 2)}px`;
+		};
+		const hideTip = () => tip.classList.remove("ss-visible");
+		// Draw the playhead at the given fraction while dragging (the audio is only moved on release).
+		const previewDrag = (fraction) => {
+			ui.dragFraction = fraction;
+			seek.style.setProperty("--ss-pct", `${(fraction * 100).toFixed(2)}%`);
+			setText(pos, clock(fraction * trackDurationSec()));
+		};
+		const endDrag = (commit) => {
+			if (!ui.seeking) return;
+			ui.seeking = false;
+			seek.classList.remove("ss-seeking");
+			const duration = trackDurationSec();
+			if (commit && duration > 0) seekAudio(ui.dragFraction * duration);
+			updateTakeoverProgress();
+		};
+
+		seek.addEventListener("pointerdown", (event) => {
+			if (event.button !== 0 || state.status === "loading" || !(trackDurationSec() > 0)) return;
+			seek.setPointerCapture(event.pointerId);
+			ui.seeking = true;
+			seek.classList.add("ss-seeking");
+			previewDrag(fractionAt(event));
+		});
+		seek.addEventListener("pointermove", (event) => {
+			const fraction = fractionAt(event);
+			seek.style.setProperty("--ss-prev", `${(fraction * 100).toFixed(2)}%`);
+			if (ui.seeking) previewDrag(fraction);
+			showTip(event, fraction);
+		});
+		seek.addEventListener("pointerup", () => endDrag(true));
+		seek.addEventListener("pointercancel", () => endDrag(false));
+		seek.addEventListener("pointerleave", () => {
+			// While dragging, the pointer is captured, so the tooltip keeps following it.
+			if (!ui.seeking) hideTip();
+		});
+		seek.addEventListener("pointerup", () => {
+			if (!seek.matches(":hover")) hideTip();
+		});
+		// Keyboard: arrow keys move by 5 seconds like Spotify's own bar, Home and End jump to the edges.
+		seek.addEventListener("keydown", (event) => {
+			const duration = trackDurationSec();
+			if (!(duration > 0) || state.status === "loading") return;
+			const current = audio.currentTime;
+			let target = null;
+			if (event.key === "ArrowRight" || event.key === "ArrowUp") target = current + 5;
+			else if (event.key === "ArrowLeft" || event.key === "ArrowDown") target = current - 5;
+			else if (event.key === "Home") target = 0;
+			else if (event.key === "End") target = duration;
+			if (target == null) return;
+			event.preventDefault();
+			event.stopPropagation();
+			seekAudio(Math.min(Math.max(target, 0), duration));
+			updateTakeoverProgress();
 		});
 		ui.pb = h("div", { class: "ss-own ss-pb" }, pos, seek, dur);
 		ui.icon = h("span", { class: "ss-own ss-pp-icon" });
@@ -1740,7 +1832,7 @@
 			ui.cover.removeAttribute("data-fallback");
 			loadImage(ui.cover, track.thumbnail);
 		}
-		const icon = state.status === "playing" ? "pause" : "play";
+		const icon = state.status === "playing" ? "barPause" : "barPlay";
 		if (ui.lastIcon !== icon) {
 			ui.lastIcon = icon;
 			ui.icon.innerHTML = ICONS[icon];
@@ -1758,11 +1850,16 @@
 		const loading = state.status === "loading";
 		const duration = trackDurationSec();
 		const fraction = loading ? state.progress : duration > 0 ? Math.min(1, audio.currentTime / duration) : 0;
-		ui.seek.disabled = loading;
-		ui.seek.value = String(Math.round(fraction * 1000));
-		ui.seek.style.setProperty("--ss-pct", `${(fraction * 100).toFixed(1)}%`);
-		const loaded = loading ? 0 : loadedFraction(duration);
-		ui.seek.style.setProperty("--ss-buf", `${(loaded * 100).toFixed(1)}%`);
+		ui.seek.classList.toggle("ss-disabled", loading);
+		ui.seek.style.setProperty("--ss-pct", `${(fraction * 100).toFixed(2)}%`);
+		const loaded = loading ? 1 : loadedFraction(duration);
+		ui.seek.style.setProperty("--ss-buf", `${(loaded * 100).toFixed(2)}%`);
+		if (loading) ui.seek.removeAttribute("aria-valuenow");
+		else {
+			ui.seek.setAttribute("aria-valuemax", String(Math.round(duration)));
+			ui.seek.setAttribute("aria-valuenow", String(Math.round(audio.currentTime)));
+			ui.seek.setAttribute("aria-valuetext", clock(audio.currentTime));
+		}
 		setText(ui.pos, loading ? "" : clock(audio.currentTime));
 		setText(ui.dur, duration > 0 ? clock(duration) : "");
 	}
