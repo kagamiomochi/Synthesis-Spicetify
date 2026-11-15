@@ -14,6 +14,8 @@
  *  - Spotify:  search page injection, a virtual queue interleaved with Spotify's own queue,
  *              and Spotify's own player bar, which shows and controls a non-Spotify track while it is active
  *              (a small mini player is only the fallback when the player bar cannot be used).
+ *  - Playlists: a saved track is a silent local-file placeholder in a Spotify playlist; when Spotify starts
+ *              it, the extension pauses Spotify and streams the real track instead.
  *
  * Both libraries are loaded lazily from jsDelivr (pinned versions) on first use.
  */
@@ -188,6 +190,16 @@
 			guideFailed: (url) => `${url} に接続できませんでした。セットアップを済ませてから、もう一度確認してください。`,
 			copyHint: "クリックでコピー",
 			copied: "コピーしました",
+			saveToPlaylist: "プレイリストに保存",
+			pickPlaylist: "保存先のプレイリスト",
+			currentPlaylist: "いま開いているプレイリスト",
+			loadingPlaylists: "読み込み中...",
+			noPlaylists: "プレイリストが見つかりませんでした。",
+			saving: "保存中...",
+			savedToPlaylist: (name) => `「${name}」に保存しました`,
+			saveNotIndexed: "ダミー曲が Spotify のローカルファイルに現れませんでした。選んだフォルダが Spotify の設定でローカルファイルのソースに入っているか確認してください。",
+			saveFailed: (m) => `保存に失敗しました: ${m}`,
+			badTrackId: "この曲は保存できません (IDが不正です)。",
 		},
 		en: {
 			tabSpotify: "Spotify",
@@ -248,6 +260,16 @@
 			guideFailed: (url) => `Could not connect to ${url}. Finish the setup and check again.`,
 			copyHint: "Click to copy",
 			copied: "Copied",
+			saveToPlaylist: "Save to playlist",
+			pickPlaylist: "Save to playlist",
+			currentPlaylist: "Currently open playlist",
+			loadingPlaylists: "Loading...",
+			noPlaylists: "No playlists found.",
+			saving: "Saving...",
+			savedToPlaylist: (name) => `Saved to "${name}"`,
+			saveNotIndexed: "The placeholder did not show up in Spotify's local files. Check that the chosen folder is a local files source in Spotify's settings.",
+			saveFailed: (m) => `Saving failed: ${m}`,
+			badTrackId: "This track cannot be saved (invalid ID).",
 		},
 	};
 
@@ -268,6 +290,7 @@
 		barPause: svg("M2.7 1a.7.7 0 0 0-.7.7v12.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V1.7a.7.7 0 0 0-.7-.7H2.7zm8 0a.7.7 0 0 0-.7.7v12.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V1.7a.7.7 0 0 0-.7-.7h-2.6z"),
 		next: svg("M12.7 1h1.6v14h-1.6zM1.7 1.6v12.8a.5.5 0 0 0 .8.4l8.6-6.4a.5.5 0 0 0 0-.8L2.5 1.2a.5.5 0 0 0-.8.4z"),
 		plus: svg("M15 7H9V1H7v6H1v2h6v6h2V9h6z"),
+		savePlaylist: svg("M1 2h9v1.5H1zM1 6.25h9v1.5H1zM1 10.5h5v1.5H1zM12 8v2.5h2.5V12H12v2.5h-1.5V12H8v-1.5h2.5V8z"),
 		playNext: svg("M1 2h9v1.5H1zM1 6.25h9v1.5H1zM1 10.5h5v1.5H1zM10 9.5v5l4.5-2.5z"),
 		external: svg("M7 2v1.5H3.5v9h9V9H14v5.5H2V2zM9 1h6v6h-1.5V3.56L8.53 8.53 7.47 7.47l4.97-4.97H9z"),
 		close: svg("M2.47 2.47a.75.75 0 0 1 1.06 0L8 6.94l4.47-4.47a.75.75 0 1 1 1.06 1.06L9.06 8l4.47 4.47a.75.75 0 1 1-1.06 1.06L8 9.06l-4.47 4.47a.75.75 0 0 1-1.06-1.06L6.94 8 2.47 3.53a.75.75 0 0 1 0-1.06z"),
@@ -896,6 +919,7 @@
 		resumeSpotify: false, // resume Spotify once the virtual queue drains
 		suppressUntil: 0, // ignore Spotify events until this timestamp
 		spotifySnapshot: null, // where Spotify was before its session was stopped ({ uri, ctx, position })
+		viaDummy: false, // the active track was started from a saved placeholder; Spotify stays paused on it
 	};
 	let playToken = 0;
 	let qidCounter = 0;
@@ -958,6 +982,16 @@
 		}
 		state.suppressUntil = Date.now() + 1000;
 		Spicetify.Player.play();
+	}
+
+	// A saved track leaves Spotify paused on its silent placeholder. Move on to whatever follows it in the
+	// playlist instead of restoring the placeholder (which would start the same track again).
+	function advancePastDummy() {
+		Spicetify.Player.next();
+		setTimeout(() => {
+			// If the next item is a placeholder too, the songchange handler has already taken over.
+			if (state.status === "idle" && !Spicetify.Player.isPlaying()) Spicetify.Player.play();
+		}, 400);
 	}
 
 	// ---------------------------------------------------------------------
@@ -1228,7 +1262,7 @@
 		}
 	}
 
-	async function playTrack(track, { fromHistory = false } = {}) {
+	async function playTrack(track, { fromHistory = false, keepSpotify = false } = {}) {
 		const token = ++playToken;
 		const previous = state.current;
 		const previousStatus = state.status;
@@ -1244,7 +1278,8 @@
 		state.current = track;
 		state.status = "loading";
 		state.progress = 0;
-		pauseSpotify();
+		// A placeholder track is paused by the caller and must keep its Spotify session (see startFromDummy).
+		if (!keepSpotify) pauseSpotify();
 		renderMini();
 
 		try {
@@ -1303,6 +1338,8 @@
 	}
 
 	function stopYT(resumeSpotify) {
+		const viaDummy = state.viaDummy;
+		state.viaDummy = false;
 		playToken++;
 		abortLoad(state.current);
 		detachStream();
@@ -1315,7 +1352,8 @@
 		state.history.length = 0;
 		renderMini();
 		if (resumeSpotify) {
-			resumeSpotifyIfNeeded();
+			if (viaDummy) advancePastDummy();
+			else resumeSpotifyIfNeeded();
 		} else {
 			state.resumeSpotify = false;
 			state.spotifySnapshot = null;
@@ -1337,6 +1375,10 @@
 	function skipNext() {
 		if (state.queue.length) {
 			playNextFromQueue();
+			return;
+		}
+		if (state.viaDummy) {
+			stopYT(true); // moves Spotify on to whatever follows the placeholder
 			return;
 		}
 		// The virtual queue is empty: hand control back to Spotify and skip to its next track.
@@ -1425,6 +1467,331 @@
 	}, 500);
 
 	// ---------------------------------------------------------------------
+	// Saving tracks to Spotify playlists (silent local-file placeholders)
+	// ---------------------------------------------------------------------
+	// A Spotify playlist can only hold Spotify items and local files, so a saved track is stored as a silent
+	// MP3 whose tags (artist / "Synthesis" / title) and length give it a unique spotify:local: URI. The MP3 is
+	// written into a folder that Spotify uses as a Local Files source, the URI is added to the playlist, and
+	// when Spotify starts playing that URI the extension pauses Spotify and streams the real track instead.
+	const SAVED_KEY = "synthesis-spicetify:saved";
+	const DUMMY_ALBUM = "Synthesis"; // album tag of every placeholder, also used to recognise them
+	const HANDLE_DB = "synthesis-spicetify";
+
+	function loadSaved() {
+		try {
+			return JSON.parse(localStorage.getItem(SAVED_KEY) || "{}");
+		} catch {
+			return {};
+		}
+	}
+
+	const savedTracks = loadSaved(); // spotify:local: URI -> track
+
+	function rememberSaved(uri, track) {
+		savedTracks[uri] = track;
+		try {
+			localStorage.setItem(SAVED_KEY, JSON.stringify(savedTracks));
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] failed to store saved tracks", error);
+		}
+	}
+
+	// Builds a silent MP3 (MPEG-2 Layer III, 24 kHz, mono, 16 kbps) with ID3v2.3 tags. The first frame is an
+	// Info header that carries the frame count, so the length is exact; TLEN repeats it for tag readers.
+	function makeSilentMp3({ artist, album, title, seconds }) {
+		const FRAME = 48; // 72 * 16000 / 24000 bytes, 576 samples = 24 ms per frame
+		const frames = Math.ceil((seconds * 1000) / 24);
+		const frame = (id, body) => {
+			const out = new Uint8Array(10 + body.length);
+			for (let i = 0; i < 4; i++) out[i] = id.charCodeAt(i);
+			new DataView(out.buffer).setUint32(4, body.length); // ID3v2.3 frame sizes are plain big-endian
+			out.set(body, 10);
+			return out;
+		};
+		// UTF-16 with BOM (encoding byte 1), so that any title survives
+		const text = (id, value) => {
+			const body = new Uint8Array(3 + value.length * 2);
+			body.set([1, 0xff, 0xfe]);
+			for (let i = 0; i < value.length; i++) {
+				const c = value.charCodeAt(i);
+				body[3 + i * 2] = c & 0xff;
+				body[4 + i * 2] = c >> 8;
+			}
+			return frame(id, body);
+		};
+		// TLEN is plain ISO-8859-1 digits, in milliseconds
+		const numeric = (id, value) => {
+			const s = String(value);
+			const body = new Uint8Array(1 + s.length);
+			for (let i = 0; i < s.length; i++) body[1 + i] = s.charCodeAt(i);
+			return frame(id, body);
+		};
+		const parts = [text("TIT2", title), text("TPE1", artist), text("TALB", album), numeric("TLEN", seconds * 1000)];
+		const tagSize = parts.reduce((n, p) => n + p.length, 0);
+		const header = new Uint8Array([0x49, 0x44, 0x33, 3, 0, 0, (tagSize >> 21) & 0x7f, (tagSize >> 14) & 0x7f, (tagSize >> 7) & 0x7f, tagSize & 0x7f]);
+		const audio = new Uint8Array(FRAME * (frames + 1));
+		// Frame header: MPEG-2 Layer III, no CRC, bitrate index 2 (16 kbps), 24 kHz, mono.
+		// The bitrate index must match FRAME, otherwise decoders reject the file as unplayable.
+		for (let f = 0; f <= frames; f++) audio.set([0xff, 0xf3, 0x24, 0xc0], f * FRAME);
+		audio.set([0x49, 0x6e, 0x66, 0x6f], 13); // "Info"
+		new DataView(audio.buffer).setUint32(17, 1); // flags: frame count present
+		new DataView(audio.buffer).setUint32(21, frames);
+		const out = new Uint8Array(10 + tagSize + audio.length);
+		out.set(header, 0);
+		let pos = 10;
+		for (const p of parts) {
+			out.set(p, pos);
+			pos += p.length;
+		}
+		out.set(audio, pos);
+		return out;
+	}
+
+	// Escapes one URI field the way Spotify does for local files: A-Z a-z 0-9 - . _ ~ stay, a space becomes
+	// "+", and every other UTF-8 byte becomes %XX. Both a mismatch and a missing file make the playlist row
+	// unplayable, so waitForLocalUri() below prefers the URI Spotify reports itself.
+	function encodeLocalField(value) {
+		return Array.from(new TextEncoder().encode(value), (byte) => {
+			if (byte === 0x20) return "+";
+			const char = String.fromCharCode(byte);
+			return /[A-Za-z0-9\-._~]/.test(char) ? char : "%" + byte.toString(16).toUpperCase().padStart(2, "0");
+		}).join("");
+	}
+
+	const localUri = (artist, album, title, seconds) =>
+		`spotify:local:${encodeLocalField(artist)}:${encodeLocalField(album)}:${encodeLocalField(title)}:${seconds}`;
+
+	// The placeholder folder handle is kept in IndexedDB so the folder only has to be chosen once.
+	function openHandleDb() {
+		return new Promise((resolve, reject) => {
+			const request = indexedDB.open(HANDLE_DB, 1);
+			request.onupgradeneeded = () => request.result.createObjectStore("handles");
+			request.onsuccess = () => resolve(request.result);
+			request.onerror = () => reject(request.error);
+		});
+	}
+
+	async function handleStore(mode, run) {
+		const db = await openHandleDb();
+		try {
+			return await new Promise((resolve, reject) => {
+				const request = run(db.transaction("handles", mode).objectStore("handles"));
+				request.onsuccess = () => resolve(request.result);
+				request.onerror = () => reject(request.error);
+			});
+		} finally {
+			db.close();
+		}
+	}
+
+	// Returns a writable handle of the placeholder folder. Call it from a click handler: both the folder
+	// picker and the permission prompt need a user gesture.
+	async function getDummyDir() {
+		let dir = null;
+		try {
+			dir = await handleStore("readonly", (store) => store.get("dir"));
+			if (dir) {
+				let permission = await dir.queryPermission({ mode: "readwrite" });
+				if (permission !== "granted") permission = await dir.requestPermission({ mode: "readwrite" });
+				if (permission === "granted") return dir;
+			}
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] stored folder is not usable", error);
+		}
+		dir = await window.showDirectoryPicker({ id: "synthesis-saved", mode: "readwrite" });
+		try {
+			await handleStore("readwrite", (store) => store.put(dir, "dir"));
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] failed to remember the folder", error);
+		}
+		return dir;
+	}
+
+	// Waits until Spotify's local file index lists the new placeholder and returns the URI Spotify uses for
+	// it (null on timeout). Without the index API the URI we computed ourselves is trusted.
+	async function waitForLocalUri(expected, { artist, title, seconds }) {
+		const api = Spicetify.Platform?.LocalFilesAPI;
+		if (typeof api?.getTracks !== "function") return expected;
+		const deadline = Date.now() + 15000;
+		while (Date.now() < deadline) {
+			try {
+				const tracks = (await api.getTracks()) ?? [];
+				const exact = tracks.find((track) => track.uri === expected);
+				if (exact) return exact.uri;
+				const loose = tracks.find(
+					(track) =>
+						track.name === title &&
+						track.album?.name === DUMMY_ALBUM &&
+						track.artists?.[0]?.name === artist &&
+						Math.round((track.duration?.milliseconds ?? 0) / 1000) === seconds
+				);
+				if (loose) return loose.uri;
+			} catch (error) {
+				console.warn("[Synthesis Spicetify] local files index not readable yet", error);
+			}
+			await sleep(500);
+		}
+		return null;
+	}
+
+	// Two different videos can share artist, title and length. They must not share a URI, so the length
+	// moves up by a second until the URI is free (or already belongs to the same video).
+	function pickLocalUri(track, artist, seconds) {
+		for (let i = 0; i < 30; i++, seconds++) {
+			const uri = localUri(artist, DUMMY_ALBUM, track.title, seconds);
+			const owner = savedTracks[uri];
+			if (!owner || owner.id === track.id) return { uri, seconds };
+		}
+		throw new Error("too many saved tracks share this title and length");
+	}
+
+	async function saveTrackToPlaylist(track, playlist) {
+		if (!/^[\w-]+$/.test(track.id)) throw new Error(t("badTrackId"));
+		const dir = await getDummyDir(); // first: it needs the user gesture of the click
+		const artist = track.artists.join(", ") || "Unknown";
+		const base = Math.max(1, Math.round((track.durationMs || 180000) / 1000));
+		const { uri: expected, seconds } = pickLocalUri(track, artist, base);
+		notify(t("saving"));
+
+		// The file name does not matter to Spotify (the URI comes from the tags), so the video ID is used.
+		const handle = await dir.getFileHandle(`${track.id}.mp3`, { create: true });
+		const writable = await handle.createWritable();
+		await writable.write(makeSilentMp3({ artist, album: DUMMY_ALBUM, title: track.title, seconds }));
+		await writable.close();
+
+		const uri = await waitForLocalUri(expected, { artist, title: track.title, seconds });
+		if (!uri) throw new Error(t("saveNotIndexed"));
+		await Spicetify.Platform.PlaylistAPI.add(playlist.uri, [uri], { after: "end" });
+		rememberSaved(uri, {
+			provider: track.provider,
+			id: track.id,
+			title: track.title,
+			artists: track.artists,
+			album: track.album,
+			durationMs: track.durationMs,
+			thumbnail: track.thumbnail,
+		});
+		notify(t("savedToPlaylist", playlist.name));
+	}
+
+	// ---- Playlist picker (small popup next to the save button) ----
+	let picker = null;
+
+	function closePicker() {
+		picker?.remove();
+		picker = null;
+		document.removeEventListener("mousedown", onPickerOutside, true);
+		document.removeEventListener("keydown", onPickerKey, true);
+	}
+
+	function onPickerOutside(event) {
+		if (picker && !picker.contains(event.target)) closePicker();
+	}
+
+	function onPickerKey(event) {
+		if (event.key === "Escape") closePicker();
+	}
+
+	// The playlist page that is open right now, if any (works without any internal API).
+	function currentPlaylist() {
+		const match = (Spicetify.Platform.History.location?.pathname || "").match(/^\/playlist\/([A-Za-z0-9]+)/);
+		return match ? { uri: `spotify:playlist:${match[1]}`, name: t("currentPlaylist") } : null;
+	}
+
+	// The user's playlists from the sidebar library, folders flattened. Uses an internal API.
+	async function listPlaylists() {
+		const api = Spicetify.Platform?.RootlistAPI;
+		if (typeof api?.getContents !== "function") return [];
+		const root = await api.getContents();
+		const found = [];
+		const walk = (items) => {
+			for (const item of items ?? []) {
+				if (item.type === "folder") walk(item.items);
+				else if (item.type === "playlist" && item.uri) found.push({ uri: item.uri, name: item.name || item.uri });
+			}
+		};
+		walk(root?.items);
+		return found;
+	}
+
+	async function openPlaylistPicker(track, anchor) {
+		closePicker();
+		const list = h("div", { class: "ss-picker-list" }, h("div", { class: "ss-picker-note" }, t("loadingPlaylists")));
+		const popup = h("div", { class: "ss-picker", role: "menu" }, h("div", { class: "ss-picker-head" }, t("pickPlaylist")), list);
+		picker = popup;
+		document.body.append(popup);
+
+		// Below the button, right edges aligned, kept inside the window
+		const rect = anchor.getBoundingClientRect();
+		popup.style.left = `${Math.max(8, Math.min(window.innerWidth - 288, rect.right - 280))}px`;
+		popup.style.top = `${Math.max(8, Math.min(window.innerHeight - 328, rect.bottom + 4))}px`;
+		document.addEventListener("mousedown", onPickerOutside, true);
+		document.addEventListener("keydown", onPickerKey, true);
+
+		const choose = (playlist) => {
+			closePicker();
+			saveTrackToPlaylist(track, playlist).catch((error) => {
+				if (error?.name === "AbortError") return; // the folder dialog was cancelled
+				console.error("[Synthesis Spicetify] saving failed", error);
+				notify(t("saveFailed", error?.message || error), true);
+			});
+		};
+
+		let playlists = [];
+		try {
+			playlists = await listPlaylists();
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] failed to list playlists", error);
+		}
+		if (picker !== popup) return; // closed while the list was loading
+		const open = currentPlaylist();
+		const entries = open ? [open, ...playlists.filter((playlist) => playlist.uri !== open.uri)] : playlists;
+		list.replaceChildren(
+			...(entries.length
+				? entries.map((playlist) => h("button", { class: "ss-picker-item", title: playlist.name, onClick: () => choose(playlist) }, playlist.name))
+				: [h("div", { class: "ss-picker-note" }, t("noPlaylists"))])
+		);
+	}
+
+	// ---- Playing a placeholder ----
+	function isDummyItem() {
+		const item = Spicetify.Player.data?.item;
+		if (!item?.uri?.startsWith("spotify:local:")) return false;
+		return Boolean(savedTracks[item.uri]) || item.album?.name === DUMMY_ALBUM;
+	}
+
+	// Spotify just started a placeholder. Pause it (keeping its session, so that the playlist can move on
+	// afterwards) and stream the real track instead.
+	async function startFromDummy() {
+		const item = Spicetify.Player.data?.item;
+		const uri = item?.uri;
+		state.suppressUntil = Date.now() + 500; // our own pause must not look like a user action
+		Spicetify.Player.pause();
+		if (!requirePlayback()) return;
+
+		let track = savedTracks[uri];
+		if (!track) {
+			// No stored mapping (for example the extension data was cleared): search by the tags instead.
+			const query = [item.artists?.[0]?.name, item.name].filter(Boolean).join(" ");
+			try {
+				track = (await youtubeSearch(query, 1))[0];
+			} catch (error) {
+				console.warn("[Synthesis Spicetify] placeholder lookup failed", error);
+			}
+			if (!track) {
+				notify(t("playFailed", query), true);
+				return;
+			}
+		}
+		if (Spicetify.Player.data?.item?.uri !== uri) return; // Spotify moved on while we were searching
+
+		state.resumeSpotify = false;
+		state.spotifySnapshot = null;
+		state.viaDummy = true;
+		playTrack({ ...track }, { keepSpotify: true });
+	}
+
+	// ---------------------------------------------------------------------
 	// Spotify player integration
 	// ---------------------------------------------------------------------
 	let lastSpotify = readSpotify();
@@ -1460,6 +1827,12 @@
 		lastSpotify = now;
 		if (!now.uri || now.uri === prev.uri) return;
 		if (Date.now() < state.suppressUntil) return;
+
+		// A saved track's silent placeholder started: stream the real track instead.
+		if (isDummyItem()) {
+			startFromDummy();
+			return;
+		}
 
 		// Same playback context means "next/previous/auto-advance"; a different one means the user
 		// started something else in Spotify.
@@ -1544,6 +1917,13 @@
 		.ss-top-play { display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border: 0; border-radius: 50%; background: var(--essential-bright-accent, #1ed760); color: #000; cursor: pointer; }
 		.ss-top-play:hover { transform: scale(1.06); }
 		.ss-top-play:active { transform: scale(1); filter: brightness(0.7); }
+
+		.ss-picker { position: fixed; z-index: 10000; width: 280px; max-height: 320px; display: flex; flex-direction: column; border-radius: 8px; background: var(--background-elevated-base, #282828); color: var(--text-base, #fff); box-shadow: 0 16px 24px rgba(0, 0, 0, 0.45); overflow: hidden; font-size: 14px; }
+		.ss-picker-head { padding: 10px 12px 6px; font-weight: 700; }
+		.ss-picker-list { overflow-y: auto; padding: 4px; }
+		.ss-picker-item { display: block; width: 100%; text-align: left; border: 0; background: transparent; color: inherit; padding: 8px 10px; border-radius: 4px; cursor: pointer; font: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.ss-picker-item:hover, .ss-picker-item:focus-visible { background: rgba(255, 255, 255, 0.1); outline: none; }
+		.ss-picker-note { padding: 8px 10px; color: var(--text-subdued, #a7a7a7); }
 
 		.ss-mini { position: fixed; left: 16px; bottom: 104px; z-index: 9999; width: 340px; display: none; grid-template-columns: 48px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px; border-radius: 10px; background: var(--background-elevated-base, #242424); color: var(--text-base, #fff); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
 		.ss-mini.ss-visible { display: grid; }
@@ -2149,6 +2529,7 @@
 				{ class: "ss-actions" },
 				canPlay && h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
 				canPlay && h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) }),
+				canPlay && h("button", { class: "ss-btn", title: t("saveToPlaylist"), html: ICONS.savePlaylist, onClick: (event) => openPlaylistPicker(track, event.currentTarget) }),
 				h("button", { class: "ss-btn", title: t("openBrowser"), html: ICONS.external, onClick: () => openInBrowser(track) })
 			),
 			h("div", { class: "ss-dur" }, formatTime(track.durationMs))
@@ -2170,6 +2551,7 @@
 				{ class: "ss-actions" },
 				canPlay && h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
 				canPlay && h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) }),
+				canPlay && h("button", { class: "ss-btn", title: t("saveToPlaylist"), html: ICONS.savePlaylist, onClick: (event) => openPlaylistPicker(track, event.currentTarget) }),
 				h("button", { class: "ss-btn", title: t("openBrowser"), html: ICONS.external, onClick: () => openInBrowser(track) })
 			),
 			canPlay && h("button", { class: "ss-top-play", title: t("play"), html: ICONS.play, onClick: () => playNow(track) })

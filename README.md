@@ -139,6 +139,16 @@ tested on real machines yet.
 Queue behavior: queued YouTube tracks play when Spotify moves to its next track within the same playback context.
 Starting a different playlist or album in Spotify stops the YouTube track.
 
+### Saving tracks to playlists
+
+The playlist button on a result saves the track to one of your Spotify playlists. A Spotify playlist can only hold Spotify tracks and local files, so each saved track is stored as a silent local file, and when Spotify starts it, the extension pauses Spotify and plays the real track from YouTube Music instead.
+
+1. In Spotify's settings, add a folder as a Local Files source.
+2. Click the playlist button on a result and pick a playlist. The first time, choose that same folder in the dialog. It is remembered afterwards; if a permission prompt appears again, allow it.
+3. The track shows up in the playlist with its YouTube title and artist and the album "Synthesis". Playing it streams the real track, and when it ends the playlist moves on to the next item.
+
+Notes: playback must be enabled. The placeholders are local files, so saved tracks only play on the PC that has the folder, not on other devices. If a placeholder file is deleted from the folder, its playlist row becomes unplayable.
+
 ## Settings
 
 Open the profile menu in Spotify and choose "Synthesis Spicetify settings".
@@ -284,6 +294,16 @@ Spotify の Spicetify Marketplace で「Synthesis Spicetify」を検索してイ
 4. YouTube の曲の再生中は、Spotify の再生ボタンがその曲の再生/一時停止になります(Spotify 自体は無音のままです)。次へ/前へは、キュー中の次の YouTube 曲に進み、キューが空なら Spotify に戻ります。
 
 キューの挙動: キューに入れた YouTube の曲は、Spotify が同じ再生コンテキスト内で次の曲に移るタイミングで再生されます。Spotify で別のプレイリストやアルバムを再生し始めると、YouTube の曲は止まります。
+
+### プレイリストに保存する
+
+結果のプレイリストボタンで、曲を Spotify のプレイリストに保存できます。Spotify のプレイリストには Spotify の曲とローカルファイルしか入れられないため、保存した曲は無音のローカルファイル(ダミー曲)として入れます。Spotify がそのダミー曲を再生し始めると、拡張機能が Spotify を一時停止し、代わりに YouTube Music の実際の曲を再生します。
+
+1. Spotify の設定で、ローカルファイルのソースとしてフォルダを追加します。
+2. 結果のプレイリストボタンを押してプレイリストを選びます。初回はダイアログで同じフォルダを選んでください。以降は記憶されます。権限の確認が再び出たら許可してください。
+3. プレイリストには、YouTube の曲名とアーティスト、アルバム「Synthesis」の曲として並びます。再生すると実際の曲が流れ、終わるとプレイリストの次の曲に進みます。
+
+注意: 再生機能が有効である必要があります。ダミー曲はローカルファイルなので、保存した曲はそのフォルダがある PC でだけ再生でき、他のデバイスでは再生できません。フォルダからダミー曲のファイルを消すと、そのプレイリストの行は再生できなくなります。
 
 ## 設定
 
