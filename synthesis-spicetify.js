@@ -1780,11 +1780,12 @@
 			// No stored mapping (for example the extension data was cleared): the title tag is the video ID,
 			// and playback only needs the ID. Display details are missing, so the ID stands in for the title.
 			if (/^[\w-]+$/.test(item.name || "")) {
+				const info = displayInfo.get(item.name);
 				track = {
 					provider: "youtube",
 					id: item.name,
-					title: item.name,
-					artists: [],
+					title: info?.title || item.name,
+					artists: info?.artist ? [info.artist] : [],
 					album: "",
 					durationMs: item.duration?.milliseconds ?? 0,
 					thumbnail: "",
@@ -1810,6 +1811,152 @@
 		state.viaDummy = true;
 		playTrack({ ...track }, { keepSpotify: true });
 	}
+
+	// ---- Showing real names for placeholders ----
+	// The placeholder file only carries the video ID as its title and a fixed artist / album, so Spotify's own
+	// rows (playlists, queue, player bar) would show "dQw4w9WgXcQ / YouTube / Synthesis". Only the DOM text is
+	// rewritten here: nothing is written to the file or to Spotify's data, and the real values live in memory.
+	const VIDEO_ID_RE = /^[\w-]{11}$/;
+	const displayInfo = new Map(); // video ID -> { title, artist, album }
+	const displayFetchedAt = new Map(); // video ID -> time of the last lookup, so a failure is retried only rarely
+
+	function savedById(id) {
+		for (const track of Object.values(savedTracks)) if (track.id === id) return track;
+		return null;
+	}
+
+	// Display details of a placeholder's video ID, or null while they are still being looked up.
+	function lookupDisplay(id) {
+		const known = displayInfo.get(id);
+		if (known) return known;
+		const saved = savedById(id);
+		if (saved?.title) {
+			const info = { title: saved.title, artist: (saved.artists || []).join(", "), album: saved.album || "" };
+			displayInfo.set(id, info);
+			return info;
+		}
+		fetchDisplay(id);
+		return null;
+	}
+
+	// No stored mapping (for example the extension data was cleared): ask YouTube's oEmbed endpoint, which
+	// needs no API key and returns the title and the channel name of any public video.
+	async function fetchDisplay(id) {
+		if (Date.now() - (displayFetchedAt.get(id) || 0) < 60000) return;
+		displayFetchedAt.set(id, Date.now());
+		try {
+			const watch = `https://www.youtube.com/watch?v=${id}`;
+			const res = await curlFetch(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(watch)}`, {
+				method: "GET",
+				headers: { accept: "application/json" },
+			});
+			if (!res.ok) throw new Error(`oEmbed returned HTTP ${res.status}`);
+			const data = await res.json();
+			if (!data?.title) return;
+			// Auto-generated artist channels are called "<artist> - Topic".
+			const artist = String(data.author_name || "").replace(/\s+-\s+Topic$/i, "");
+			displayInfo.set(id, { title: data.title, artist, album: "" });
+			scheduleDisplayRewrite(true);
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] display lookup failed", id, error);
+		}
+	}
+
+	function findTextNode(scope, value) {
+		const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+		for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+			if (node.nodeValue.trim() === value) return node;
+		}
+		return null;
+	}
+
+	function countIdNodes(scope) {
+		const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+		let count = 0;
+		for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+			if (VIDEO_ID_RE.test(node.nodeValue.trim())) count++;
+		}
+		return count;
+	}
+
+	// The element that holds exactly one track: a tracklist row, or else (queue, player bar) the nearest
+	// ancestor that has the fixed artist next to this title and no other ID-like text, so that a list
+	// containing several rows is never mistaken for one track.
+	function findTrackScope(owner) {
+		const row = owner.closest('[data-testid="tracklist-row"], [role="row"]');
+		if (row) return findTextNode(row, DUMMY_ARTIST) ? row : null;
+		let scope = owner;
+		for (let depth = 0; depth < 6 && scope; depth++, scope = scope.parentElement) {
+			if (!findTextNode(scope, DUMMY_ARTIST)) continue;
+			return countIdNodes(scope) === 1 ? scope : null;
+		}
+		return null;
+	}
+
+	// If this text node is a placeholder's title (a video ID next to the fixed artist), swap in the real text.
+	// Only nodeValue is changed, so React keeps owning the node and simply overwrites it when the row is reused.
+	function rewriteTextNode(node) {
+		const id = node.nodeValue?.trim();
+		if (!id || !VIDEO_ID_RE.test(id)) return;
+		const owner = node.parentElement;
+		if (!owner || owner.closest('[class^="ss-"], [class*=" ss-"]')) return;
+
+		const scope = findTrackScope(owner);
+		if (!scope) return;
+		const artistNode = findTextNode(scope, DUMMY_ARTIST);
+		if (!artistNode) return;
+
+		const info = lookupDisplay(id);
+		if (!info) return;
+		node.nodeValue = info.title;
+		if (info.artist) artistNode.nodeValue = info.artist;
+		if (info.album) {
+			const albumNode = findTextNode(scope, DUMMY_ALBUM);
+			if (albumNode) albumNode.nodeValue = info.album;
+		}
+	}
+
+	function rewriteWithin(root) {
+		if (root.nodeType === Node.TEXT_NODE) {
+			rewriteTextNode(root);
+			return;
+		}
+		if (root.nodeType !== Node.ELEMENT_NODE) return;
+		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+		const found = [];
+		for (let node = walker.nextNode(); node; node = walker.nextNode()) found.push(node);
+		for (const node of found) rewriteTextNode(node);
+	}
+
+	const rewriteQueue = new Set();
+	let rewriteScheduled = false;
+	let rewriteAll = false;
+
+	function scheduleDisplayRewrite(everything = false) {
+		if (everything) rewriteAll = true;
+		if (rewriteScheduled) return;
+		rewriteScheduled = true;
+		requestAnimationFrame(() => {
+			rewriteScheduled = false;
+			const nodes = [...rewriteQueue];
+			rewriteQueue.clear();
+			if (rewriteAll) {
+				rewriteAll = false;
+				rewriteWithin(document.body);
+				return;
+			}
+			for (const node of nodes) if (node.isConnected) rewriteWithin(node);
+		});
+	}
+
+	new MutationObserver((mutations) => {
+		for (const mutation of mutations) {
+			if (mutation.type === "characterData") rewriteQueue.add(mutation.target);
+			else for (const node of mutation.addedNodes) rewriteQueue.add(node);
+		}
+		if (rewriteQueue.size) scheduleDisplayRewrite();
+	}).observe(document.body, { childList: true, subtree: true, characterData: true });
+	scheduleDisplayRewrite(true);
 
 	// ---------------------------------------------------------------------
 	// Spotify player integration
