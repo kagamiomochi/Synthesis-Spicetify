@@ -1788,7 +1788,7 @@
 					artists: info?.artist ? [info.artist] : [],
 					album: "",
 					durationMs: item.duration?.milliseconds ?? 0,
-					thumbnail: "",
+					thumbnail: info?.thumbnail || "",
 				};
 			} else {
 				// A placeholder made by an older version: its tags hold the artist and title, so search by them.
@@ -1819,6 +1819,7 @@
 	const VIDEO_ID_RE = /^[\w-]{11}$/;
 	const displayInfo = new Map(); // video ID -> { title, artist, album }
 	const displayFetchedAt = new Map(); // video ID -> time of the last lookup, so a failure is retried only rarely
+	const youtubeThumbnail = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
 
 	function savedById(id) {
 		for (const track of Object.values(savedTracks)) if (track.id === id) return track;
@@ -1831,7 +1832,13 @@
 		if (known) return known;
 		const saved = savedById(id);
 		if (saved?.title) {
-			const info = { title: saved.title, artist: (saved.artists || []).join(", "), album: saved.album || "" };
+			const info = {
+				title: saved.title,
+				artist: (saved.artists || []).join(", "),
+				album: saved.album || "",
+				thumbnail: saved.thumbnail || youtubeThumbnail(id),
+				letterbox: !saved.thumbnail, // YouTube's own thumbnails have black bars above and below the picture
+			};
 			displayInfo.set(id, info);
 			return info;
 		}
@@ -1855,7 +1862,7 @@
 			if (!data?.title) return;
 			// Auto-generated artist channels are called "<artist> - Topic".
 			const artist = String(data.author_name || "").replace(/\s+-\s+Topic$/i, "");
-			displayInfo.set(id, { title: data.title, artist, album: "" });
+			displayInfo.set(id, { title: data.title, artist, album: "", thumbnail: data.thumbnail_url || youtubeThumbnail(id), letterbox: true });
 			scheduleDisplayRewrite(true);
 		} catch (error) {
 			console.warn("[Synthesis Spicetify] display lookup failed", id, error);
@@ -1908,11 +1915,75 @@
 
 		const info = lookupDisplay(id);
 		if (!info) return;
+		const art = placeArt(node, scope, info);
 		node.nodeValue = info.title;
+		rewritten.set(node, { title: info.title, art });
 		if (info.artist) artistNode.nodeValue = info.artist;
 		if (info.album) {
 			const albumNode = findTextNode(scope, DUMMY_ALBUM);
 			if (albumNode) albumNode.nodeValue = info.album;
+		}
+	}
+
+	// ---- Cover art for placeholders ----
+	// Spotify shows a generic icon for a local file. The real cover is laid over that slot as a separate element
+	// (Spotify's own nodes are left alone), and removed again as soon as the row shows something else.
+	const rewritten = new WeakMap(); // rewritten title text node -> { title, art }
+
+	// The cover (or its placeholder icon) that comes before the title inside the same cell.
+	function findCoverSlot(titleNode, scope) {
+		const owner = titleNode.parentElement;
+		const containers = [];
+		const cell = owner.closest('[aria-colindex="2"]');
+		if (cell && scope.contains(cell)) containers.push(cell);
+		else for (let el = owner, depth = 0; el && depth < 4; el = el.parentElement, depth++) {
+			containers.push(el);
+			if (el === scope) break;
+		}
+		for (const container of containers) {
+			for (const el of container.querySelectorAll("img, svg")) {
+				if (el.closest(".ss-art")) continue;
+				if (el.compareDocumentPosition(titleNode) & Node.DOCUMENT_POSITION_FOLLOWING) return el;
+			}
+		}
+		return null;
+	}
+
+	function placeArt(titleNode, scope, info) {
+		if (!info.thumbnail) return null;
+		const el = findCoverSlot(titleNode, scope);
+		if (!el) return null;
+		// An icon is usually wrapped in a tile that has the size of the cover.
+		let slot = el;
+		if (el.tagName.toLowerCase() === "svg" && el.parentElement && !el.parentElement.contains(titleNode)) slot = el.parentElement;
+		const host = slot.parentElement;
+		if (!host) return null;
+		const rect = slot.getBoundingClientRect();
+		if (rect.width < 16 || rect.height < 16) return null;
+		if (getComputedStyle(host).position === "static") host.style.position = "relative";
+		const hostRect = host.getBoundingClientRect();
+		for (const old of host.querySelectorAll(":scope > .ss-art")) old.remove();
+
+		const img = h("img", { alt: "" });
+		loadImage(img, info.thumbnail);
+		const left = rect.left - hostRect.left - host.clientLeft;
+		const top = rect.top - hostRect.top - host.clientTop;
+		const art = h(
+			"div",
+			{ class: info.letterbox ? "ss-art ss-letterbox" : "ss-art", style: `left:${left}px;top:${top}px;width:${rect.width}px;height:${rect.height}px` },
+			img
+		);
+		art._titleNode = titleNode;
+		host.append(art);
+		return art;
+	}
+
+	// Removes covers whose row was reused for another track or has gone away.
+	function sweepArt() {
+		for (const art of document.querySelectorAll(".ss-art")) {
+			const node = art._titleNode;
+			const entry = node && rewritten.get(node);
+			if (!entry || entry.art !== art || !node.isConnected || node.nodeValue !== entry.title) art.remove();
 		}
 	}
 
@@ -1940,6 +2011,7 @@
 			rewriteScheduled = false;
 			const nodes = [...rewriteQueue];
 			rewriteQueue.clear();
+			sweepArt();
 			if (rewriteAll) {
 				rewriteAll = false;
 				rewriteWithin(document.body);
@@ -2046,6 +2118,9 @@
 		.ss-row:hover { background: rgba(128, 128, 128, 0.18); }
 		.ss-cover-wrap { position: relative; width: 40px; height: 40px; }
 		.ss-cover { width: 40px; height: 40px; border-radius: 4px; object-fit: cover; background: rgba(128, 128, 128, 0.3); }
+		.ss-art { position: absolute; z-index: 1; overflow: hidden; border-radius: 4px; background: rgba(128, 128, 128, 0.3); pointer-events: none; }
+		.ss-art img { display: block; width: 100%; height: 100%; object-fit: cover; }
+		.ss-art.ss-letterbox img { transform: scale(1.34); }
 		.ss-cover-play { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; border: 0; border-radius: 4px; background: rgba(0, 0, 0, 0.55); color: #fff; cursor: pointer; }
 		.ss-row:hover .ss-cover-play { display: flex; }
 		.ss-meta { min-width: 0; }
