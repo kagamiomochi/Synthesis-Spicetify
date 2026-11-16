@@ -1470,11 +1470,17 @@
 	// Saving tracks to Spotify playlists (silent local-file placeholders)
 	// ---------------------------------------------------------------------
 	// A Spotify playlist can only hold Spotify items and local files, so a saved track is stored as a silent
-	// MP3 whose tags (artist / "Synthesis" / title) and length give it a unique spotify:local: URI. The MP3 is
+	// MP3 whose tags (artist / "Synthesis" / title) and length give it a unique spotify:local: URI. The tags
+	// carry no song information: the title is only the video ID, the artist a fixed label. The MP3 is
 	// written into a folder that Spotify uses as a Local Files source, the URI is added to the playlist, and
 	// when Spotify starts playing that URI the extension pauses Spotify and streams the real track instead.
 	const SAVED_KEY = "synthesis-spicetify:saved";
 	const DUMMY_ALBUM = "Synthesis"; // album tag of every placeholder, also used to recognise them
+	const DUMMY_ARTIST = "YouTube"; // artist tag of every placeholder (fixed, so no song info is written)
+
+	// The title tag of a placeholder. Only the video ID is written, which is unique per video, so the
+	// playlist row does not reveal the song and the real track can be found again from the ID alone.
+	const placeholderTitle = (track) => track.id;
 	const HANDLE_DB = "synthesis-spicetify";
 
 	function loadSaved() {
@@ -1636,9 +1642,9 @@
 
 	// Two different videos can share artist, title and length. They must not share a URI, so the length
 	// moves up by a second until the URI is free (or already belongs to the same video).
-	function pickLocalUri(track, artist, seconds) {
+	function pickLocalUri(track, seconds) {
 		for (let i = 0; i < 30; i++, seconds++) {
-			const uri = localUri(artist, DUMMY_ALBUM, track.title, seconds);
+			const uri = localUri(DUMMY_ARTIST, DUMMY_ALBUM, placeholderTitle(track), seconds);
 			const owner = savedTracks[uri];
 			if (!owner || owner.id === track.id) return { uri, seconds };
 		}
@@ -1648,18 +1654,18 @@
 	async function saveTrackToPlaylist(track, playlist) {
 		if (!/^[\w-]+$/.test(track.id)) throw new Error(t("badTrackId"));
 		const dir = await getDummyDir(); // first: it needs the user gesture of the click
-		const artist = track.artists.join(", ") || "Unknown";
+		const title = placeholderTitle(track);
 		const base = Math.max(1, Math.round((track.durationMs || 180000) / 1000));
-		const { uri: expected, seconds } = pickLocalUri(track, artist, base);
+		const { uri: expected, seconds } = pickLocalUri(track, base);
 		notify(t("saving"));
 
 		// The file name does not matter to Spotify (the URI comes from the tags), so the video ID is used.
 		const handle = await dir.getFileHandle(`${track.id}.mp3`, { create: true });
 		const writable = await handle.createWritable();
-		await writable.write(makeSilentMp3({ artist, album: DUMMY_ALBUM, title: track.title, seconds }));
+		await writable.write(makeSilentMp3({ artist: DUMMY_ARTIST, album: DUMMY_ALBUM, title, seconds }));
 		await writable.close();
 
-		const uri = await waitForLocalUri(expected, { artist, title: track.title, seconds });
+		const uri = await waitForLocalUri(expected, { artist: DUMMY_ARTIST, title, seconds });
 		if (!uri) throw new Error(t("saveNotIndexed"));
 		await Spicetify.Platform.PlaylistAPI.add(playlist.uri, [uri], { after: "end" });
 		rememberSaved(uri, {
@@ -1771,16 +1777,30 @@
 
 		let track = savedTracks[uri];
 		if (!track) {
-			// No stored mapping (for example the extension data was cleared): search by the tags instead.
-			const query = [item.artists?.[0]?.name, item.name].filter(Boolean).join(" ");
-			try {
-				track = (await youtubeSearch(query, 1))[0];
-			} catch (error) {
-				console.warn("[Synthesis Spicetify] placeholder lookup failed", error);
-			}
-			if (!track) {
-				notify(t("playFailed", query), true);
-				return;
+			// No stored mapping (for example the extension data was cleared): the title tag is the video ID,
+			// and playback only needs the ID. Display details are missing, so the ID stands in for the title.
+			if (/^[\w-]+$/.test(item.name || "")) {
+				track = {
+					provider: "youtube",
+					id: item.name,
+					title: item.name,
+					artists: [],
+					album: "",
+					durationMs: item.duration?.milliseconds ?? 0,
+					thumbnail: "",
+				};
+			} else {
+				// A placeholder made by an older version: its tags hold the artist and title, so search by them.
+				const query = [item.artists?.[0]?.name, item.name].filter(Boolean).join(" ");
+				try {
+					track = (await youtubeSearch(query, 1))[0];
+				} catch (error) {
+					console.warn("[Synthesis Spicetify] placeholder lookup failed", error);
+				}
+				if (!track) {
+					notify(t("playFailed", query), true);
+					return;
+				}
 			}
 		}
 		if (Spicetify.Player.data?.item?.uri !== uri) return; // Spotify moved on while we were searching

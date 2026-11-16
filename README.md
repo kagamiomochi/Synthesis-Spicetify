@@ -102,7 +102,7 @@ The playlist button on a result saves the track to one of your Spotify playlists
 
 1. In Spotify's settings, add a folder as a Local Files source.
 2. Click the playlist button on a result and pick a playlist. The first time, choose that same folder in the dialog. It is remembered afterwards; if a permission prompt appears again, allow it.
-3. The track shows up in the playlist with its YouTube title and artist and the album "Synthesis". Playing it streams the real track, and when it ends the playlist moves on to the next item.
+3. The track shows up in the playlist as the artist "YouTube" and the album "Synthesis", with only its video ID as the title. The placeholder file holds no other song information (the title and thumbnail shown while playing are kept in the extension data, not in the file). Playing it streams the real track, and when it ends the playlist moves on to the next item.
 
 Notes: playback must be enabled. The placeholders are local files, so saved tracks only play on the PC that has the folder, not on other devices. If a placeholder file is deleted from the folder, its playlist row becomes unplayable.
 
@@ -318,7 +318,7 @@ YouTube に弾かれるためです([ローカル Wisp が必要な理由](#ロ�
 
 1. Spotify の設定で、ローカルファイルのソースとしてフォルダを追加します。
 2. 結果のプレイリストボタンを押してプレイリストを選びます。初回はダイアログで同じフォルダを選んでください。以降は記憶されます。権限の確認が再び出たら許可してください。
-3. プレイリストには、YouTube の曲名とアーティスト、アルバム「Synthesis」の曲として並びます。再生すると実際の曲が流れ、終わるとプレイリストの次の曲に進みます。
+3. プレイリストには、アーティスト「YouTube」、アルバム「Synthesis」、曲名が動画 ID だけの曲として並びます。ダミー曲のファイルには、これ以外の曲の情報は入りません(再生中に表示する曲名やサムネイルは、ファイルではなく拡張機能のデータに保存されます)。再生すると実際の曲が流れ、終わるとプレイリストの次の曲に進みます。
 
 注意: 再生機能が有効である必要があります。ダミー曲はローカルファイルなので、保存した曲はそのフォルダがある PC でだけ再生でき、他のデバイスでは再生できません。フォルダからダミー曲のファイルを消すと、そのプレイリストの行は再生できなくなります。
 
