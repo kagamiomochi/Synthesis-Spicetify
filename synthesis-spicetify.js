@@ -1877,11 +1877,22 @@
 		return null;
 	}
 
-	function countIdNodes(scope) {
+	// True inside this extension's own UI. <body> is skipped on purpose: it carries "ss-takeover" while a
+	// non-Spotify track is playing, and that must not count as "inside our UI".
+	function isOwnUi(el) {
+		for (; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+			for (const name of el.classList) if (name.startsWith("ss-")) return true;
+		}
+		return false;
+	}
+
+	// Number of ID-like text nodes in scope, not counting `except` (the title being handled, which may already
+	// have been rewritten when this runs again for a retry).
+	function countIdNodes(scope, except) {
 		const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
 		let count = 0;
 		for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-			if (VIDEO_ID_RE.test(node.nodeValue.trim())) count++;
+			if (node !== except && VIDEO_ID_RE.test(node.nodeValue.trim())) count++;
 		}
 		return count;
 	}
@@ -1889,13 +1900,13 @@
 	// The element that holds exactly one track: a tracklist row, or else (queue, player bar) the nearest
 	// ancestor that has the fixed artist next to this title and no other ID-like text, so that a list
 	// containing several rows is never mistaken for one track.
-	function findTrackScope(owner) {
+	function findTrackScope(owner, titleNode) {
 		const row = owner.closest('[data-testid="tracklist-row"], [role="row"]');
 		if (row) return findTextNode(row, DUMMY_ARTIST) ? row : null;
 		let scope = owner;
 		for (let depth = 0; depth < 6 && scope; depth++, scope = scope.parentElement) {
 			if (!findTextNode(scope, DUMMY_ARTIST)) continue;
-			return countIdNodes(scope) === 1 ? scope : null;
+			return countIdNodes(scope, titleNode) === 0 ? scope : null;
 		}
 		return null;
 	}
@@ -1906,18 +1917,21 @@
 		const id = node.nodeValue?.trim();
 		if (!id || !VIDEO_ID_RE.test(id)) return;
 		const owner = node.parentElement;
-		if (!owner || owner.closest('[class^="ss-"], [class*=" ss-"]')) return;
+		if (!owner || isOwnUi(owner)) return;
 
-		const scope = findTrackScope(owner);
+		const scope = findTrackScope(owner, node);
 		if (!scope) return;
 		const artistNode = findTextNode(scope, DUMMY_ARTIST);
 		if (!artistNode) return;
 
 		const info = lookupDisplay(id);
 		if (!info) return;
-		const art = placeArt(node, scope, info);
+		const entry = { title: info.title, art: placeArt(node, scope, info), scope, info };
 		node.nodeValue = info.title;
-		rewritten.set(node, { title: info.title, art });
+		rewritten.set(node, entry);
+		if (!entry.art) {
+			ART_RETRY_DELAYS.forEach((delay, i) => setTimeout(() => retryArt(node, i === ART_RETRY_DELAYS.length - 1), delay));
+		}
 		if (info.artist) artistNode.nodeValue = info.artist;
 		if (info.album) {
 			const albumNode = findTextNode(scope, DUMMY_ALBUM);
@@ -1930,42 +1944,106 @@
 	// (Spotify's own nodes are left alone), and removed again as soon as the row shows something else.
 	const rewritten = new WeakMap(); // rewritten title text node -> { title, art }
 
-	// The cover (or its placeholder icon) that comes before the title inside the same cell.
+	let artFailReason = ""; // why the last placeArt() call gave up, for the console hint below
+
+	// A cover slot is the cover image itself, or the tile around a placeholder icon.
+	function slotOf(el, titleNode) {
+		const parent = el.parentElement;
+		if (el.tagName.toLowerCase() === "svg" && parent && !parent.contains(titleNode)) return parent;
+		return el;
+	}
+
+	// The biggest cover slot that comes before the title: inside the title's cell in a tracklist row, otherwise
+	// (queue, now playing panel) inside the nearest ancestor that holds only this track. The biggest one wins,
+	// so that small icons next to the cover (buttons, badges) are not mistaken for it.
 	function findCoverSlot(titleNode, scope) {
 		const owner = titleNode.parentElement;
 		const containers = [];
 		const cell = owner.closest('[aria-colindex="2"]');
 		if (cell && scope.contains(cell)) containers.push(cell);
-		else for (let el = owner, depth = 0; el && depth < 4; el = el.parentElement, depth++) {
-			containers.push(el);
-			if (el === scope) break;
+		else {
+			for (let el = owner, depth = 0; el && el !== document.body && depth < 14; el = el.parentElement, depth++) {
+				if (countIdNodes(el, titleNode) !== 0) break;
+				containers.push(el);
+			}
 		}
 		for (const container of containers) {
+			let best = null;
+			let bestArea = 0;
 			for (const el of container.querySelectorAll("img, svg")) {
 				if (el.closest(".ss-art")) continue;
-				if (el.compareDocumentPosition(titleNode) & Node.DOCUMENT_POSITION_FOLLOWING) return el;
+				if (!(el.compareDocumentPosition(titleNode) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+				const slot = slotOf(el, titleNode);
+				const rect = slot.getBoundingClientRect();
+				if (rect.width * rect.height > bestArea) {
+					best = slot;
+					bestArea = rect.width * rect.height;
+				}
 			}
+			if (best) return best;
 		}
 		return null;
 	}
 
+	// URL of the stored cover at about the size it is shown at (YT Music covers accept a size in the URL).
+	function sizedThumbnail(url, cssSize) {
+		const wanted = Math.min(1200, Math.ceil((cssSize * (window.devicePixelRatio || 1)) / 64) * 64);
+		if (/=w\d+-h\d+/.test(url)) return resizeThumbnail(url, Math.max(226, wanted));
+		return url;
+	}
+
+	// A plain YouTube thumbnail is a small picture with black bars. For a big cover, swap in the full-size
+	// frame when YouTube has one (it has no bars, so the crop that hides them is dropped as well).
+	function upgradeYoutubeThumbnail(art, img, url) {
+		const match = /^(https:\/\/i\.ytimg\.com\/vi\/[\w-]{11}\/)\w+\.jpg/.exec(url);
+		if (!match) return;
+		const maxres = `${match[1]}maxresdefault.jpg`;
+		const probe = new Image();
+		probe.onload = () => {
+			// A missing full-size frame comes back as a tiny placeholder picture.
+			if (probe.naturalWidth < 640 || !art.isConnected) return;
+			art.classList.remove("ss-letterbox");
+			loadImage(img, maxres);
+		};
+		probe.src = maxres;
+	}
+
 	function placeArt(titleNode, scope, info) {
-		if (!info.thumbnail) return null;
-		const el = findCoverSlot(titleNode, scope);
-		if (!el) return null;
-		// An icon is usually wrapped in a tile that has the size of the cover.
-		let slot = el;
-		if (el.tagName.toLowerCase() === "svg" && el.parentElement && !el.parentElement.contains(titleNode)) slot = el.parentElement;
+		if (!info.thumbnail) {
+			artFailReason = "no thumbnail URL";
+			return null;
+		}
+		const slot = findCoverSlot(titleNode, scope);
+		if (!slot) {
+			artFailReason = "no cover slot found before the title (or it has no size yet)";
+			return null;
+		}
 		const host = slot.parentElement;
-		if (!host) return null;
-		const rect = slot.getBoundingClientRect();
-		if (rect.width < 16 || rect.height < 16) return null;
+		if (!host) {
+			artFailReason = "cover slot has no parent";
+			return null;
+		}
+		// Drop an old cover first: it may have resized this very slot.
+		for (const old of host.querySelectorAll(":scope > .ss-art")) removeArt(old);
+		let rect = slot.getBoundingClientRect();
+		if (rect.width < 16 || rect.height < 16) {
+			artFailReason = `cover slot too small (${Math.round(rect.width)}x${Math.round(rect.height)})`;
+			return null;
+		}
+		// The now playing panel shows a wide, short box for a local file: make it square so the cover fits.
+		let slotHeight = null;
+		if (rect.width > rect.height * 1.5) {
+			slotHeight = slot.style.height;
+			slot.style.height = `${rect.width}px`;
+			rect = slot.getBoundingClientRect();
+		}
 		if (getComputedStyle(host).position === "static") host.style.position = "relative";
 		const hostRect = host.getBoundingClientRect();
-		for (const old of host.querySelectorAll(":scope > .ss-art")) old.remove();
 
+		// Thumbnails are stored small (226px), which looks blurry in a big cover such as the now playing panel.
+		const size = Math.max(rect.width, rect.height);
 		const img = h("img", { alt: "" });
-		loadImage(img, info.thumbnail);
+		loadImage(img, sizedThumbnail(info.thumbnail, size));
 		const left = rect.left - hostRect.left - host.clientLeft;
 		const top = rect.top - hostRect.top - host.clientTop;
 		const art = h(
@@ -1973,9 +2051,43 @@
 			{ class: info.letterbox ? "ss-art ss-letterbox" : "ss-art", style: `left:${left}px;top:${top}px;width:${rect.width}px;height:${rect.height}px` },
 			img
 		);
+		if (info.letterbox && size * (window.devicePixelRatio || 1) > 240) upgradeYoutubeThumbnail(art, img, info.thumbnail);
 		art._titleNode = titleNode;
+		art._slot = slot;
+		art._slotHeight = slotHeight;
 		host.append(art);
 		return art;
+	}
+
+	// Compact outline of an element (tags, classes, test ids only, no text) for the console hint.
+	function describeNode(el, depth = 0, max = 7) {
+		const attrs = [...el.attributes]
+			.filter((a) => a.name === "class" || a.name === "data-testid" || a.name === "aria-colindex" || a.name === "role")
+			.map((a) => `${a.name}="${a.value.slice(0, 70)}"`)
+			.join(" ");
+		const head = `${"  ".repeat(depth)}<${el.tagName.toLowerCase()}${attrs ? " " + attrs : ""}>`;
+		if (depth >= max) return head;
+		const kids = [...el.children].map((child) => describeNode(child, depth + 1, max)).join("\n");
+		return kids ? `${head}\n${kids}` : head;
+	}
+
+	// The cover often cannot be placed on the first try (the row or panel is not laid out yet), so a few
+	// retries follow the first attempt. The last failure is reported in the console.
+	const ART_RETRY_DELAYS = [120, 350, 800, 1600, 3200];
+
+	function retryArt(node, last) {
+		const entry = rewritten.get(node);
+		if (!entry || entry.art || !node.isConnected || node.nodeValue !== entry.title || !entry.scope.isConnected) return;
+		entry.art = placeArt(node, entry.scope, entry.info);
+		if (entry.art || !last) return;
+		let root = node.parentElement;
+		for (let i = 0; i < 8 && root?.parentElement && root.parentElement !== document.body; i++) root = root.parentElement;
+		console.warn(`[Synthesis Spicetify] cover art not shown: ${artFailReason}\n${describeNode(root).slice(0, 6000)}`);
+	}
+
+	function removeArt(art) {
+		if (art._slotHeight !== null && art._slotHeight !== undefined && art._slot) art._slot.style.height = art._slotHeight;
+		art.remove();
 	}
 
 	// Removes covers whose row was reused for another track or has gone away.
@@ -1983,7 +2095,7 @@
 		for (const art of document.querySelectorAll(".ss-art")) {
 			const node = art._titleNode;
 			const entry = node && rewritten.get(node);
-			if (!entry || entry.art !== art || !node.isConnected || node.nodeValue !== entry.title) art.remove();
+			if (!entry || entry.art !== art || !node.isConnected || node.nodeValue !== entry.title) removeArt(art);
 		}
 	}
 
