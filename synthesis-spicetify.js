@@ -11,11 +11,13 @@
  *  - Audio:    the audio stream is downloaded in ranged chunks and fed to a hidden <audio> through
  *              Media Source Extensions, so playback starts as soon as the first chunk has arrived.
  *              The finished download is kept as a Blob URL cache (also the fallback without MSE).
- *  - Spotify:  search page injection, a virtual queue interleaved with Spotify's own queue,
- *              and Spotify's own player bar, which shows and controls a non-Spotify track while it is active
- *              (a small mini player is only the fallback when the player bar cannot be used).
- *  - Playlists: a saved track is a silent local-file placeholder in a Spotify playlist; when Spotify starts
- *              it, the extension pauses Spotify and streams the real track instead.
+ *  - Spotify:  search page injection, and Spotify's own player bar, which shows and controls a non-Spotify
+ *              track while it is active (a small mini player is only the fallback when the player bar
+ *              cannot be used).
+ *  - Playback: every non-Spotify track goes through a silent local-file placeholder (a spotify:local: item).
+ *              Play, queue and playlist actions hand that placeholder to Spotify's own player, queue and
+ *              playlists. When Spotify starts it, the extension pauses Spotify and streams the real track
+ *              instead, and when the track ends Spotify moves on to whatever follows the placeholder.
  *
  * Both libraries are loaded lazily from jsDelivr (pinned versions) on first use.
  */
@@ -68,9 +70,6 @@
 		clients: ["visionos", "tv_samsung"],
 		resultLimit: 20,
 		prefetchNext: true,
-		// End Spotify's playback session (not just pause) while a non-Spotify track plays, so that
-		// the OS media controls and Discord RPC stop showing the Spotify track. Uses an internal API.
-		stopSpotify: true,
 	};
 
 	const CONFIG_VERSION = 6;
@@ -147,11 +146,6 @@
 			openBrowser: "ブラウザで開く",
 			queueTitle: "Synthesis Spicetify キュー",
 			queueEmpty: "キューは空です。",
-			remove: "削除",
-			clear: "すべて削除",
-			playNow: "今すぐ再生",
-			queueNowPlaying: "Synthesis Spicetify で再生中",
-			queueSynthesisHead: "Synthesis Spicetify のキュー",
 			loading: (p) => `読み込み中 ${Math.round(p * 100)}%`,
 			preparing: "準備中...",
 			addedQueue: "キューに追加しました",
@@ -199,7 +193,9 @@
 			savedToPlaylist: (name) => `「${name}」に保存しました`,
 			saveNotIndexed: "ダミー曲が Spotify のローカルファイルに現れませんでした。選んだフォルダが Spotify の設定でローカルファイルのソースに入っているか確認してください。",
 			saveFailed: (m) => `保存に失敗しました: ${m}`,
-			badTrackId: "この曲は保存できません (IDが不正です)。",
+			badTrackId: "この曲は扱えません (IDが不正です)。",
+			pickFolder: "ダミー曲を置くフォルダを選んでください (Spotify のローカルファイルのソースに追加済みのフォルダ)。",
+			placeholderNotPlayed: "Spotify がダミー曲を再生しませんでした。",
 		},
 		en: {
 			tabSpotify: "Spotify",
@@ -217,11 +213,6 @@
 			openBrowser: "Open in browser",
 			queueTitle: "Synthesis Spicetify queue",
 			queueEmpty: "The queue is empty.",
-			remove: "Remove",
-			clear: "Clear all",
-			playNow: "Play now",
-			queueNowPlaying: "Playing from Synthesis Spicetify",
-			queueSynthesisHead: "Synthesis Spicetify queue",
 			loading: (p) => `Loading ${Math.round(p * 100)}%`,
 			preparing: "Preparing...",
 			addedQueue: "Added to queue",
@@ -269,7 +260,9 @@
 			savedToPlaylist: (name) => `Saved to "${name}"`,
 			saveNotIndexed: "The placeholder did not show up in Spotify's local files. Check that the chosen folder is a local files source in Spotify's settings.",
 			saveFailed: (m) => `Saving failed: ${m}`,
-			badTrackId: "This track cannot be saved (invalid ID).",
+			badTrackId: "This track cannot be used (invalid ID).",
+			pickFolder: "Choose the folder for the placeholder files (it must be a Local Files source in Spotify).",
+			placeholderNotPlayed: "Spotify did not play the placeholder.",
 		},
 	};
 
@@ -814,11 +807,12 @@
 	// Audio cache (Blob URLs)
 	// ---------------------------------------------------------------------
 	const audioCache = new Map(); // key -> { url }
+	let prefetchKey = null; // key of the next placeholder track that is being downloaded ahead of time
 	const inflight = new Map(); // key -> { controller, listeners, promise }
 	const trackKey = (track) => `${track.provider}:${track.id}`;
 
 	function evictCache() {
-		const keep = new Set([state.current && trackKey(state.current), state.queue[0] && trackKey(state.queue[0])].filter(Boolean));
+		const keep = new Set([state.current && trackKey(state.current), prefetchKey].filter(Boolean));
 		for (const key of [...audioCache.keys()]) {
 			if (audioCache.size <= MAX_CACHED_TRACKS) break;
 			if (keep.has(key)) continue;
@@ -900,7 +894,7 @@
 	function abortLoad(track) {
 		if (!track) return;
 		const key = trackKey(track);
-		if (state.queue.some((queued) => trackKey(queued) === key)) return; // still wanted
+		if (key === prefetchKey) return; // still wanted as the next track
 		inflight.get(key)?.controller.abort();
 	}
 
@@ -914,84 +908,36 @@
 		current: null, // active non-Spotify track
 		status: "idle", // idle | loading | playing | paused
 		progress: 0, // download progress while loading (0..1)
-		queue: [], // virtual queue of non-Spotify tracks
-		history: [], // tracks already played from the virtual queue (for the previous button)
-		resumeSpotify: false, // resume Spotify once the virtual queue drains
+		dummyUri: null, // spotify:local: URI of the placeholder Spotify is paused on while our track plays
 		suppressUntil: 0, // ignore Spotify events until this timestamp
-		spotifySnapshot: null, // where Spotify was before its session was stopped ({ uri, ctx, position })
-		viaDummy: false, // the active track was started from a saved placeholder; Spotify stays paused on it
+		advancingUntil: 0, // Spotify is being moved to another item: what it does meanwhile is not a new start
 	};
 	let playToken = 0;
-	let qidCounter = 0;
 
 	function readSpotify() {
-		const data = Spicetify.Player.data;
-		return {
-			uri: data?.item?.uri ?? null,
-			ctx: data?.context?.uri ?? data?.contextUri ?? null,
-		};
+		return { uri: Spicetify.Player.data?.item?.uri ?? null };
 	}
 
-	// Ends Spotify's playback session through the internal context player. Returns false when the
-	// method is unavailable (Spotify update) or throws, so the caller can fall back to a plain pause.
-	function stopSpotifySession() {
-		try {
-			const player = Spicetify.Platform?.PlayerAPI?._contextPlayer;
-			if (typeof player?.stop !== "function") return false;
-			const result = player.stop();
-			if (result && typeof result.catch === "function") result.catch(() => {});
-			return true;
-		} catch (error) {
-			console.warn("[Synthesis Spicetify] failed to stop Spotify session", error);
-			return false;
-		}
-	}
-
-	function pauseSpotify() {
-		if (!Spicetify.Player.isPlaying()) return;
-		state.resumeSpotify = true;
-		const { uri, ctx } = readSpotify();
-		const position = Spicetify.Player.getProgress();
-		Spicetify.Player.pause();
-		if (!config.stopSpotify || !uri) return;
-		state.suppressUntil = Date.now() + 1000;
-		if (stopSpotifySession()) state.spotifySnapshot = { uri, ctx, position };
-	}
-
-	// A stopped session cannot be resumed with play(), so start the saved track again.
-	async function restoreSpotifySession(snapshot) {
-		state.suppressUntil = Date.now() + 3000;
-		try {
-			await Spicetify.Player.playUri(snapshot.ctx || snapshot.uri, {}, { skipTo: { uri: snapshot.uri } });
-			if (snapshot.position > 1000) Spicetify.Player.seek(snapshot.position);
-		} catch (error) {
-			console.warn("[Synthesis Spicetify] failed to restore Spotify session", error);
-			Spicetify.Player.play();
-		}
-		state.suppressUntil = Date.now() + 1000;
-	}
-
-	function resumeSpotifyIfNeeded() {
-		if (!state.resumeSpotify) return;
-		state.resumeSpotify = false;
-		const snapshot = state.spotifySnapshot;
-		state.spotifySnapshot = null;
-		if (snapshot) {
-			restoreSpotifySession(snapshot);
-			return;
-		}
-		state.suppressUntil = Date.now() + 1000;
-		Spicetify.Player.play();
-	}
-
-	// A saved track leaves Spotify paused on its silent placeholder. Move on to whatever follows it in the
-	// playlist instead of restoring the placeholder (which would start the same track again).
-	function advancePastDummy() {
-		Spicetify.Player.next();
+	// Moves Spotify to its next or previous item. Spotify is paused on our placeholder at that point, so a
+	// regular track it lands on has to be started by hand. A placeholder it lands on is picked up by the
+	// songchange handler.
+	function moveSpotify(step) {
+		const before = readSpotify().uri;
+		state.advancingUntil = Date.now() + 1500;
+		if (step === "back") Spicetify.Player.back();
+		else Spicetify.Player.next();
 		setTimeout(() => {
-			// If the next item is a placeholder too, the songchange handler has already taken over.
-			if (state.status === "idle" && !Spicetify.Player.isPlaying()) Spicetify.Player.play();
-		}, 400);
+			if (state.status !== "idle") return; // another placeholder has taken over
+			if (readSpotify().uri === before) {
+				// Spotify could not move (start or end of its context). Going back then restarts the same
+				// placeholder, so restart our track too. Going forward must not, or the last track would
+				// repeat forever; just keep Spotify from playing the silent file.
+				if (step === "back" && isDummyItem()) startFromDummy();
+				else if (Spicetify.Player.isPlaying() && isDummyItem()) Spicetify.Player.pause();
+				return;
+			}
+			if (!Spicetify.Player.isPlaying()) Spicetify.Player.play();
+		}, 500);
 	}
 
 	// ---------------------------------------------------------------------
@@ -1183,7 +1129,7 @@
 					// The download died after playback had started: nothing more will arrive.
 					if (token !== playToken || error?.name === "AbortError") return;
 					notify(t("playFailed", error?.message || error), true);
-					playNextFromQueue();
+					stopYT(true);
 				}
 			);
 		});
@@ -1262,24 +1208,18 @@
 		}
 	}
 
-	async function playTrack(track, { fromHistory = false, keepSpotify = false } = {}) {
+	// Streams the real track. Only called once Spotify has started a placeholder (see startFromDummy), and
+	// Spotify has already been paused on it by then.
+	async function playTrack(track) {
 		const token = ++playToken;
 		const previous = state.current;
-		const previousStatus = state.status;
-		if (previous && previousStatus === "loading") abortLoad(previous);
-		// Remember tracks that actually played, so that the previous button can go back to them.
-		if (previous && !fromHistory && (previousStatus === "playing" || previousStatus === "paused")) {
-			state.history.push(previous);
-			if (state.history.length > 20) state.history.shift();
-		}
+		if (previous && state.status === "loading") abortLoad(previous);
 
 		detachStream();
 		audio.pause();
 		state.current = track;
 		state.status = "loading";
 		state.progress = 0;
-		// A placeholder track is paused by the caller and must keep its Spotify session (see startFromDummy).
-		if (!keepSpotify) pauseSpotify();
 		renderMini();
 
 		try {
@@ -1316,30 +1256,35 @@
 			state.status = "playing";
 			updateMediaSession(track);
 			renderMini();
-			if (config.prefetchNext && state.queue[0]) {
-				getAudioUrl(state.queue[0]).catch(() => {});
-			}
+			prefetchNext();
 		} catch (error) {
 			if (token !== playToken || error?.name === "AbortError") return;
 			console.error("[Synthesis Spicetify] playback failed", error);
 			notify(t("playFailed", error?.message || error), true);
-			playNextFromQueue();
-		}
-	}
-
-	function playNextFromQueue() {
-		const next = state.queue.shift();
-		renderQueueSection();
-		if (next) {
-			playTrack(next);
-		} else {
 			stopYT(true);
 		}
 	}
 
-	function stopYT(resumeSpotify) {
-		const viaDummy = state.viaDummy;
-		state.viaDummy = false;
+	// Downloads the next item of Spotify's queue ahead of time when it is one of our placeholders, so that
+	// it starts without a wait. The queue API is internal, so this is best effort only.
+	function prefetchNext() {
+		prefetchKey = null;
+		if (!config.prefetchNext) return;
+		try {
+			const entry = Spicetify.Queue?.nextTracks?.[0];
+			const uri = entry?.contextTrack?.uri ?? entry?.uri;
+			const track = uri && (dummyTracks.get(uri) ?? savedTracks[uri]);
+			if (!track) return;
+			prefetchKey = trackKey(track);
+			getAudioUrl(track).catch(() => {});
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] prefetch skipped", error);
+		}
+	}
+
+	// Stops our track. With `advance`, Spotify then moves on to whatever follows the placeholder it is
+	// paused on (the end of a track, the next button, or a failure); without it Spotify stays where it is.
+	function stopYT(advance) {
 		playToken++;
 		abortLoad(state.current);
 		detachStream();
@@ -1349,15 +1294,9 @@
 		state.current = null;
 		state.status = "idle";
 		state.progress = 0;
-		state.history.length = 0;
+		state.dummyUri = null;
 		renderMini();
-		if (resumeSpotify) {
-			if (viaDummy) advancePastDummy();
-			else resumeSpotifyIfNeeded();
-		} else {
-			state.resumeSpotify = false;
-			state.spotifySnapshot = null;
-		}
+		if (advance) moveSpotify("next");
 	}
 
 	function toggleYT() {
@@ -1373,44 +1312,18 @@
 
 	// Next button of Spotify's player bar while a non-Spotify track is active.
 	function skipNext() {
-		if (state.queue.length) {
-			playNextFromQueue();
-			return;
-		}
-		if (state.viaDummy) {
-			stopYT(true); // moves Spotify on to whatever follows the placeholder
-			return;
-		}
-		// The virtual queue is empty: hand control back to Spotify and skip to its next track.
-		const wasPlaying = state.resumeSpotify;
-		const snapshot = state.spotifySnapshot;
-		stopYT(false);
-		if (snapshot) {
-			// The session was stopped: bring the saved track back, then skip it.
-			restoreSpotifySession(snapshot).then(() => {
-				Spicetify.Player.next();
-			});
-			return;
-		}
-		Spicetify.Player.next();
-		if (wasPlaying) {
-			setTimeout(() => {
-				if (!Spicetify.Player.isPlaying()) Spicetify.Player.play();
-			}, 400);
-		}
+		stopYT(true);
 	}
 
-	// Previous button of Spotify's player bar: restart the track, or go back to the one before it.
+	// Previous button of Spotify's player bar: restart the track, or go back to the item before it.
 	function skipPrev() {
 		if (state.status === "loading") return;
-		if (audio.currentTime > 3 || !state.history.length) {
+		if (audio.currentTime > 3) {
 			seekAudio(0);
 			return;
 		}
-		const previous = state.history.pop();
-		if (state.current) state.queue.unshift({ ...state.current, qid: ++qidCounter });
-		playTrack(previous, { fromHistory: true });
-		renderQueueSection();
+		stopYT(false);
+		moveSpotify("back");
 	}
 
 	function requirePlayback() {
@@ -1419,33 +1332,124 @@
 		return false;
 	}
 
-	function addToQueue(track, { next = false } = {}) {
-		if (!requirePlayback()) return;
-		const entry = { ...track, qid: ++qidCounter };
-		if (next) state.queue.unshift(entry);
-		else state.queue.push(entry);
-		renderQueueSection();
-
-		// Nothing is playing at all: start right away instead of leaving the track stranded.
-		if (state.status === "idle" && !Spicetify.Player.isPlaying()) {
-			playNextFromQueue();
-			return;
-		}
-		notify(next ? t("addedNext") : t("addedQueue"));
-		if (config.prefetchNext && state.queue[0]) getAudioUrl(state.queue[0]).catch(() => {});
+	function reportPlaceholderError(error) {
+		if (error?.name === "AbortError") return; // the folder dialog was cancelled
+		console.error("[Synthesis Spicetify] could not hand the track to Spotify", error);
+		notify(t("playFailed", error?.message || error), true);
 	}
 
-	function playNow(track) {
+	// True once Spotify's current item is the placeholder. Spotify may spell a local file's URI differently from
+	// the local files index, so the tags (title = video ID, album "Synthesis") count as well.
+	async function waitForSpotifyItem(uri, id, timeoutMs) {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			const item = Spicetify.Player.data?.item;
+			if (item?.uri === uri) return true;
+			if (item?.uri?.startsWith("spotify:local:") && item.name === id && item.album?.name === DUMMY_ALBUM) return true;
+			await sleep(100);
+		}
+		return false;
+	}
+
+	const LOCAL_FILES_CONTEXT = "spotify:local-files"; // the playback context Spotify uses for local files
+
+	// Plays a placeholder in Spotify's own player. The songchange handler then takes over and streams the
+	// real track (see startFromDummy).
+	async function playPlaceholder(uri, id) {
+		// A local file can only be played inside the Local Files context, so start that context at the placeholder.
+		for (const attempt of [
+			() => Spicetify.Player.playUri(LOCAL_FILES_CONTEXT, {}, { skipTo: { uri } }),
+			() => Spicetify.Player.playUri(uri),
+		]) {
+			try {
+				await attempt();
+			} catch (error) {
+				console.warn("[Synthesis Spicetify] could not start the placeholder", error);
+			}
+			if (await waitForSpotifyItem(uri, id, 2000)) return;
+		}
+		console.warn("[Synthesis Spicetify] Spotify did not switch to the placeholder", { expected: uri, current: Spicetify.Player.data?.item?.uri });
+		// Spotify did not switch. Put the placeholder at the front of the queue and skip to it instead.
+		// (Both fail without an active Spotify session, which is reported below.)
+		try {
+			await queuePlaceholder(uri, true);
+			await Spicetify.Player.next();
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] queue fallback failed", error);
+		}
+		if (await waitForSpotifyItem(uri, id, 2000)) return;
+		throw new Error(t("placeholderNotPlayed"));
+	}
+
+	// Adds a placeholder to Spotify's own queue, at the front (play next) or at the end. Resolves with true
+	// when it ended up at the front. These queue calls are internal APIs.
+	async function queuePlaceholder(uri, next) {
+		const api = Spicetify.Platform?.PlayerAPI;
+		const items = [{ uri }];
+		const addToEnd = () => (typeof api?.addToQueue === "function" ? api.addToQueue(items) : Spicetify.addToQueue(items));
+		const upcoming = Spicetify.Queue?.nextTracks;
+		if (!next || !Array.isArray(upcoming)) {
+			await addToEnd();
+			return false;
+		}
+		const first = upcoming[0]?.contextTrack;
+		if (!first?.uri) {
+			await addToEnd(); // nothing follows yet, so the end is also the front
+			return true;
+		}
+		if (typeof api?.insertIntoQueue === "function") {
+			try {
+				await api.insertIntoQueue(items, { before: { uri: first.uri, uid: first.uid } });
+				return true;
+			} catch (error) {
+				console.warn("[Synthesis Spicetify] could not insert at the front of the queue", error);
+			}
+		}
+		await addToEnd();
+		return false;
+	}
+
+	async function playNow(track) {
 		if (!requirePlayback()) return;
-		playTrack({ ...track });
+		// The same track is already active: restart it instead of asking Spotify to play its placeholder
+		// again, which would look like a press of the play/pause button.
+		if (state.current && trackKey(state.current) === trackKey(track) && state.status !== "idle") {
+			seekAudio(0);
+			if (state.status === "paused") toggleYT();
+			return;
+		}
+		try {
+			// Nothing may be awaited before this: choosing the placeholder folder needs the click's user gesture.
+			const uri = await ensurePlaceholder(track, t("preparing"));
+			await playPlaceholder(uri, track.id);
+		} catch (error) {
+			reportPlaceholderError(error);
+		}
+	}
+
+	async function addToQueue(track, { next = false } = {}) {
+		if (!requirePlayback()) return;
+		try {
+			const uri = await ensurePlaceholder(track, t("preparing"));
+			// Nothing is playing at all: there is no queue to add to, so start right away.
+			if (!readSpotify().uri && state.status === "idle") {
+				await playPlaceholder(uri, track.id);
+				return;
+			}
+			const placedNext = await queuePlaceholder(uri, next);
+			notify(t(placedNext ? "addedNext" : "addedQueue"));
+			if (state.status !== "idle") setTimeout(prefetchNext, 800); // the queue needs a moment to update
+		} catch (error) {
+			reportPlaceholderError(error);
+		}
 	}
 
 	// Audio element events
-	audio.addEventListener("ended", () => playNextFromQueue());
+	audio.addEventListener("ended", () => stopYT(true));
 	audio.addEventListener("error", () => {
 		if (!audio.getAttribute("src")) return;
 		notify(t("playFailed", audio.error?.message || "media error"), true);
-		playNextFromQueue();
+		stopYT(true);
 	});
 	audio.addEventListener("timeupdate", () => {
 		activeStream?.sink.poke();
@@ -1467,13 +1471,14 @@
 	}, 500);
 
 	// ---------------------------------------------------------------------
-	// Saving tracks to Spotify playlists (silent local-file placeholders)
+	// Placeholders (silent local files) for playing, queueing and saving tracks
 	// ---------------------------------------------------------------------
-	// A Spotify playlist can only hold Spotify items and local files, so a saved track is stored as a silent
-	// MP3 whose tags (artist / "Synthesis" / title) and length give it a unique spotify:local: URI. The tags
-	// carry no song information: the title is only the video ID, the artist a fixed label. The MP3 is
-	// written into a folder that Spotify uses as a Local Files source, the URI is added to the playlist, and
-	// when Spotify starts playing that URI the extension pauses Spotify and streams the real track instead.
+	// Spotify's player, queue and playlists can only hold Spotify items and local files, so every track of
+	// another service is represented by a silent MP3 whose tags (artist / "Synthesis" / title) and length
+	// give it a unique spotify:local: URI. The tags carry no song information: the title is only the video
+	// ID, the artist a fixed label. The MP3 is written into a folder that Spotify uses as a Local Files
+	// source and the URI is handed to Spotify: played, added to its queue, or added to a playlist. When
+	// Spotify starts playing that URI the extension pauses Spotify and streams the real track instead.
 	const SAVED_KEY = "synthesis-spicetify:saved";
 	const DUMMY_ALBUM = "Synthesis"; // album tag of every placeholder, also used to recognise them
 	const DUMMY_ARTIST = "YouTube"; // artist tag of every placeholder (fixed, so no song info is written)
@@ -1491,7 +1496,9 @@
 		}
 	}
 
-	const savedTracks = loadSaved(); // spotify:local: URI -> track
+	const savedTracks = loadSaved(); // spotify:local: URI -> track (saved to a playlist, kept in localStorage)
+	const dummyTracks = new Map(); // spotify:local: URI -> track (made for playing or queueing, memory only)
+	const placeholderJobs = new Map(); // video ID -> promise of a placeholder that is being made
 
 	function rememberSaved(uri, track) {
 		savedTracks[uri] = track;
@@ -1604,6 +1611,7 @@
 		} catch (error) {
 			console.warn("[Synthesis Spicetify] stored folder is not usable", error);
 		}
+		notify(t("pickFolder"));
 		dir = await window.showDirectoryPicker({ id: "synthesis-saved", mode: "readwrite" });
 		try {
 			await handleStore("readwrite", (store) => store.put(dir, "dir"));
@@ -1651,22 +1659,84 @@
 		throw new Error("too many saved tracks share this title and length");
 	}
 
-	async function saveTrackToPlaylist(track, playlist) {
-		if (!/^[\w-]+$/.test(track.id)) throw new Error(t("badTrackId"));
-		const dir = await getDummyDir(); // first: it needs the user gesture of the click
+	// The URI Spotify's local file index uses for a placeholder, or null while it is not listed (or the index
+	// cannot be read).
+	async function findIndexedUri(expected) {
+		const api = Spicetify.Platform?.LocalFilesAPI;
+		if (typeof api?.getTracks !== "function") return null;
+		try {
+			const tracks = (await api.getTracks()) ?? [];
+			return tracks.find((track) => track.uri === expected)?.uri ?? null;
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] local files index not readable", error);
+			return null;
+		}
+	}
+
+	// A video that already has a placeholder keeps its length, so that it keeps its URI even when a later
+	// search reports a slightly different duration.
+	function knownSeconds(id) {
+		let uri = null;
+		for (const [key, track] of dummyTracks) if (track.id === id) uri = key;
+		uri ??= Object.keys(savedTracks).find((key) => savedTracks[key].id === id) ?? null;
+		const seconds = uri ? Number(uri.split(":").pop()) : NaN;
+		return seconds > 0 ? seconds : null;
+	}
+
+	async function makePlaceholder(track, busyText) {
 		const title = placeholderTitle(track);
 		const base = Math.max(1, Math.round((track.durationMs || 180000) / 1000));
-		const { uri: expected, seconds } = pickLocalUri(track, base);
-		notify(t("saving"));
+		const { uri: expected, seconds } = pickLocalUri(track, knownSeconds(track.id) ?? base);
 
-		// The file name does not matter to Spotify (the URI comes from the tags), so the video ID is used.
-		const handle = await dir.getFileHandle(`${track.id}.mp3`, { create: true });
-		const writable = await handle.createWritable();
-		await writable.write(makeSilentMp3({ artist: DUMMY_ARTIST, album: DUMMY_ALBUM, title, seconds }));
-		await writable.close();
+		// A placeholder that Spotify already lists is reused as it is. No file access is needed then.
+		let uri = await findIndexedUri(expected);
+		if (!uri) {
+			if (busyText) notify(busyText);
+			const dir = await getDummyDir();
+			// The file name does not matter to Spotify (the URI comes from the tags). Including the length
+			// keeps two placeholders of the same video, if there ever are two, in separate files.
+			const handle = await dir.getFileHandle(`${track.id}-${seconds}.mp3`, { create: true });
+			const writable = await handle.createWritable();
+			await writable.write(makeSilentMp3({ artist: DUMMY_ARTIST, album: DUMMY_ALBUM, title, seconds }));
+			await writable.close();
+			uri = await waitForLocalUri(expected, { artist: DUMMY_ARTIST, title, seconds });
+			if (!uri) throw new Error(t("saveNotIndexed"));
+		}
 
-		const uri = await waitForLocalUri(expected, { artist: DUMMY_ARTIST, title, seconds });
-		if (!uri) throw new Error(t("saveNotIndexed"));
+		dummyTracks.set(uri, {
+			provider: track.provider,
+			id: track.id,
+			title: track.title,
+			artists: track.artists,
+			album: track.album,
+			durationMs: track.durationMs,
+			thumbnail: track.thumbnail,
+		});
+		// Spotify's rows for the placeholder can show the real text and cover art right away.
+		displayInfo.set(track.id, {
+			title: track.title,
+			artist: (track.artists || []).join(", "),
+			album: track.album || "",
+			thumbnail: track.thumbnail || youtubeThumbnail(track.id),
+			letterbox: !track.thumbnail, // YouTube's own thumbnails have black bars above and below the picture
+		});
+		return uri;
+	}
+
+	// Returns the spotify:local: URI of the track's placeholder, making the file when needed. Call it from a
+	// click handler without awaiting anything first: the folder dialog needs the click's user gesture.
+	function ensurePlaceholder(track, busyText) {
+		if (!/^[\w-]+$/.test(track.id)) return Promise.reject(new Error(t("badTrackId")));
+		let job = placeholderJobs.get(track.id);
+		if (!job) {
+			job = makePlaceholder(track, busyText).finally(() => placeholderJobs.delete(track.id));
+			placeholderJobs.set(track.id, job);
+		}
+		return job;
+	}
+
+	async function saveTrackToPlaylist(track, playlist) {
+		const uri = await ensurePlaceholder(track, t("saving"));
 		await Spicetify.Platform.PlaylistAPI.add(playlist.uri, [uri], { after: "end" });
 		rememberSaved(uri, {
 			provider: track.provider,
@@ -1766,16 +1836,17 @@
 		return Boolean(savedTracks[item.uri]) || item.album?.name === DUMMY_ALBUM;
 	}
 
-	// Spotify just started a placeholder. Pause it (keeping its session, so that the playlist can move on
-	// afterwards) and stream the real track instead.
+	// Spotify just started a placeholder. Pause it (keeping its session, so that the queue or playlist can
+	// move on afterwards) and stream the real track instead.
 	async function startFromDummy() {
 		const item = Spicetify.Player.data?.item;
 		const uri = item?.uri;
+		if (!uri || (state.status !== "idle" && uri === state.dummyUri)) return; // already handling it
 		state.suppressUntil = Date.now() + 500; // our own pause must not look like a user action
 		Spicetify.Player.pause();
 		if (!requirePlayback()) return;
 
-		let track = savedTracks[uri];
+		let track = savedTracks[uri] ?? dummyTracks.get(uri);
 		if (!track) {
 			// No stored mapping (for example the extension data was cleared): the title tag is the video ID,
 			// and playback only needs the ID. Display details are missing, so the ID stands in for the title.
@@ -1806,10 +1877,8 @@
 		}
 		if (Spicetify.Player.data?.item?.uri !== uri) return; // Spotify moved on while we were searching
 
-		state.resumeSpotify = false;
-		state.spotifySnapshot = null;
-		state.viaDummy = true;
-		playTrack({ ...track }, { keepSpotify: true });
+		state.dummyUri = uri;
+		playTrack({ ...track });
 	}
 
 	// ---- Showing real names for placeholders ----
@@ -2147,29 +2216,29 @@
 	// ---------------------------------------------------------------------
 	let lastSpotify = readSpotify();
 
-	Spicetify.Player.addEventListener("onplaypause", () => {
-		const playing = Spicetify.Player.isPlaying();
-		if (Date.now() < state.suppressUntil) return;
+	// Spotify is playing a placeholder that none of our tracks belongs to yet (it was started again after
+	// our track had been stopped, or an event was missed): stream the real track.
+	function reconcilePlaceholder() {
+		const now = Date.now();
+		if (now < state.suppressUntil || now < state.advancingUntil) return;
+		if (!Spicetify.Player.isPlaying() || !isDummyItem()) return;
+		if (state.status !== "idle" && readSpotify().uri === state.dummyUri) return;
+		startFromDummy();
+	}
 
-		if (playing) {
-			// Spotify's play button was pressed while a non-Spotify track is active:
+	Spicetify.Player.addEventListener("onplaypause", () => {
+		if (!Spicetify.Player.isPlaying() || Date.now() < state.suppressUntil) return;
+		if (state.status !== "idle") {
+			// Spotify's play button (or a media key) was pressed while a non-Spotify track is active:
 			// keep Spotify silent and use the button as play/pause for our track.
-			if (state.status !== "idle") {
+			if (readSpotify().uri === state.dummyUri || !isDummyItem()) {
 				state.suppressUntil = Date.now() + 300;
 				Spicetify.Player.pause();
 				toggleYT();
-			}
-			return;
-		}
-
-		// Spotify stopped at the very end of its last track: continue with our queue.
-		if (state.status === "idle" && state.queue.length) {
-			const remaining = Spicetify.Player.getDuration() - Spicetify.Player.getProgress();
-			if (Spicetify.Player.getDuration() > 0 && remaining < 1500) {
-				state.resumeSpotify = false;
-				playNextFromQueue();
+				return;
 			}
 		}
+		reconcilePlaceholder();
 	});
 
 	Spicetify.Player.addEventListener("songchange", () => {
@@ -2179,37 +2248,19 @@
 		if (!now.uri || now.uri === prev.uri) return;
 		if (Date.now() < state.suppressUntil) return;
 
-		// A saved track's silent placeholder started: stream the real track instead.
+		// One of our placeholders started: stream the real track instead.
 		if (isDummyItem()) {
 			startFromDummy();
 			return;
 		}
 
-		// Same playback context means "next/previous/auto-advance"; a different one means the user
-		// started something else in Spotify.
-		const advance = Boolean(prev.uri) && prev.ctx === now.ctx;
-
-		if (state.status !== "idle") {
-			if (!advance) {
-				stopYT(false);
-			} else if (state.queue.length) {
-				state.suppressUntil = Date.now() + 300;
-				Spicetify.Player.pause();
-				playNextFromQueue();
-			} else {
-				stopYT(false); // Spotify already started the new track
-			}
-			return;
-		}
-
-		if (advance && state.queue.length) {
-			// Queued non-Spotify tracks play between the finished Spotify track and the next one.
-			state.suppressUntil = Date.now() + 300;
-			state.resumeSpotify = true;
-			Spicetify.Player.pause();
-			playNextFromQueue();
-		}
+		// Spotify moved on to a regular track, or the user started something else: our track is over.
+		if (state.status !== "idle") stopYT(false);
 	});
+
+	// Safety net: events are ignored while our own pause is settling, so a placeholder that Spotify lands on
+	// in that moment would otherwise play as silence.
+	setInterval(reconcilePlaceholder, 700);
 
 	// ---------------------------------------------------------------------
 	// Styles
@@ -2321,20 +2372,6 @@
 		.ss-takeover [data-ss-host]:hover > .ss-pp-icon { transform: scale(1.06); }
 		.ss-takeover [data-ss-host]:active > .ss-pp-icon { transform: scale(1); filter: brightness(0.7); }
 
-		.ss-queue-block { display: flex; flex-direction: column; gap: 0; padding: 0 0 8px; box-sizing: border-box; }
-		/* Rows look like Spotify's own queue rows: 48px cover, 16px title, 14px subtitle, hover highlight bleeding 8px outwards */
-		.ss-queue-block .ss-row { grid-template-columns: 48px minmax(0, 1fr) auto; gap: 12px; margin: 0 -8px; padding: 8px; border-radius: 4px; }
-		.ss-queue-block .ss-row:hover, .ss-queue-block .ss-row:focus-within { background: rgba(255, 255, 255, 0.1); }
-		.ss-queue-block .ss-cover-wrap, .ss-queue-block .ss-cover { width: 48px; height: 48px; }
-		.ss-queue-block .ss-cover-play { background: rgba(0, 0, 0, 0.5); }
-		.ss-queue-block .ss-row:focus-within .ss-cover-play { display: flex; }
-		.ss-queue-block .ss-title { font-size: 16px; line-height: 24px; }
-		.ss-queue-block .ss-sub { font-size: 14px; line-height: 20px; }
-		.ss-queue-block .ss-row.ss-current .ss-title { color: var(--text-bright-accent, var(--essential-bright-accent, #1ed760)); }
-		.ss-queue-block .ss-actions { opacity: 0; }
-		.ss-queue-block .ss-row:hover .ss-actions, .ss-queue-block .ss-row:focus-within .ss-actions { opacity: 1; }
-		.ss-queue-block .ss-link { align-self: flex-start; margin: 8px 0 0; font-size: 14px; }
-		.ss-queue-head { margin: 16px 0 8px; font-size: 16px; line-height: 24px; font-weight: 700; color: var(--text-base, #fff); }
 		.ss-settings label { display: block; margin: 12px 0 4px; font-size: 13px; color: var(--text-subdued, #a7a7a7); }
 		.ss-settings textarea, .ss-settings input[type="text"] { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 6px; border: 1px solid rgba(128, 128, 128, 0.5); background: rgba(128, 128, 128, 0.15); color: var(--text-base, #fff); font-family: monospace; font-size: 12px; }
 		.ss-settings .ss-buttons { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
@@ -2407,8 +2444,8 @@
 			if (duration > 0) seekAudio((Number(seek.value) / 1000) * duration);
 		});
 		const toggle = h("button", { class: "ss-btn", onClick: toggleYT });
-		const next = h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.next, onClick: playNextFromQueue });
-		const close = h("button", { class: "ss-btn", html: ICONS.close, onClick: () => stopYT(true) });
+		const next = h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.next, onClick: skipNext });
+		const close = h("button", { class: "ss-btn", html: ICONS.close, onClick: () => stopYT(false) });
 		const root = h(
 			"div",
 			{ class: "ss-mini" },
@@ -2690,144 +2727,6 @@
 		},
 		true
 	);
-
-	// ---------------------------------------------------------------------
-	// Queue (injected into Spotify's own queue page)
-	// ---------------------------------------------------------------------
-	function renderQueueRow(track, index) {
-		const img = h("img", { class: "ss-cover", alt: "" });
-		loadImage(img, track.thumbnail);
-		const playHere = () => {
-			state.queue.splice(index, 1);
-			playTrack(track);
-			renderQueueSection();
-		};
-		return h(
-			"div",
-			{ class: "ss-row", onDblclick: playHere },
-			h("div", { class: "ss-cover-wrap" }, img, h("button", { class: "ss-cover-play", title: t("playNow"), html: ICONS.play, onClick: playHere })),
-			h("div", { class: "ss-meta" }, h("div", { class: "ss-title" }, track.title), h("div", { class: "ss-sub" }, track.artists.join(", "))),
-			h(
-				"div",
-				{ class: "ss-actions" },
-				h("button", {
-					class: "ss-btn",
-					title: t("remove"),
-					html: ICONS.close,
-					onClick: () => {
-						state.queue.splice(index, 1);
-						renderQueueSection();
-					},
-				})
-			)
-		);
-	}
-
-	// Read-only row for the Synthesis track that is currently playing.
-	function renderStaticRow(track) {
-		const img = h("img", { class: "ss-cover", alt: "" });
-		loadImage(img, track.thumbnail);
-		return h(
-			"div",
-			{ class: "ss-row ss-current" },
-			h("div", { class: "ss-cover-wrap" }, img),
-			h("div", { class: "ss-meta" }, h("div", { class: "ss-title" }, track.title), h("div", { class: "ss-sub" }, track.artists.join(", "))),
-			h("div", { class: "ss-actions" })
-		);
-	}
-
-	const queuePanel = { active: false, block: null };
-	const QUEUE_BUTTON = '[data-testid="control-button-queue"]';
-
-	// The queue lives in the right-hand panel; it is open while the queue button is pressed.
-	function isQueueOpen() {
-		return document.querySelector(QUEUE_BUTTON)?.getAttribute("aria-pressed") === "true";
-	}
-
-	// Section headings of Spotify's own queue ("Now playing", "Next in queue", ...), used as anchors.
-	// Nothing here depends on obfuscated class names, except the stable "tab-panel" fragment of the panel.
-	function findQueueHeadings() {
-		const usable = (el) => !el.closest(".ss-queue-block");
-		const headings = [...document.querySelectorAll('[class*="tab-panel"] h2')].filter(usable);
-		if (!headings.length) return [];
-		const panel = headings[0].closest('[class*="tab-panel"]');
-		return headings.filter((el) => panel.contains(el));
-	}
-
-	// Rebuild our block for Spotify's queue panel: the active Synthesis track and the virtual queue.
-	function renderQueueSection() {
-		if (!queuePanel.active) return;
-		if (!queuePanel.block) queuePanel.block = h("div", { class: "ss-queue-block" });
-		const children = [];
-		if (state.current) children.push(h("div", { class: "ss-queue-head" }, t("queueNowPlaying")), renderStaticRow(state.current));
-		if (state.queue.length) {
-			children.push(
-				h("div", { class: "ss-queue-head" }, t("queueSynthesisHead")),
-				...state.queue.map(renderQueueRow),
-				h("button", { class: "ss-link", onClick: () => { state.queue.length = 0; renderQueueSection(); } }, t("clear"))
-			);
-		}
-		queuePanel.block.replaceChildren(...children);
-		attachQueueSection();
-	}
-
-	// While Spotify is the active player the block goes between the "Now playing" and "Next in queue"
-	// sections (the order in which tracks play); while a Synthesis track is active it goes first.
-	function attachQueueSection() {
-		const block = queuePanel.block;
-		if (!block) return;
-		if (!queuePanel.active || !block.childElementCount) {
-			block.remove();
-			return;
-		}
-		const headings = findQueueHeadings();
-
-		let parent = null;
-		let before = null; // insert before this node; null means append to parent
-
-		if (headings.length >= 2) {
-			// The lowest common ancestor of the first two headings holds the queue's sections.
-			parent = headings[0];
-			while (parent && !parent.contains(headings[1])) parent = parent.parentElement;
-			if (parent) {
-				const sectionOf = (heading) => {
-					let node = heading;
-					while (node.parentElement && node.parentElement !== parent) node = node.parentElement;
-					return node;
-				};
-				before = sectionOf(state.current ? headings[0] : headings[1]);
-			}
-		} else if (headings.length === 1) {
-			parent = headings[0].parentElement?.parentElement || headings[0].parentElement;
-			before = state.current ? headings[0].parentElement : headings[0].parentElement?.nextElementSibling || null;
-			if (before && before.parentElement !== parent) before = null;
-		}
-		// Never put the block anywhere but into Spotify's queue panel.
-		if (!parent) {
-			block.remove();
-			return;
-		}
-
-		// Already in place: do nothing, so the MutationObserver does not loop on our own change.
-		if (block.parentElement === parent && (before ? block.nextElementSibling === before : block.nextElementSibling === null)) return;
-		parent.insertBefore(block, before);
-	}
-
-	// Our playback state can change without a render call (e.g. a track ends) and the panel can be opened or
-	// closed at any time, so poll; this also re-attaches the block if Spotify re-rendered the panel.
-	let queueSignature = "";
-	setInterval(() => {
-		const active = isQueueOpen();
-		const signature = [active, state.status, state.current?.title, state.queue.length].join("|");
-		if (signature === queueSignature) {
-			if (active) attachQueueSection();
-			return;
-		}
-		queueSignature = signature;
-		queuePanel.active = active;
-		if (active) renderQueueSection();
-		else queuePanel.block?.remove();
-	}, 500);
 
 	// ---------------------------------------------------------------------
 	// Search page integration
@@ -3137,14 +3036,13 @@
 	// Spotify re-renders the search page and may drop our section; re-attach when needed.
 	let attachScheduled = false;
 	new MutationObserver((mutations) => {
-		if (attachScheduled || (!search.query && !isYTActive() && !queuePanel.active)) return;
+		if (attachScheduled || (!search.query && !isYTActive())) return;
 		// Ignore changes made by this extension to its own player bar elements.
 		if (mutations.every((m) => m.target.closest?.(".ss-own"))) return;
 		attachScheduled = true;
 		requestAnimationFrame(() => {
 			attachScheduled = false;
 			attachSection();
-			attachQueueSection();
 			if (isYTActive()) syncTakeover();
 		});
 	}).observe(document.body, { childList: true, subtree: true });
@@ -3360,11 +3258,7 @@
 		const setPlayback = (enabled) => {
 			saveConfig({ playbackEnabled: enabled });
 			playback.checked = enabled;
-			if (!enabled) {
-				if (state.status !== "idle") stopYT(true);
-				state.queue.length = 0;
-				renderQueueSection();
-			}
+			if (!enabled && state.status !== "idle") stopYT(false);
 			resetNetwork();
 			renderSearch();
 			notify(t(enabled ? "playbackOnToast" : "playbackOffToast"));
@@ -3423,12 +3317,8 @@
 			guideStatus.textContent = "";
 			output.style.display = "none";
 			output.textContent = "";
-			// Defaults have playback off, so stop the current YouTube track and clear the queue like the switch does.
-			if (config.playbackEnabled) {
-				if (state.status !== "idle") stopYT(true);
-				state.queue.length = 0;
-				renderQueueSection();
-			}
+			// Defaults have playback off, so stop the current YouTube track like the switch does.
+			if (config.playbackEnabled && state.status !== "idle") stopYT(false);
 			resetConfig();
 			// Sync the form with the restored defaults.
 			wisp.value = config.wispServers.join("\n");

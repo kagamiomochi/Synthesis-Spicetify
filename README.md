@@ -17,7 +17,7 @@ Currently supported service: YouTube Music (YouTube). More services are planned.
 
 - Spotify's search results page gets "Spotify" and "YouTube Music" tabs, so you can switch between the standard results and the YouTube Music results
 - Play a result, add it to the queue, or play it next
-- Queued tracks play between Spotify tracks (shown in Spotify's own queue panel)
+- Every YouTube track goes through a silent local file, so it plays, queues and saves like a normal Spotify track (see [How playback works](#how-playback-works))
 - While a YouTube track is active, Spotify's own player bar shows it (cover, title, progress bar) and its play/pause,
   previous and next buttons control it. A small mini player is only shown if the player bar cannot be used
 - Save tracks to your Spotify playlists (see [Saving tracks to playlists](#saving-tracks-to-playlists))
@@ -88,17 +88,20 @@ If something does not work, see [Troubleshooting](#troubleshooting).
 2. Hover a result:
    - Play button on the cover: play now
    - "Play next" / "Add to queue" buttons on the right
-3. Open Spotify's queue panel (the queue button on the playbar) to see, play or remove queued YouTube tracks.
+3. Queued YouTube tracks appear in Spotify's own queue panel and can be reordered or removed there.
 4. While a YouTube track is active, Spotify's play button toggles play/pause of that track and Spotify itself stays
-   silent. Spotify's next/previous buttons move on to the next queued YouTube track, or back to Spotify when the
-   queue is empty.
+   silent. Spotify's next/previous buttons move to the next/previous item of Spotify's queue or playlist, whether it is
+   a YouTube track or a Spotify track.
 
-Queue behavior: queued YouTube tracks play when Spotify moves to its next track within the same playback context.
-Starting a different playlist or album in Spotify stops the YouTube track.
+### How playback works
+
+Spotify's player, queue and playlists can only hold Spotify tracks and local files. So when you play or queue a result, the extension makes a silent local file for it (the artist \"YouTube\", the album \"Synthesis\", the video ID as the title) and hands that file to Spotify like any other local track. When Spotify starts it, the extension pauses Spotify and streams the real track instead. When the track ends, Spotify moves on to whatever follows it.
+
+This needs the same folder setup as saving to playlists (below). The first time you play or queue a result, choose the folder in the dialog. Playlist saving, the queue and plain playback all use the same files, and the files are kept in the folder (about 2 KB per second of track length); delete the ones you no longer need, except those that are in your playlists.
 
 ### Saving tracks to playlists
 
-The playlist button on a result saves the track to one of your Spotify playlists. A Spotify playlist can only hold Spotify tracks and local files, so each saved track is stored as a silent local file, and when Spotify starts it, the extension pauses Spotify and plays the real track from YouTube Music instead.
+The playlist button on a result saves the track to one of your Spotify playlists. A Spotify playlist can only hold Spotify tracks and local files, so each saved track is stored as a silent local file (the same file that playing uses), and when Spotify starts it, the extension pauses Spotify and plays the real track from YouTube Music instead.
 
 1. In Spotify's settings, add a folder as a Local Files source.
 2. Click the playlist button on a result and pick a playlist. The first time, choose that same folder in the dialog. It is remembered afterwards; if a permission prompt appears again, allow it.
@@ -113,14 +116,14 @@ Open the profile menu in Spotify and choose "Synthesis Spicetify settings".
 - **Enable playback**: off by default. While it is off, only the public Wisp proxies below are used, so you can search
   and open results in the browser, but not play them. Turning it on shows the local Wisp setup steps and checks the
   connection to `ws://localhost:6001/`; playback is enabled once the check succeeds. Turning it off stops the current
-  YouTube track and clears the queue.
+  YouTube track.
 - **Public Wisp proxies**: one per line, tried in order. Default: a shared public server. While playback is enabled,
   the local server `ws://localhost:6001/` is tried first.
 - **InnerTube clients**: `visionos`, `tv_samsung`, tried in order. Defaults work without a PO token.
 - **Connection test**: runs the whole chain (libcurl, session, search, player request, audio download) and prints
   the result of each step.
 - **Clear audio cache**: frees the downloaded audio (the last few tracks are cached in memory).
-- **Reset settings**: restores every setting to its default (playback off, default Wisp proxies and clients). Click it twice to confirm. Turning playback off this way stops the current YouTube track and clears the queue.
+- **Reset settings**: restores every setting to its default (playback off, default Wisp proxies and clients). Click it twice to confirm. Turning playback off this way stops the current YouTube track.
 
 ## Troubleshooting
 
@@ -247,7 +250,7 @@ Spotify に YouTube Music を統合する [Spicetify](https://spicetify.app/) �
 
 - Spotify の検索結果ページに「Spotify」「YouTube Music」のタブを追加し、標準の検索結果と YouTube Music の結果をタブで切り替えて表示
 - 結果から再生、次に再生、キューに追加
-- キューに入れた曲は Spotify の曲の間に挟まって再生(プレイバーのキューボタンで確認)
+- YouTube の曲はすべて無音のローカルファイル経由で扱うため、Spotify の曲と同じように再生・キュー・プレイリスト保存ができます([ダミー曲を経由した再生](#ダミー曲を経由した再生)を参照)
 - YouTube の曲の再生中は、Spotify 本体のプレイヤーバー(カバー・曲名・シークバー)にその曲を表示し、
   再生/一時停止・前へ・次へボタンでそのまま操作できます。プレイヤーバーを使えない場合だけ、小さなミニプレイヤーを表示します
 - Spotify のプレイリストに曲を保存可能([プレイリストに保存する](#プレイリストに保存する)を参照)
@@ -307,14 +310,18 @@ YouTube に弾かれるためです([ローカル Wisp が必要な理由](#ロ�
 
 1. Spotify で普通に検索すると、検索結果ページの上部に「Spotify」「YouTube Music」のタブが出ます。初期表示は Spotify の標準の検索結果で、「YouTube Music」タブをクリックすると YouTube Music の結果に切り替わります(「Spotify」タブで元に戻せます)。選んだタブは、検索ワードを変えても維持されます。
 2. 結果にカーソルを合わせて、カバー画像の再生ボタンで再生、右側のボタンで「次に再生」「キューに追加」ができます。
-3. プレイバーのキューボタンで、キュー中の YouTube 曲を確認、再生、削除できます。
-4. YouTube の曲の再生中は、Spotify の再生ボタンがその曲の再生/一時停止になります(Spotify 自体は無音のままです)。次へ/前へは、キュー中の次の YouTube 曲に進み、キューが空なら Spotify に戻ります。
+3. キューに入れた YouTube の曲は Spotify 標準のキューパネルに並び、そこで並べ替えや削除ができます。
+4. YouTube の曲の再生中は、Spotify の再生ボタンがその曲の再生/一時停止になります(Spotify 自体は無音のままです)。次へ/前へは、YouTube の曲か Spotify の曲かを問わず、Spotify のキューやプレイリストの次/前の曲に進みます。
 
-キューの挙動: キューに入れた YouTube の曲は、Spotify が同じ再生コンテキスト内で次の曲に移るタイミングで再生されます。Spotify で別のプレイリストやアルバムを再生し始めると、YouTube の曲は止まります。
+### ダミー曲を経由した再生
+
+Spotify のプレイヤー、キュー、プレイリストには、Spotify の曲とローカルファイルしか入れられません。そのため、結果を再生またはキューに追加するときは、その曲用の無音のローカルファイル(アーティスト「YouTube」、アルバム「Synthesis」、曲名は動画 ID)を作り、ほかのローカル曲と同じように Spotify に渡します。Spotify がそのファイルを再生し始めると、拡張機能が Spotify を一時停止し、代わりに実際の曲を再生します。曲が終わると、Spotify はそのファイルの次の曲に進みます。
+
+プレイリストへの保存と同じフォルダの設定が必要です(下記)。初めて再生またはキュー追加をするときに、ダイアログでフォルダを選んでください。再生、キュー、プレイリスト保存は同じファイルを使い、ファイルはフォルダに残ります(曲の長さ 1 秒あたり約 2 KB)。不要なものは、プレイリストに入れているもの以外なら削除して構いません。
 
 ### プレイリストに保存する
 
-結果のプレイリストボタンで、曲を Spotify のプレイリストに保存できます。Spotify のプレイリストには Spotify の曲とローカルファイルしか入れられないため、保存した曲は無音のローカルファイル(ダミー曲)として入れます。Spotify がそのダミー曲を再生し始めると、拡張機能が Spotify を一時停止し、代わりに YouTube Music の実際の曲を再生します。
+結果のプレイリストボタンで、曲を Spotify のプレイリストに保存できます。Spotify のプレイリストには Spotify の曲とローカルファイルしか入れられないため、保存した曲は無音のローカルファイル(ダミー曲。再生にも同じファイルを使います)として入れます。Spotify がそのダミー曲を再生し始めると、拡張機能が Spotify を一時停止し、代わりに YouTube Music の実際の曲を再生します。
 
 1. Spotify の設定で、ローカルファイルのソースとしてフォルダを追加します。
 2. 結果のプレイリストボタンを押してプレイリストを選びます。初回はダイアログで同じフォルダを選んでください。以降は記憶されます。権限の確認が再び出たら許可してください。
@@ -326,12 +333,12 @@ YouTube に弾かれるためです([ローカル Wisp が必要な理由](#ロ�
 
 Spotify のプロフィールメニューから「Synthesis Spicetify 設定」を開きます。
 
-- **再生機能を有効化:** 既定はオフです。オフの間は下の公開 Wisp プロキシだけを使い、検索結果の表示と「ブラウザで開く」のみ使えます (再生はできません)。オンにしようとするとローカル Wisp のセットアップ手順を表示し、`ws://localhost:6001/` への接続を確認します。確認できると有効になります。オフにすると、再生中の YouTube の曲を止めてキューを空にします。
+- **再生機能を有効化:** 既定はオフです。オフの間は下の公開 Wisp プロキシだけを使い、検索結果の表示と「ブラウザで開く」のみ使えます (再生はできません)。オンにしようとするとローカル Wisp のセットアップ手順を表示し、`ws://localhost:6001/` への接続を確認します。確認できると有効になります。オフにすると、再生中の YouTube の曲を止めます。
 - **公開 Wisp プロキシ:** 1 行に 1 つ、上から順に試します。既定は共有の公開サーバーです。再生機能がオンの間は、ローカルの `ws://localhost:6001/` を最初に試します。
 - **InnerTube クライアント:** `visionos`、`tv_samsung` を上から順に試します。既定では PO Token は不要です。
 - **接続テスト:** libcurl、セッション、検索、プレイヤーリクエスト、音声ダウンロードまでを順に試し、各ステップの結果を表示します。
 - **音声キャッシュを削除:** ダウンロード済みの音声(直近の数曲をメモリにキャッシュ)を解放します。
-- **設定をリセット:** すべての設定を初期値(再生機能オフ、既定の Wisp プロキシとクライアント)に戻します。確認のため 2 回押す必要があります。再生機能がオンだった場合は、再生中の YouTube の曲を止めてキューを空にします。
+- **設定をリセット:** すべての設定を初期値(再生機能オフ、既定の Wisp プロキシとクライアント)に戻します。確認のため 2 回押す必要があります。再生機能がオンだった場合は、再生中の YouTube の曲を止めます。
 
 ## トラブルシューティング
 
