@@ -1348,20 +1348,88 @@
 		return Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
 	}
 
-	function updateMediaSession(track) {
-		if (!("mediaSession" in navigator) || !track) return;
+	// The OS media controller (MPRIS, SMTC) and tools built on it (Discord RPC, scrobblers) see two players: Spotify's
+	// own, which is playing the placeholder, and this page's audio element. Its Media Session is the one that
+	// can carry the real song, so keep it in step with the track state.
+	let mediaSessionKey = null; // track the current metadata was built for
+	let positionStateAt = 0; // last time the position was reported
+
+	function setupMediaSessionHandlers() {
+		if (!("mediaSession" in navigator)) return;
+		// The audio element is only a slave of Spotify's clock, so every action goes to Spotify, not to the element.
+		const handlers = {
+			play: () => {
+				if (state.status === "paused") Spicetify.Player.play();
+			},
+			pause: () => {
+				if (state.status === "playing") Spicetify.Player.pause();
+			},
+			nexttrack: () => skipNext(),
+			previoustrack: () => Spicetify.Player.back(),
+			seekto: (details) => {
+				if ((state.status === "playing" || state.status === "paused") && Number.isFinite(details?.seekTime)) seekSpotify(details.seekTime);
+			},
+		};
+		for (const [action, handler] of Object.entries(handlers)) {
+			try {
+				navigator.mediaSession.setActionHandler(action, handler);
+			} catch {
+				// This action is not supported here.
+			}
+		}
+	}
+
+	// Reports position and length, so that progress bars and Discord's timestamps are right.
+	function updatePositionState(force) {
+		if (!("mediaSession" in navigator) || !state.current) return;
+		const now = Date.now();
+		if (!force && now - positionStateAt < 1000) return;
+		const duration = trackDurationSec();
+		if (!(duration > 0) || !Number.isFinite(duration)) return;
+		positionStateAt = now;
 		try {
-			navigator.mediaSession.metadata = new MediaMetadata({
-				title: track.title,
-				artist: track.artists.join(", "),
-				album: track.album || providers[track.provider].label,
-				artwork: track.thumbnail ? [{ src: track.thumbnail, sizes: "226x226" }] : [],
+			navigator.mediaSession.setPositionState({
+				duration,
+				playbackRate: 1,
+				position: Math.min(Math.max(spotifyPosition(), 0), duration),
 			});
-			navigator.mediaSession.playbackState = "playing";
 		} catch {
 			// MediaSession is best effort only.
 		}
 	}
+
+	// Called on every state change (from renderMini). Metadata is only replaced when the track changes.
+	function syncMediaSession() {
+		if (!("mediaSession" in navigator)) return;
+		const track = state.current;
+		try {
+			if (!track || state.status === "idle") {
+				// Nothing of ours is playing: leave no stale song behind.
+				if (mediaSessionKey !== null) {
+					navigator.mediaSession.metadata = null;
+					mediaSessionKey = null;
+				}
+				navigator.mediaSession.playbackState = "none";
+				return;
+			}
+			const key = trackKey(track);
+			if (key !== mediaSessionKey) {
+				navigator.mediaSession.metadata = new MediaMetadata({
+					title: track.title,
+					artist: track.artists.join(", "),
+					album: track.album || providers[track.provider].label,
+					artwork: track.thumbnail ? [{ src: track.thumbnail, sizes: "226x226" }] : [],
+				});
+				mediaSessionKey = key;
+			}
+			// While loading, Spotify is held paused and nothing is audible yet.
+			navigator.mediaSession.playbackState = state.status === "playing" ? "playing" : "paused";
+			updatePositionState(true);
+		} catch {
+			// MediaSession is best effort only.
+		}
+	}
+	setupMediaSessionHandlers();
 
 	// ---------------------------------------------------------------------
 	// Playback control
@@ -1413,7 +1481,6 @@
 			}
 
 			state.status = "playing";
-			updateMediaSession(track);
 			releaseClock();
 			renderMini();
 			prefetchNext();
@@ -1592,6 +1659,7 @@
 	audio.addEventListener("timeupdate", () => {
 		activeStream?.sink.poke();
 		updateSeek();
+		updatePositionState(false);
 	});
 
 	// Keep the volume in sync with Spotify's volume slider.
@@ -2697,6 +2765,7 @@
 	}
 
 	function renderMini() {
+		syncMediaSession();
 		const ui = ensureMini();
 		const track = state.current;
 		// The mini player is only a fallback for when Spotify's own player bar cannot be used.
