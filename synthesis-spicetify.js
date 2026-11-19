@@ -20,6 +20,12 @@
  *              instead, and when the track ends Spotify moves on to whatever follows the placeholder.
  *
  * Both libraries are loaded lazily from jsDelivr (pinned versions) on first use.
+ *
+ * The file is one script (the Marketplace installs a single file), laid out top to bottom in dependency order:
+ * boot, constants and config, i18n, utilities, network, images, YouTube Music provider, playback state and
+ * registries, audio cache, progressive playback, playback control, placeholders (files, registry, playlist
+ * picker, handing them to Spotify, real names, cover art), styles, mini player, player bar takeover, search
+ * page, diagnostics, settings, registration.
  */
 
 (async function SynthesisSpicetify() {
@@ -28,6 +34,7 @@
 	// ---------------------------------------------------------------------
 	// Boot: wait until Spicetify is ready
 	// ---------------------------------------------------------------------
+
 	const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 	for (let i = 0; i < 150; i++) {
@@ -50,6 +57,7 @@
 	// ---------------------------------------------------------------------
 	// Constants and configuration
 	// ---------------------------------------------------------------------
+
 	/* VERSION */ const VERSION = "v0.6.0";
 	const WISP_SCRIPT_URL = "https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/main/wisp-launcher/portable/wisp_ondemand.py";
 	const LIBCURL_URL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.5/libcurl_full.mjs";
@@ -123,6 +131,7 @@
 	// ---------------------------------------------------------------------
 	// i18n (ja / en)
 	// ---------------------------------------------------------------------
+
 	const lang = String(Spicetify.Locale?.getLocale?.() || navigator.language || "en")
 		.toLowerCase()
 		.startsWith("ja")
@@ -144,8 +153,6 @@
 			addQueue: "キューに追加",
 			playNext: "次に再生",
 			openBrowser: "ブラウザで開く",
-			queueTitle: "Synthesis Spicetify キュー",
-			queueEmpty: "キューは空です。",
 			loading: (p) => `読み込み中 ${Math.round(p * 100)}%`,
 			preparing: "準備中...",
 			addedQueue: "キューに追加しました",
@@ -211,8 +218,6 @@
 			addQueue: "Add to queue",
 			playNext: "Play next",
 			openBrowser: "Open in browser",
-			queueTitle: "Synthesis Spicetify queue",
-			queueEmpty: "The queue is empty.",
 			loading: (p) => `Loading ${Math.round(p * 100)}%`,
 			preparing: "Preparing...",
 			addedQueue: "Added to queue",
@@ -274,6 +279,7 @@
 	// ---------------------------------------------------------------------
 	// Small DOM helpers and icons
 	// ---------------------------------------------------------------------
+
 	const svg = (path) => `<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="${path}"/></svg>`;
 	const ICONS = {
 		play: svg("M3 1.7v12.6a.7.7 0 0 0 1.05.6l10.5-6.3a.7.7 0 0 0 0-1.2L4.05 1.1A.7.7 0 0 0 3 1.7z"),
@@ -305,16 +311,28 @@
 		return el;
 	}
 
+	// Formats whole seconds as m:ss.
+	const mmss = (seconds) => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+
+	// Track length of a result row; empty while unknown.
 	function formatTime(ms) {
 		if (!Number.isFinite(ms) || ms <= 0) return "";
-		const total = Math.round(ms / 1000);
-		return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+		return mmss(Math.round(ms / 1000));
 	}
+
+	// Playback position of the player bar; an unknown value shows 0:00.
+	const clock = (sec) => mmss(Math.max(0, Math.floor(Number.isFinite(sec) ? sec : 0)));
+
+	const setText = (el, text) => {
+		if (el.textContent !== text) el.textContent = text;
+	};
 
 	const notify = (message, isError = false) => Spicetify.showNotification(message, isError);
 
+	const abortError = () => new DOMException("Aborted", "AbortError");
+
 	function throwIfAborted(signal) {
-		if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+		if (signal?.aborted) throw abortError();
 	}
 
 	function withTimeout(promise, ms, label) {
@@ -333,9 +351,23 @@
 		});
 	}
 
+	async function copyText(text) {
+		try {
+			await navigator.clipboard.writeText(text);
+		} catch {
+			try {
+				Spicetify.Platform.ClipboardAPI.copy(text);
+			} catch {
+				return;
+			}
+		}
+		notify(t("copied"));
+	}
+
 	// ---------------------------------------------------------------------
 	// Network layer: libcurl.js (fetch replacement that is not bound by CORS)
 	// ---------------------------------------------------------------------
+
 	let curlPromise = null;
 	let activeWisp = "";
 	let lastPlayerUserAgent = null;
@@ -432,9 +464,78 @@
 		return res;
 	}
 
+	// Plain WebSocket handshake against the local Wisp server. With on-demand start this also wakes it up.
+	function probeLocalWisp(url, timeoutMs = 10000) {
+		return new Promise((resolve) => {
+			let ws = null;
+			let settled = false;
+			let timer = null;
+			const finish = (ok) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				try {
+					ws?.close();
+				} catch {
+					// ignore
+				}
+				resolve(ok);
+			};
+			timer = setTimeout(() => finish(false), timeoutMs);
+			try {
+				ws = new WebSocket(url);
+				ws.addEventListener("open", () => finish(true));
+				ws.addEventListener("error", () => finish(false));
+				ws.addEventListener("close", () => finish(false));
+			} catch {
+				finish(false);
+			}
+		});
+	}
+
+	// ---------------------------------------------------------------------
+	// Images (fall back to Blob URLs fetched through libcurl if <img> is blocked)
+	// ---------------------------------------------------------------------
+
+	const imageCache = new Map();
+
+	function loadImage(img, url) {
+		if (!url) return;
+		if (imageCache.has(url)) {
+			img.src = imageCache.get(url);
+			return;
+		}
+		img.addEventListener(
+			"error",
+			async () => {
+				if (img.dataset.fallback) return;
+				img.dataset.fallback = "1";
+				try {
+					const res = await curlFetch(url);
+					const blobUrl = URL.createObjectURL(await res.blob());
+					imageCache.set(url, blobUrl);
+					img.src = blobUrl;
+				} catch {
+					// leave the placeholder
+				}
+			},
+			{ once: true }
+		);
+		img.src = url;
+	}
+
+	// Shows the cover of a track in ui.cover, unless it already shows that URL.
+	function setCover(ui, url) {
+		if (ui.lastCoverUrl === url) return;
+		ui.lastCoverUrl = url;
+		ui.cover.removeAttribute("data-fallback");
+		loadImage(ui.cover, url);
+	}
+
 	// ---------------------------------------------------------------------
 	// Provider: YouTube Music (youtubei.js)
 	// ---------------------------------------------------------------------
+
 	// "gl" must be a two-letter ISO 3166-1 region. navigator.language may be "ja" (no region),
 	// "en-001" / "es-419" (numeric UN M.49 area) or "zh-Hans-CN" (script subtag), and passing those
 	// through as-is makes InnerTube answer HTTP 400 INVALID_ARGUMENT.
@@ -598,6 +699,14 @@
 
 	async function youtubeSearch(query, limit) {
 		return createYoutubeSearch(query).take(limit);
+	}
+
+	// Open the track on YouTube Music in the default external browser
+	function openInBrowser(track) {
+		const url = `https://music.youtube.com/watch?v=${encodeURIComponent(track.id)}`;
+		// Do not check the return value: the Spotify client may return null even when the browser opened,
+		// and a fallback would open a second tab
+		window.open(url, "_blank", "noopener,noreferrer");
 	}
 
 	// ---- Audio download through libcurl (ranged requests, like YouTube's own player) ----
@@ -779,7 +888,7 @@
 			} catch (error) {
 				// libcurl.js rejects aborted requests with a DOMException named "Error" (or errors the body
 				// stream with a plain string), so check the signal instead of relying on error.name.
-				if (signal?.aborted || error?.name === "AbortError") throw new DOMException("Aborted", "AbortError");
+				if (signal?.aborted || error?.name === "AbortError") throw abortError();
 				// Chunks already handed to the player cannot be taken back, so a failure mid-stream is final.
 				if (started) throw error;
 				errors.push(`${client}: ${error?.message || error}`);
@@ -803,9 +912,87 @@
 		},
 	};
 
+	function resetNetwork() {
+		// Reset the lazily created singletons so new Wisp settings take effect.
+		curlPromise = null;
+		innertubes.plain = null;
+		innertubes.player = null;
+		warmUpPromise = null;
+		cookieJar.clear();
+	}
+
+	// ---------------------------------------------------------------------
+	// Playback state and track registries
+	// ---------------------------------------------------------------------
+
+	const audio = new Audio();
+	audio.preload = "auto";
+
+	const state = {
+		current: null, // active non-Spotify track
+		status: "idle", // idle | loading | playing | paused
+		progress: 0, // download progress while loading (0..1)
+		placeholderUri: null, // spotify:local: URI of the placeholder Spotify is paused on while our track plays
+		suppressUntil: 0, // ignore Spotify events until this timestamp
+		advancingUntil: 0, // Spotify is being moved to another item: what it does meanwhile is not a new start
+	};
+	let playToken = 0;
+
+	const SAVED_KEY = "synthesis-spicetify:saved";
+
+	function loadSaved() {
+		try {
+			return JSON.parse(localStorage.getItem(SAVED_KEY) || "{}");
+		} catch {
+			return {};
+		}
+	}
+
+	const savedTracks = loadSaved(); // spotify:local: URI -> track (saved to a playlist, kept in localStorage)
+	const placeholderTracks = new Map(); // spotify:local: URI -> track (made for playing or queueing, memory only)
+
+	function rememberSaved(uri, track) {
+		savedTracks[uri] = track;
+		try {
+			localStorage.setItem(SAVED_KEY, JSON.stringify(savedTracks));
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] failed to store saved tracks", error);
+		}
+	}
+
+	const displayInfo = new Map(); // video ID -> { title, artist, album, thumbnail, letterbox }
+
+	const youtubeThumbnail = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+
+	// What Spotify's rows show for a track's placeholder. Without a stored cover, YouTube's own thumbnail is used,
+	// which has black bars above and below the picture (hence "letterbox").
+	function displayInfoOf(track) {
+		return {
+			title: track.title,
+			artist: (track.artists || []).join(", "),
+			album: track.album || "",
+			thumbnail: track.thumbnail || youtubeThumbnail(track.id),
+			letterbox: !track.thumbnail,
+		};
+	}
+
+	// The part of a track that is kept for its placeholder (in memory, or in localStorage once it is saved to a playlist).
+	function snapshotTrack(track) {
+		return {
+			provider: track.provider,
+			id: track.id,
+			title: track.title,
+			artists: track.artists,
+			album: track.album,
+			durationMs: track.durationMs,
+			thumbnail: track.thumbnail,
+		};
+	}
+
 	// ---------------------------------------------------------------------
 	// Audio cache (Blob URLs)
 	// ---------------------------------------------------------------------
+
 	const audioCache = new Map(); // key -> { url }
 	let prefetchKey = null; // key of the next placeholder track that is being downloaded ahead of time
 	const inflight = new Map(); // key -> { controller, listeners, promise }
@@ -899,50 +1086,9 @@
 	}
 
 	// ---------------------------------------------------------------------
-	// Playback engine
-	// ---------------------------------------------------------------------
-	const audio = new Audio();
-	audio.preload = "auto";
-
-	const state = {
-		current: null, // active non-Spotify track
-		status: "idle", // idle | loading | playing | paused
-		progress: 0, // download progress while loading (0..1)
-		dummyUri: null, // spotify:local: URI of the placeholder Spotify is paused on while our track plays
-		suppressUntil: 0, // ignore Spotify events until this timestamp
-		advancingUntil: 0, // Spotify is being moved to another item: what it does meanwhile is not a new start
-	};
-	let playToken = 0;
-
-	function readSpotify() {
-		return { uri: Spicetify.Player.data?.item?.uri ?? null };
-	}
-
-	// Moves Spotify to its next or previous item. Spotify is paused on our placeholder at that point, so a
-	// regular track it lands on has to be started by hand. A placeholder it lands on is picked up by the
-	// songchange handler.
-	function moveSpotify(step) {
-		const before = readSpotify().uri;
-		state.advancingUntil = Date.now() + 1500;
-		if (step === "back") Spicetify.Player.back();
-		else Spicetify.Player.next();
-		setTimeout(() => {
-			if (state.status !== "idle") return; // another placeholder has taken over
-			if (readSpotify().uri === before) {
-				// Spotify could not move (start or end of its context). Going back then restarts the same
-				// placeholder, so restart our track too. Going forward must not, or the last track would
-				// repeat forever; just keep Spotify from playing the silent file.
-				if (step === "back" && isDummyItem()) startFromDummy();
-				else if (Spicetify.Player.isPlaying() && isDummyItem()) Spicetify.Player.pause();
-				return;
-			}
-			if (!Spicetify.Player.isPlaying()) Spicetify.Player.play();
-		}, 500);
-	}
-
-	// ---------------------------------------------------------------------
 	// Progressive playback (Media Source Extensions)
 	// ---------------------------------------------------------------------
+
 	let activeStream = null; // { job, sink, cancel } of the track that is currently being streamed
 
 	// Feeds downloaded chunks into a MediaSource attached to the shared <audio> element.
@@ -1105,7 +1251,7 @@
 				},
 				onBlocked: () => switchIfBlocked(),
 			});
-			activeStream = { job, sink, track, token, cancel: () => settle(reject, new DOMException("Aborted", "AbortError")) };
+			activeStream = { job, sink, track, token, cancel: () => settle(reject, abortError()) };
 
 			// A long track does not fit into the browser's buffer. Once the whole file has been downloaded,
 			// continue from the finished Blob at the current position.
@@ -1129,7 +1275,7 @@
 					// The download died after playback had started: nothing more will arrive.
 					if (token !== playToken || error?.name === "AbortError") return;
 					notify(t("playFailed", error?.message || error), true);
-					stopYT(true);
+					stopTrack(true);
 				}
 			);
 		});
@@ -1193,6 +1339,10 @@
 		audio.currentTime = seconds;
 	}
 
+	function trackDurationSec() {
+		return Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
+	}
+
 	function updateMediaSession(track) {
 		if (!("mediaSession" in navigator) || !track) return;
 		try {
@@ -1208,7 +1358,11 @@
 		}
 	}
 
-	// Streams the real track. Only called once Spotify has started a placeholder (see startFromDummy), and
+	// ---------------------------------------------------------------------
+	// Playback control
+	// ---------------------------------------------------------------------
+
+	// Streams the real track. Only called once Spotify has started a placeholder (see startFromPlaceholder), and
 	// Spotify has already been paused on it by then.
 	async function playTrack(track) {
 		const token = ++playToken;
@@ -1261,7 +1415,7 @@
 			if (token !== playToken || error?.name === "AbortError") return;
 			console.error("[Synthesis Spicetify] playback failed", error);
 			notify(t("playFailed", error?.message || error), true);
-			stopYT(true);
+			stopTrack(true);
 		}
 	}
 
@@ -1273,7 +1427,7 @@
 		try {
 			const entry = Spicetify.Queue?.nextTracks?.[0];
 			const uri = entry?.contextTrack?.uri ?? entry?.uri;
-			const track = uri && (dummyTracks.get(uri) ?? savedTracks[uri]);
+			const track = uri && (placeholderTracks.get(uri) ?? savedTracks[uri]);
 			if (!track) return;
 			prefetchKey = trackKey(track);
 			getAudioUrl(track).catch(() => {});
@@ -1284,7 +1438,7 @@
 
 	// Stops our track. With `advance`, Spotify then moves on to whatever follows the placeholder it is
 	// paused on (the end of a track, the next button, or a failure); without it Spotify stays where it is.
-	function stopYT(advance) {
+	function stopTrack(advance) {
 		playToken++;
 		abortLoad(state.current);
 		detachStream();
@@ -1294,12 +1448,12 @@
 		state.current = null;
 		state.status = "idle";
 		state.progress = 0;
-		state.dummyUri = null;
+		state.placeholderUri = null;
 		renderMini();
 		if (advance) moveSpotify("next");
 	}
 
-	function toggleYT() {
+	function togglePause() {
 		if (state.status === "playing") {
 			audio.pause();
 			state.status = "paused";
@@ -1312,7 +1466,7 @@
 
 	// Next button of Spotify's player bar while a non-Spotify track is active.
 	function skipNext() {
-		stopYT(true);
+		stopTrack(true);
 	}
 
 	// Previous button of Spotify's player bar: restart the track, or go back to the item before it.
@@ -1322,7 +1476,7 @@
 			seekAudio(0);
 			return;
 		}
-		stopYT(false);
+		stopTrack(false);
 		moveSpotify("back");
 	}
 
@@ -1332,124 +1486,12 @@
 		return false;
 	}
 
-	function reportPlaceholderError(error) {
-		if (error?.name === "AbortError") return; // the folder dialog was cancelled
-		console.error("[Synthesis Spicetify] could not hand the track to Spotify", error);
-		notify(t("playFailed", error?.message || error), true);
-	}
-
-	// True once Spotify's current item is the placeholder. Spotify may spell a local file's URI differently from
-	// the local files index, so the tags (title = video ID, album "Synthesis") count as well.
-	async function waitForSpotifyItem(uri, id, timeoutMs) {
-		const deadline = Date.now() + timeoutMs;
-		while (Date.now() < deadline) {
-			const item = Spicetify.Player.data?.item;
-			if (item?.uri === uri) return true;
-			if (item?.uri?.startsWith("spotify:local:") && item.name === id && item.album?.name === DUMMY_ALBUM) return true;
-			await sleep(100);
-		}
-		return false;
-	}
-
-	const LOCAL_FILES_CONTEXT = "spotify:local-files"; // the playback context Spotify uses for local files
-
-	// Plays a placeholder in Spotify's own player. The songchange handler then takes over and streams the
-	// real track (see startFromDummy).
-	async function playPlaceholder(uri, id) {
-		// A local file can only be played inside the Local Files context, so start that context at the placeholder.
-		for (const attempt of [
-			() => Spicetify.Player.playUri(LOCAL_FILES_CONTEXT, {}, { skipTo: { uri } }),
-			() => Spicetify.Player.playUri(uri),
-		]) {
-			try {
-				await attempt();
-			} catch (error) {
-				console.warn("[Synthesis Spicetify] could not start the placeholder", error);
-			}
-			if (await waitForSpotifyItem(uri, id, 2000)) return;
-		}
-		console.warn("[Synthesis Spicetify] Spotify did not switch to the placeholder", { expected: uri, current: Spicetify.Player.data?.item?.uri });
-		// Spotify did not switch. Put the placeholder at the front of the queue and skip to it instead.
-		// (Both fail without an active Spotify session, which is reported below.)
-		try {
-			await queuePlaceholder(uri, true);
-			await Spicetify.Player.next();
-		} catch (error) {
-			console.warn("[Synthesis Spicetify] queue fallback failed", error);
-		}
-		if (await waitForSpotifyItem(uri, id, 2000)) return;
-		throw new Error(t("placeholderNotPlayed"));
-	}
-
-	// Adds a placeholder to Spotify's own queue, at the front (play next) or at the end. Resolves with true
-	// when it ended up at the front. These queue calls are internal APIs.
-	async function queuePlaceholder(uri, next) {
-		const api = Spicetify.Platform?.PlayerAPI;
-		const items = [{ uri }];
-		const addToEnd = () => (typeof api?.addToQueue === "function" ? api.addToQueue(items) : Spicetify.addToQueue(items));
-		const upcoming = Spicetify.Queue?.nextTracks;
-		if (!next || !Array.isArray(upcoming)) {
-			await addToEnd();
-			return false;
-		}
-		const first = upcoming[0]?.contextTrack;
-		if (!first?.uri) {
-			await addToEnd(); // nothing follows yet, so the end is also the front
-			return true;
-		}
-		if (typeof api?.insertIntoQueue === "function") {
-			try {
-				await api.insertIntoQueue(items, { before: { uri: first.uri, uid: first.uid } });
-				return true;
-			} catch (error) {
-				console.warn("[Synthesis Spicetify] could not insert at the front of the queue", error);
-			}
-		}
-		await addToEnd();
-		return false;
-	}
-
-	async function playNow(track) {
-		if (!requirePlayback()) return;
-		// The same track is already active: restart it instead of asking Spotify to play its placeholder
-		// again, which would look like a press of the play/pause button.
-		if (state.current && trackKey(state.current) === trackKey(track) && state.status !== "idle") {
-			seekAudio(0);
-			if (state.status === "paused") toggleYT();
-			return;
-		}
-		try {
-			// Nothing may be awaited before this: choosing the placeholder folder needs the click's user gesture.
-			const uri = await ensurePlaceholder(track, t("preparing"));
-			await playPlaceholder(uri, track.id);
-		} catch (error) {
-			reportPlaceholderError(error);
-		}
-	}
-
-	async function addToQueue(track, { next = false } = {}) {
-		if (!requirePlayback()) return;
-		try {
-			const uri = await ensurePlaceholder(track, t("preparing"));
-			// Nothing is playing at all: there is no queue to add to, so start right away.
-			if (!readSpotify().uri && state.status === "idle") {
-				await playPlaceholder(uri, track.id);
-				return;
-			}
-			const placedNext = await queuePlaceholder(uri, next);
-			notify(t(placedNext ? "addedNext" : "addedQueue"));
-			if (state.status !== "idle") setTimeout(prefetchNext, 800); // the queue needs a moment to update
-		} catch (error) {
-			reportPlaceholderError(error);
-		}
-	}
-
 	// Audio element events
-	audio.addEventListener("ended", () => stopYT(true));
+	audio.addEventListener("ended", () => stopTrack(true));
 	audio.addEventListener("error", () => {
 		if (!audio.getAttribute("src")) return;
 		notify(t("playFailed", audio.error?.message || "media error"), true);
-		stopYT(true);
+		stopTrack(true);
 	});
 	audio.addEventListener("timeupdate", () => {
 		activeStream?.sink.poke();
@@ -1473,41 +1515,22 @@
 	// ---------------------------------------------------------------------
 	// Placeholders (silent local files) for playing, queueing and saving tracks
 	// ---------------------------------------------------------------------
+
 	// Spotify's player, queue and playlists can only hold Spotify items and local files, so every track of
 	// another service is represented by a silent MP3 whose tags (artist / "Synthesis" / title) and length
 	// give it a unique spotify:local: URI. The tags carry no song information: the title is only the video
 	// ID, the artist a fixed label. The MP3 is written into a folder that Spotify uses as a Local Files
 	// source and the URI is handed to Spotify: played, added to its queue, or added to a playlist. When
 	// Spotify starts playing that URI the extension pauses Spotify and streams the real track instead.
-	const SAVED_KEY = "synthesis-spicetify:saved";
-	const DUMMY_ALBUM = "Synthesis"; // album tag of every placeholder, also used to recognise them
-	const DUMMY_ARTIST = "YouTube"; // artist tag of every placeholder (fixed, so no song info is written)
+
+	const PLACEHOLDER_ALBUM = "Synthesis"; // album tag of every placeholder, also used to recognise them
+	const PLACEHOLDER_ARTIST = "YouTube"; // artist tag of every placeholder (fixed, so no song info is written)
 
 	// The title tag of a placeholder. Only the video ID is written, which is unique per video, so the
 	// playlist row does not reveal the song and the real track can be found again from the ID alone.
 	const placeholderTitle = (track) => track.id;
+
 	const HANDLE_DB = "synthesis-spicetify";
-
-	function loadSaved() {
-		try {
-			return JSON.parse(localStorage.getItem(SAVED_KEY) || "{}");
-		} catch {
-			return {};
-		}
-	}
-
-	const savedTracks = loadSaved(); // spotify:local: URI -> track (saved to a playlist, kept in localStorage)
-	const dummyTracks = new Map(); // spotify:local: URI -> track (made for playing or queueing, memory only)
-	const placeholderJobs = new Map(); // video ID -> promise of a placeholder that is being made
-
-	function rememberSaved(uri, track) {
-		savedTracks[uri] = track;
-		try {
-			localStorage.setItem(SAVED_KEY, JSON.stringify(savedTracks));
-		} catch (error) {
-			console.warn("[Synthesis Spicetify] failed to store saved tracks", error);
-		}
-	}
 
 	// Builds a silent MP3 (MPEG-2 Layer III, 24 kHz, mono, 16 kbps) with ID3v2.3 tags. The first frame is an
 	// Info header that carries the frame count, so the length is exact; TLEN repeats it for tag readers.
@@ -1542,21 +1565,21 @@
 		const parts = [text("TIT2", title), text("TPE1", artist), text("TALB", album), numeric("TLEN", seconds * 1000)];
 		const tagSize = parts.reduce((n, p) => n + p.length, 0);
 		const header = new Uint8Array([0x49, 0x44, 0x33, 3, 0, 0, (tagSize >> 21) & 0x7f, (tagSize >> 14) & 0x7f, (tagSize >> 7) & 0x7f, tagSize & 0x7f]);
-		const audio = new Uint8Array(FRAME * (frames + 1));
+		const mpeg = new Uint8Array(FRAME * (frames + 1));
 		// Frame header: MPEG-2 Layer III, no CRC, bitrate index 2 (16 kbps), 24 kHz, mono.
 		// The bitrate index must match FRAME, otherwise decoders reject the file as unplayable.
-		for (let f = 0; f <= frames; f++) audio.set([0xff, 0xf3, 0x24, 0xc0], f * FRAME);
-		audio.set([0x49, 0x6e, 0x66, 0x6f], 13); // "Info"
-		new DataView(audio.buffer).setUint32(17, 1); // flags: frame count present
-		new DataView(audio.buffer).setUint32(21, frames);
-		const out = new Uint8Array(10 + tagSize + audio.length);
+		for (let f = 0; f <= frames; f++) mpeg.set([0xff, 0xf3, 0x24, 0xc0], f * FRAME);
+		mpeg.set([0x49, 0x6e, 0x66, 0x6f], 13); // "Info"
+		new DataView(mpeg.buffer).setUint32(17, 1); // flags: frame count present
+		new DataView(mpeg.buffer).setUint32(21, frames);
+		const out = new Uint8Array(10 + tagSize + mpeg.length);
 		out.set(header, 0);
 		let pos = 10;
 		for (const p of parts) {
 			out.set(p, pos);
 			pos += p.length;
 		}
-		out.set(audio, pos);
+		out.set(mpeg, pos);
 		return out;
 	}
 
@@ -1599,7 +1622,7 @@
 
 	// Returns a writable handle of the placeholder folder. Call it from a click handler: both the folder
 	// picker and the permission prompt need a user gesture.
-	async function getDummyDir() {
+	async function getPlaceholderDir() {
 		let dir = null;
 		try {
 			dir = await handleStore("readonly", (store) => store.get("dir"));
@@ -1635,7 +1658,7 @@
 				const loose = tracks.find(
 					(track) =>
 						track.name === title &&
-						track.album?.name === DUMMY_ALBUM &&
+						track.album?.name === PLACEHOLDER_ALBUM &&
 						track.artists?.[0]?.name === artist &&
 						Math.round((track.duration?.milliseconds ?? 0) / 1000) === seconds
 				);
@@ -1652,7 +1675,7 @@
 	// moves up by a second until the URI is free (or already belongs to the same video).
 	function pickLocalUri(track, seconds) {
 		for (let i = 0; i < 30; i++, seconds++) {
-			const uri = localUri(DUMMY_ARTIST, DUMMY_ALBUM, placeholderTitle(track), seconds);
+			const uri = localUri(PLACEHOLDER_ARTIST, PLACEHOLDER_ALBUM, placeholderTitle(track), seconds);
 			const owner = savedTracks[uri];
 			if (!owner || owner.id === track.id) return { uri, seconds };
 		}
@@ -1677,11 +1700,15 @@
 	// search reports a slightly different duration.
 	function knownSeconds(id) {
 		let uri = null;
-		for (const [key, track] of dummyTracks) if (track.id === id) uri = key;
+		for (const [key, track] of placeholderTracks) if (track.id === id) uri = key;
 		uri ??= Object.keys(savedTracks).find((key) => savedTracks[key].id === id) ?? null;
 		const seconds = uri ? Number(uri.split(":").pop()) : NaN;
 		return seconds > 0 ? seconds : null;
 	}
+
+	// ---- Placeholder registry: making a placeholder for a track, and saving it to a playlist ----
+
+	const placeholderJobs = new Map(); // video ID -> promise of a placeholder that is being made
 
 	async function makePlaceholder(track, busyText) {
 		const title = placeholderTitle(track);
@@ -1692,34 +1719,20 @@
 		let uri = await findIndexedUri(expected);
 		if (!uri) {
 			if (busyText) notify(busyText);
-			const dir = await getDummyDir();
+			const dir = await getPlaceholderDir();
 			// The file name does not matter to Spotify (the URI comes from the tags). Including the length
 			// keeps two placeholders of the same video, if there ever are two, in separate files.
 			const handle = await dir.getFileHandle(`${track.id}-${seconds}.mp3`, { create: true });
 			const writable = await handle.createWritable();
-			await writable.write(makeSilentMp3({ artist: DUMMY_ARTIST, album: DUMMY_ALBUM, title, seconds }));
+			await writable.write(makeSilentMp3({ artist: PLACEHOLDER_ARTIST, album: PLACEHOLDER_ALBUM, title, seconds }));
 			await writable.close();
-			uri = await waitForLocalUri(expected, { artist: DUMMY_ARTIST, title, seconds });
+			uri = await waitForLocalUri(expected, { artist: PLACEHOLDER_ARTIST, title, seconds });
 			if (!uri) throw new Error(t("saveNotIndexed"));
 		}
 
-		dummyTracks.set(uri, {
-			provider: track.provider,
-			id: track.id,
-			title: track.title,
-			artists: track.artists,
-			album: track.album,
-			durationMs: track.durationMs,
-			thumbnail: track.thumbnail,
-		});
+		placeholderTracks.set(uri, snapshotTrack(track));
 		// Spotify's rows for the placeholder can show the real text and cover art right away.
-		displayInfo.set(track.id, {
-			title: track.title,
-			artist: (track.artists || []).join(", "),
-			album: track.album || "",
-			thumbnail: track.thumbnail || youtubeThumbnail(track.id),
-			letterbox: !track.thumbnail, // YouTube's own thumbnails have black bars above and below the picture
-		});
+		displayInfo.set(track.id, displayInfoOf(track));
 		return uri;
 	}
 
@@ -1738,15 +1751,7 @@
 	async function saveTrackToPlaylist(track, playlist) {
 		const uri = await ensurePlaceholder(track, t("saving"));
 		await Spicetify.Platform.PlaylistAPI.add(playlist.uri, [uri], { after: "end" });
-		rememberSaved(uri, {
-			provider: track.provider,
-			id: track.id,
-			title: track.title,
-			artists: track.artists,
-			album: track.album,
-			durationMs: track.durationMs,
-			thumbnail: track.thumbnail,
-		});
+		rememberSaved(uri, snapshotTrack(track));
 		notify(t("savedToPlaylist", playlist.name));
 	}
 
@@ -1829,24 +1834,166 @@
 		);
 	}
 
-	// ---- Playing a placeholder ----
-	function isDummyItem() {
+	// ---------------------------------------------------------------------
+	// Handing placeholders to Spotify and taking them back
+	// ---------------------------------------------------------------------
+
+	function readSpotify() {
+		return { uri: Spicetify.Player.data?.item?.uri ?? null };
+	}
+
+	// Moves Spotify to its next or previous item. Spotify is paused on our placeholder at that point, so a
+	// regular track it lands on has to be started by hand. A placeholder it lands on is picked up by the
+	// songchange handler.
+	function moveSpotify(step) {
+		const before = readSpotify().uri;
+		state.advancingUntil = Date.now() + 1500;
+		if (step === "back") Spicetify.Player.back();
+		else Spicetify.Player.next();
+		setTimeout(() => {
+			if (state.status !== "idle") return; // another placeholder has taken over
+			if (readSpotify().uri === before) {
+				// Spotify could not move (start or end of its context). Going back then restarts the same
+				// placeholder, so restart our track too. Going forward must not, or the last track would
+				// repeat forever; just keep Spotify from playing the silent file.
+				if (step === "back" && isPlaceholderItem()) startFromPlaceholder();
+				else if (Spicetify.Player.isPlaying() && isPlaceholderItem()) Spicetify.Player.pause();
+				return;
+			}
+			if (!Spicetify.Player.isPlaying()) Spicetify.Player.play();
+		}, 500);
+	}
+
+	function reportPlaceholderError(error) {
+		if (error?.name === "AbortError") return; // the folder dialog was cancelled
+		console.error("[Synthesis Spicetify] could not hand the track to Spotify", error);
+		notify(t("playFailed", error?.message || error), true);
+	}
+
+	// True once Spotify's current item is the placeholder. Spotify may spell a local file's URI differently from
+	// the local files index, so the tags (title = video ID, album "Synthesis") count as well.
+	async function waitForSpotifyItem(uri, id, timeoutMs) {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			const item = Spicetify.Player.data?.item;
+			if (item?.uri === uri) return true;
+			if (item?.uri?.startsWith("spotify:local:") && item.name === id && item.album?.name === PLACEHOLDER_ALBUM) return true;
+			await sleep(100);
+		}
+		return false;
+	}
+
+	const LOCAL_FILES_CONTEXT = "spotify:local-files"; // the playback context Spotify uses for local files
+
+	// Plays a placeholder in Spotify's own player. The songchange handler then takes over and streams the
+	// real track (see startFromPlaceholder).
+	async function playPlaceholder(uri, id) {
+		// A local file can only be played inside the Local Files context, so start that context at the placeholder.
+		for (const attempt of [
+			() => Spicetify.Player.playUri(LOCAL_FILES_CONTEXT, {}, { skipTo: { uri } }),
+			() => Spicetify.Player.playUri(uri),
+		]) {
+			try {
+				await attempt();
+			} catch (error) {
+				console.warn("[Synthesis Spicetify] could not start the placeholder", error);
+			}
+			if (await waitForSpotifyItem(uri, id, 2000)) return;
+		}
+		console.warn("[Synthesis Spicetify] Spotify did not switch to the placeholder", { expected: uri, current: Spicetify.Player.data?.item?.uri });
+		// Spotify did not switch. Put the placeholder at the front of the queue and skip to it instead.
+		// (Both fail without an active Spotify session, which is reported below.)
+		try {
+			await queuePlaceholder(uri, true);
+			await Spicetify.Player.next();
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] queue fallback failed", error);
+		}
+		if (await waitForSpotifyItem(uri, id, 2000)) return;
+		throw new Error(t("placeholderNotPlayed"));
+	}
+
+	// Adds a placeholder to Spotify's own queue, at the front (play next) or at the end. Resolves with true
+	// when it ended up at the front. These queue calls are internal APIs.
+	async function queuePlaceholder(uri, next) {
+		const api = Spicetify.Platform?.PlayerAPI;
+		const items = [{ uri }];
+		const addToEnd = () => (typeof api?.addToQueue === "function" ? api.addToQueue(items) : Spicetify.addToQueue(items));
+		const upcoming = Spicetify.Queue?.nextTracks;
+		if (!next || !Array.isArray(upcoming)) {
+			await addToEnd();
+			return false;
+		}
+		const first = upcoming[0]?.contextTrack;
+		if (!first?.uri) {
+			await addToEnd(); // nothing follows yet, so the end is also the front
+			return true;
+		}
+		if (typeof api?.insertIntoQueue === "function") {
+			try {
+				await api.insertIntoQueue(items, { before: { uri: first.uri, uid: first.uid } });
+				return true;
+			} catch (error) {
+				console.warn("[Synthesis Spicetify] could not insert at the front of the queue", error);
+			}
+		}
+		await addToEnd();
+		return false;
+	}
+
+	async function playNow(track) {
+		if (!requirePlayback()) return;
+		// The same track is already active: restart it instead of asking Spotify to play its placeholder
+		// again, which would look like a press of the play/pause button.
+		if (state.current && trackKey(state.current) === trackKey(track) && state.status !== "idle") {
+			seekAudio(0);
+			if (state.status === "paused") togglePause();
+			return;
+		}
+		try {
+			// Nothing may be awaited before this: choosing the placeholder folder needs the click's user gesture.
+			const uri = await ensurePlaceholder(track, t("preparing"));
+			await playPlaceholder(uri, track.id);
+		} catch (error) {
+			reportPlaceholderError(error);
+		}
+	}
+
+	async function addToQueue(track, { next = false } = {}) {
+		if (!requirePlayback()) return;
+		try {
+			const uri = await ensurePlaceholder(track, t("preparing"));
+			// Nothing is playing at all: there is no queue to add to, so start right away.
+			if (!readSpotify().uri && state.status === "idle") {
+				await playPlaceholder(uri, track.id);
+				return;
+			}
+			const placedNext = await queuePlaceholder(uri, next);
+			notify(t(placedNext ? "addedNext" : "addedQueue"));
+			if (state.status !== "idle") setTimeout(prefetchNext, 800); // the queue needs a moment to update
+		} catch (error) {
+			reportPlaceholderError(error);
+		}
+	}
+
+	// ---- Spotify started a placeholder ----
+	function isPlaceholderItem() {
 		const item = Spicetify.Player.data?.item;
 		if (!item?.uri?.startsWith("spotify:local:")) return false;
-		return Boolean(savedTracks[item.uri]) || item.album?.name === DUMMY_ALBUM;
+		return Boolean(savedTracks[item.uri]) || item.album?.name === PLACEHOLDER_ALBUM;
 	}
 
 	// Spotify just started a placeholder. Pause it (keeping its session, so that the queue or playlist can
 	// move on afterwards) and stream the real track instead.
-	async function startFromDummy() {
+	async function startFromPlaceholder() {
 		const item = Spicetify.Player.data?.item;
 		const uri = item?.uri;
-		if (!uri || (state.status !== "idle" && uri === state.dummyUri)) return; // already handling it
+		if (!uri || (state.status !== "idle" && uri === state.placeholderUri)) return; // already handling it
 		state.suppressUntil = Date.now() + 500; // our own pause must not look like a user action
 		Spicetify.Player.pause();
 		if (!requirePlayback()) return;
 
-		let track = savedTracks[uri] ?? dummyTracks.get(uri);
+		let track = savedTracks[uri] ?? placeholderTracks.get(uri);
 		if (!track) {
 			// No stored mapping (for example the extension data was cleared): the title tag is the video ID,
 			// and playback only needs the ID. Display details are missing, so the ID stands in for the title.
@@ -1877,18 +2024,69 @@
 		}
 		if (Spicetify.Player.data?.item?.uri !== uri) return; // Spotify moved on while we were searching
 
-		state.dummyUri = uri;
+		state.placeholderUri = uri;
 		playTrack({ ...track });
 	}
+
+	let lastSpotify = readSpotify();
+
+	// Spotify is playing a placeholder that none of our tracks belongs to yet (it was started again after
+	// our track had been stopped, or an event was missed): stream the real track.
+	function reconcilePlaceholder() {
+		const now = Date.now();
+		if (now < state.suppressUntil || now < state.advancingUntil) return;
+		if (!Spicetify.Player.isPlaying() || !isPlaceholderItem()) return;
+		if (state.status !== "idle" && readSpotify().uri === state.placeholderUri) return;
+		startFromPlaceholder();
+	}
+
+	Spicetify.Player.addEventListener("onplaypause", () => {
+		if (!Spicetify.Player.isPlaying() || Date.now() < state.suppressUntil) return;
+		if (state.status !== "idle") {
+			// Spotify's play button (or a media key) was pressed while a non-Spotify track is active:
+			// keep Spotify silent and use the button as play/pause for our track.
+			if (readSpotify().uri === state.placeholderUri || !isPlaceholderItem()) {
+				state.suppressUntil = Date.now() + 300;
+				Spicetify.Player.pause();
+				togglePause();
+				return;
+			}
+		}
+		reconcilePlaceholder();
+	});
+
+	Spicetify.Player.addEventListener("songchange", () => {
+		const now = readSpotify();
+		const prev = lastSpotify;
+		lastSpotify = now;
+		if (!now.uri || now.uri === prev.uri) return;
+		if (Date.now() < state.suppressUntil) return;
+
+		// One of our placeholders started: stream the real track instead.
+		if (isPlaceholderItem()) {
+			startFromPlaceholder();
+			return;
+		}
+
+		// Spotify moved on to a regular track, or the user started something else: our track is over.
+		if (state.status !== "idle") stopTrack(false);
+	});
+
+	// Safety net: events are ignored while our own pause is settling, so a placeholder that Spotify lands on
+	// in that moment would otherwise play as silence.
+	setInterval(reconcilePlaceholder, 700);
+
+	// ---------------------------------------------------------------------
+	// Real names and cover art for placeholders
+	// ---------------------------------------------------------------------
 
 	// ---- Showing real names for placeholders ----
 	// The placeholder file only carries the video ID as its title and a fixed artist / album, so Spotify's own
 	// rows (playlists, queue, player bar) would show "dQw4w9WgXcQ / YouTube / Synthesis". Only the DOM text is
 	// rewritten here: nothing is written to the file or to Spotify's data, and the real values live in memory.
+
 	const VIDEO_ID_RE = /^[\w-]{11}$/;
-	const displayInfo = new Map(); // video ID -> { title, artist, album }
 	const displayFetchedAt = new Map(); // video ID -> time of the last lookup, so a failure is retried only rarely
-	const youtubeThumbnail = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
 
 	function savedById(id) {
 		for (const track of Object.values(savedTracks)) if (track.id === id) return track;
@@ -1901,13 +2099,7 @@
 		if (known) return known;
 		const saved = savedById(id);
 		if (saved?.title) {
-			const info = {
-				title: saved.title,
-				artist: (saved.artists || []).join(", "),
-				album: saved.album || "",
-				thumbnail: saved.thumbnail || youtubeThumbnail(id),
-				letterbox: !saved.thumbnail, // YouTube's own thumbnails have black bars above and below the picture
-			};
+			const info = displayInfoOf(saved);
 			displayInfo.set(id, info);
 			return info;
 		}
@@ -1971,49 +2163,24 @@
 	// containing several rows is never mistaken for one track.
 	function findTrackScope(owner, titleNode) {
 		const row = owner.closest('[data-testid="tracklist-row"], [role="row"]');
-		if (row) return findTextNode(row, DUMMY_ARTIST) ? row : null;
+		if (row) return findTextNode(row, PLACEHOLDER_ARTIST) ? row : null;
 		let scope = owner;
 		for (let depth = 0; depth < 6 && scope; depth++, scope = scope.parentElement) {
-			if (!findTextNode(scope, DUMMY_ARTIST)) continue;
+			if (!findTextNode(scope, PLACEHOLDER_ARTIST)) continue;
 			return countIdNodes(scope, titleNode) === 0 ? scope : null;
 		}
 		return null;
 	}
 
-	// If this text node is a placeholder's title (a video ID next to the fixed artist), swap in the real text.
-	// Only nodeValue is changed, so React keeps owning the node and simply overwrites it when the row is reused.
-	function rewriteTextNode(node) {
-		const id = node.nodeValue?.trim();
-		if (!id || !VIDEO_ID_RE.test(id)) return;
-		const owner = node.parentElement;
-		if (!owner || isOwnUi(owner)) return;
-
-		const scope = findTrackScope(owner, node);
-		if (!scope) return;
-		const artistNode = findTextNode(scope, DUMMY_ARTIST);
-		if (!artistNode) return;
-
-		const info = lookupDisplay(id);
-		if (!info) return;
-		const entry = { title: info.title, art: placeArt(node, scope, info), scope, info };
-		node.nodeValue = info.title;
-		rewritten.set(node, entry);
-		if (!entry.art) {
-			ART_RETRY_DELAYS.forEach((delay, i) => setTimeout(() => retryArt(node, i === ART_RETRY_DELAYS.length - 1), delay));
-		}
-		if (info.artist) artistNode.nodeValue = info.artist;
-		if (info.album) {
-			const albumNode = findTextNode(scope, DUMMY_ALBUM);
-			if (albumNode) albumNode.nodeValue = info.album;
-		}
-	}
-
 	// ---- Cover art for placeholders ----
 	// Spotify shows a generic icon for a local file. The real cover is laid over that slot as a separate element
 	// (Spotify's own nodes are left alone), and removed again as soon as the row shows something else.
+
 	const rewritten = new WeakMap(); // rewritten title text node -> { title, art }
 
 	let artFailReason = ""; // why the last placeArt() call gave up, for the console hint below
+
+	const ART_RETRY_DELAYS = [120, 350, 800, 1600, 3200]; // ms after the first attempt, see retryArt()
 
 	// A cover slot is the cover image itself, or the tile around a placeholder icon.
 	function slotOf(el, titleNode) {
@@ -2142,7 +2309,6 @@
 
 	// The cover often cannot be placed on the first try (the row or panel is not laid out yet), so a few
 	// retries follow the first attempt. The last failure is reported in the console.
-	const ART_RETRY_DELAYS = [120, 350, 800, 1600, 3200];
 
 	function retryArt(node, last) {
 		const entry = rewritten.get(node);
@@ -2165,6 +2331,34 @@
 			const node = art._titleNode;
 			const entry = node && rewritten.get(node);
 			if (!entry || entry.art !== art || !node.isConnected || node.nodeValue !== entry.title) removeArt(art);
+		}
+	}
+
+	// If this text node is a placeholder's title (a video ID next to the fixed artist), swap in the real text.
+	// Only nodeValue is changed, so React keeps owning the node and simply overwrites it when the row is reused.
+	function rewriteTextNode(node) {
+		const id = node.nodeValue?.trim();
+		if (!id || !VIDEO_ID_RE.test(id)) return;
+		const owner = node.parentElement;
+		if (!owner || isOwnUi(owner)) return;
+
+		const scope = findTrackScope(owner, node);
+		if (!scope) return;
+		const artistNode = findTextNode(scope, PLACEHOLDER_ARTIST);
+		if (!artistNode) return;
+
+		const info = lookupDisplay(id);
+		if (!info) return;
+		const entry = { title: info.title, art: placeArt(node, scope, info), scope, info };
+		node.nodeValue = info.title;
+		rewritten.set(node, entry);
+		if (!entry.art) {
+			ART_RETRY_DELAYS.forEach((delay, i) => setTimeout(() => retryArt(node, i === ART_RETRY_DELAYS.length - 1), delay));
+		}
+		if (info.artist) artistNode.nodeValue = info.artist;
+		if (info.album) {
+			const albumNode = findTextNode(scope, PLACEHOLDER_ALBUM);
+			if (albumNode) albumNode.nodeValue = info.album;
 		}
 	}
 
@@ -2212,59 +2406,9 @@
 	scheduleDisplayRewrite(true);
 
 	// ---------------------------------------------------------------------
-	// Spotify player integration
-	// ---------------------------------------------------------------------
-	let lastSpotify = readSpotify();
-
-	// Spotify is playing a placeholder that none of our tracks belongs to yet (it was started again after
-	// our track had been stopped, or an event was missed): stream the real track.
-	function reconcilePlaceholder() {
-		const now = Date.now();
-		if (now < state.suppressUntil || now < state.advancingUntil) return;
-		if (!Spicetify.Player.isPlaying() || !isDummyItem()) return;
-		if (state.status !== "idle" && readSpotify().uri === state.dummyUri) return;
-		startFromDummy();
-	}
-
-	Spicetify.Player.addEventListener("onplaypause", () => {
-		if (!Spicetify.Player.isPlaying() || Date.now() < state.suppressUntil) return;
-		if (state.status !== "idle") {
-			// Spotify's play button (or a media key) was pressed while a non-Spotify track is active:
-			// keep Spotify silent and use the button as play/pause for our track.
-			if (readSpotify().uri === state.dummyUri || !isDummyItem()) {
-				state.suppressUntil = Date.now() + 300;
-				Spicetify.Player.pause();
-				toggleYT();
-				return;
-			}
-		}
-		reconcilePlaceholder();
-	});
-
-	Spicetify.Player.addEventListener("songchange", () => {
-		const now = readSpotify();
-		const prev = lastSpotify;
-		lastSpotify = now;
-		if (!now.uri || now.uri === prev.uri) return;
-		if (Date.now() < state.suppressUntil) return;
-
-		// One of our placeholders started: stream the real track instead.
-		if (isDummyItem()) {
-			startFromDummy();
-			return;
-		}
-
-		// Spotify moved on to a regular track, or the user started something else: our track is over.
-		if (state.status !== "idle") stopYT(false);
-	});
-
-	// Safety net: events are ignored while our own pause is settling, so a placeholder that Spotify lands on
-	// in that moment would otherwise play as silence.
-	setInterval(reconcilePlaceholder, 700);
-
-	// ---------------------------------------------------------------------
 	// Styles
 	// ---------------------------------------------------------------------
+
 	document.head.append(
 		h("style", { id: "synthesis-spicetify-style" }, `
 		.ss-section { margin: 8px 0 24px; padding: 0 var(--content-spacing, 32px); box-sizing: border-box; }
@@ -2399,38 +2543,9 @@
 	);
 
 	// ---------------------------------------------------------------------
-	// Images (fall back to Blob URLs fetched through libcurl if <img> is blocked)
-	// ---------------------------------------------------------------------
-	const imageCache = new Map();
-
-	function loadImage(img, url) {
-		if (!url) return;
-		if (imageCache.has(url)) {
-			img.src = imageCache.get(url);
-			return;
-		}
-		img.addEventListener(
-			"error",
-			async () => {
-				if (img.dataset.fallback) return;
-				img.dataset.fallback = "1";
-				try {
-					const res = await curlFetch(url);
-					const blobUrl = URL.createObjectURL(await res.blob());
-					imageCache.set(url, blobUrl);
-					img.src = blobUrl;
-				} catch {
-					// leave the placeholder
-				}
-			},
-			{ once: true }
-		);
-		img.src = url;
-	}
-
-	// ---------------------------------------------------------------------
 	// Mini player (visible while a non-Spotify track is active)
 	// ---------------------------------------------------------------------
+
 	let mini = null;
 
 	function ensureMini() {
@@ -2440,12 +2555,12 @@
 		const sub = h("div", { class: "ss-mini-sub" });
 		const seek = h("input", { class: "ss-mini-seek", type: "range", min: "0", max: "1000", value: "0" });
 		seek.addEventListener("input", () => {
-			const duration = Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
+			const duration = trackDurationSec();
 			if (duration > 0) seekAudio((Number(seek.value) / 1000) * duration);
 		});
-		const toggle = h("button", { class: "ss-btn", onClick: toggleYT });
+		const toggle = h("button", { class: "ss-btn", onClick: togglePause });
 		const next = h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.next, onClick: skipNext });
-		const close = h("button", { class: "ss-btn", html: ICONS.close, onClick: () => stopYT(false) });
+		const close = h("button", { class: "ss-btn", html: ICONS.close, onClick: () => stopTrack(false) });
 		const root = h(
 			"div",
 			{ class: "ss-mini" },
@@ -2471,11 +2586,7 @@
 			state.status === "loading"
 				? `${t("loading", state.progress)}  -  ${track.artists.join(", ")}`
 				: track.artists.join(", ");
-		if (ui.lastCoverUrl !== track.thumbnail) {
-			ui.lastCoverUrl = track.thumbnail;
-			ui.cover.removeAttribute("data-fallback");
-			loadImage(ui.cover, track.thumbnail);
-		}
+		setCover(ui, track.thumbnail);
 		ui.toggle.innerHTML = state.status === "playing" ? ICONS.pause : ICONS.play;
 		ui.toggle.title = state.status === "playing" ? "Pause" : t("play");
 		ui.seek.disabled = state.status === "loading";
@@ -2485,7 +2596,7 @@
 	function updateSeek() {
 		updateTakeoverProgress();
 		if (!mini || state.status === "loading") return;
-		const duration = Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
+		const duration = trackDurationSec();
 		if (duration > 0) mini.seek.value = String(Math.round((audio.currentTime / duration) * 1000));
 	}
 
@@ -2497,6 +2608,7 @@
 	// the originals are only hidden with CSS, so a re-render of Spotify cannot break anything.
 	// If a part of the player bar cannot be found, the mini player is shown instead.
 	// ---------------------------------------------------------------------
+
 	const PLAYBAR = {
 		// "-v2" is what current Spotify builds use; the plain name is kept for older builds.
 		widget: '[data-testid="now-playing-widget-v2"], [data-testid="now-playing-widget"]',
@@ -2507,20 +2619,10 @@
 		skipForward: '[data-testid="control-button-skip-forward"]',
 		skipBack: '[data-testid="control-button-skip-back"]',
 	};
+
 	const takeover = { active: false, ui: null, widget: null, progressHost: null, playPause: null };
 
-	const isYTActive = () => Boolean(state.current) && state.status !== "idle";
-	const setText = (el, text) => {
-		if (el.textContent !== text) el.textContent = text;
-	};
-	const clock = (sec) => {
-		const total = Math.max(0, Math.floor(Number.isFinite(sec) ? sec : 0));
-		return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
-	};
-
-	function trackDurationSec() {
-		return Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
-	}
+	const isTrackActive = () => Boolean(state.current) && state.status !== "idle";
 
 	function ensureTakeoverUi() {
 		if (takeover.ui) return takeover.ui;
@@ -2549,6 +2651,7 @@
 			const rect = seek.getBoundingClientRect();
 			return rect.width > 0 ? Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)) : 0;
 		};
+		const hideTip = () => tip.classList.remove("ss-visible");
 		// Show the time under the pointer in a tooltip above the bar. It is attached to the body so that
 		// no overflow rule of Spotify's player bar can clip it.
 		const showTip = (event, fraction) => {
@@ -2563,7 +2666,6 @@
 			tip.style.left = `${Math.round(x - half)}px`;
 			tip.style.top = `${Math.round(rect.top - tip.offsetHeight - 2)}px`;
 		};
-		const hideTip = () => tip.classList.remove("ss-visible");
 		// Draw the playhead at the given fraction while dragging (the audio is only moved on release).
 		const previewDrag = (fraction) => {
 			ui.dragFraction = fraction;
@@ -2648,7 +2750,7 @@
 
 	// Returns true while Spotify's player bar is showing the active non-Spotify track.
 	function syncTakeover() {
-		if (!isYTActive()) {
+		if (!isTrackActive()) {
 			if (takeover.active) {
 				takeover.active = false;
 				document.body.classList.remove("ss-takeover");
@@ -2673,11 +2775,7 @@
 		const artists = [track.artists.join(", "), providerLabel].filter(Boolean).join(" \u00b7 ");
 		setText(ui.title, track.title);
 		setText(ui.sub, state.status === "loading" ? `${t("loading", state.progress)}  -  ${artists}` : artists);
-		if (ui.lastCoverUrl !== track.thumbnail) {
-			ui.lastCoverUrl = track.thumbnail;
-			ui.cover.removeAttribute("data-fallback");
-			loadImage(ui.cover, track.thumbnail);
-		}
+		setCover(ui, track.thumbnail);
 		const icon = state.status === "playing" ? "barPause" : "barPlay";
 		if (ui.lastIcon !== icon) {
 			ui.lastIcon = icon;
@@ -2717,7 +2815,7 @@
 		(event) => {
 			if (!takeover.active || !(event.target instanceof Element)) return;
 			let action = null;
-			if (event.target.closest(PLAYBAR.playPause)) action = toggleYT;
+			if (event.target.closest(PLAYBAR.playPause)) action = togglePause;
 			else if (event.target.closest(PLAYBAR.skipForward)) action = skipNext;
 			else if (event.target.closest(PLAYBAR.skipBack)) action = skipPrev;
 			if (!action) return;
@@ -2731,13 +2829,6 @@
 	// ---------------------------------------------------------------------
 	// Search page integration
 	// ---------------------------------------------------------------------
-	// Open the track on YouTube Music in the default external browser
-	function openInBrowser(track) {
-		const url = `https://music.youtube.com/watch?v=${encodeURIComponent(track.id)}`;
-		// Do not check the return value: the Spotify client may return null even when the browser opened,
-		// and a fallback would open a second tab
-		window.open(url, "_blank", "noopener,noreferrer");
-	}
 
 	const search = {
 		query: "",
@@ -2761,10 +2852,22 @@
 		observer: null
 	};
 
+	// The buttons of a result. Without playback enabled a result only offers "open in browser".
+	function actionButtons(track) {
+		const canPlay = config.playbackEnabled;
+		return h(
+			"div",
+			{ class: "ss-actions" },
+			canPlay && h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
+			canPlay && h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) }),
+			canPlay && h("button", { class: "ss-btn", title: t("saveToPlaylist"), html: ICONS.savePlaylist, onClick: (event) => openPlaylistPicker(track, event.currentTarget) }),
+			h("button", { class: "ss-btn", title: t("openBrowser"), html: ICONS.external, onClick: () => openInBrowser(track) })
+		);
+	}
+
 	function trackRow(track) {
 		const img = h("img", { class: "ss-cover", alt: "", loading: "lazy" });
 		loadImage(img, track.thumbnail);
-		// Without playback enabled the rows only offer "open in browser".
 		const canPlay = config.playbackEnabled;
 		return h(
 			"div",
@@ -2777,14 +2880,7 @@
 			),
 			h("div", { class: "ss-meta" }, h("div", { class: "ss-title" }, track.title), h("div", { class: "ss-sub" }, track.artists.join(", "))),
 			h("div", { class: "ss-album" }, track.album),
-			h(
-				"div",
-				{ class: "ss-actions" },
-				canPlay && h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
-				canPlay && h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) }),
-				canPlay && h("button", { class: "ss-btn", title: t("saveToPlaylist"), html: ICONS.savePlaylist, onClick: (event) => openPlaylistPicker(track, event.currentTarget) }),
-				h("button", { class: "ss-btn", title: t("openBrowser"), html: ICONS.external, onClick: () => openInBrowser(track) })
-			),
+			actionButtons(track),
 			h("div", { class: "ss-dur" }, formatTime(track.durationMs))
 		);
 	}
@@ -2799,14 +2895,7 @@
 			{ class: "ss-top", onDblclick: canPlay ? () => playNow(track) : null },
 			img,
 			h("div", { class: "ss-meta" }, h("div", { class: "ss-top-title" }, track.title), h("div", { class: "ss-top-sub" }, track.artists.join(", "))),
-			h(
-				"div",
-				{ class: "ss-actions" },
-				canPlay && h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
-				canPlay && h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) }),
-				canPlay && h("button", { class: "ss-btn", title: t("saveToPlaylist"), html: ICONS.savePlaylist, onClick: (event) => openPlaylistPicker(track, event.currentTarget) }),
-				h("button", { class: "ss-btn", title: t("openBrowser"), html: ICONS.external, onClick: () => openInBrowser(track) })
-			),
+			actionButtons(track),
 			canPlay && h("button", { class: "ss-top-play", title: t("play"), html: ICONS.play, onClick: () => playNow(track) })
 		);
 	}
@@ -3036,20 +3125,21 @@
 	// Spotify re-renders the search page and may drop our section; re-attach when needed.
 	let attachScheduled = false;
 	new MutationObserver((mutations) => {
-		if (attachScheduled || (!search.query && !isYTActive())) return;
+		if (attachScheduled || (!search.query && !isTrackActive())) return;
 		// Ignore changes made by this extension to its own player bar elements.
 		if (mutations.every((m) => m.target.closest?.(".ss-own"))) return;
 		attachScheduled = true;
 		requestAnimationFrame(() => {
 			attachScheduled = false;
 			attachSection();
-			if (isYTActive()) syncTakeover();
+			if (isTrackActive()) syncTakeover();
 		});
 	}).observe(document.body, { childList: true, subtree: true });
 
 	// ---------------------------------------------------------------------
-	// Diagnostics and settings
+	// Diagnostics
 	// ---------------------------------------------------------------------
+
 	async function runDiagnostics(log) {
 		const step = async (label, fn) => {
 			log(`[..] ${label}`);
@@ -3128,54 +3218,168 @@
 		});
 	}
 
-	function resetNetwork() {
-		// Reset the lazily created singletons so new Wisp settings take effect.
-		curlPromise = null;
-		innertubes.plain = null;
-		innertubes.player = null;
-		warmUpPromise = null;
-		cookieJar.clear();
+	// ---------------------------------------------------------------------
+	// Settings
+	// ---------------------------------------------------------------------
+
+	// A command of the setup guide. Clicking it copies the text.
+	function commandBlock(label, text) {
+		return h(
+			"div",
+			{},
+			label && h("div", { class: "ss-desc" }, label),
+			h("pre", { class: "ss-cmd", title: t("copyHint"), onClick: () => copyText(text) }, text)
+		);
 	}
 
-	// Plain WebSocket handshake against the local Wisp server. With on-demand start this also wakes it up.
-	function probeLocalWisp(url, timeoutMs = 10000) {
-		return new Promise((resolve) => {
-			let ws = null;
-			let settled = false;
-			const finish = (ok) => {
-				if (settled) return;
-				settled = true;
-				clearTimeout(timer);
-				try {
-					ws?.close();
-				} catch {
-					// ignore
-				}
-				resolve(ok);
-			};
-			const timer = setTimeout(() => finish(false), timeoutMs);
-			try {
-				ws = new WebSocket(url);
-				ws.addEventListener("open", () => finish(true));
-				ws.addEventListener("error", () => finish(false));
-				ws.addEventListener("close", () => finish(false));
-			} catch {
-				finish(false);
-			}
-		});
+	// A button that needs two clicks within a few seconds: the first one arms it, the second one confirms.
+	function createConfirmButton(label, armedLabel, onConfirm) {
+		let armed = false;
+		let timer = null;
+		const button = h(
+			"button",
+			{
+				class: "ss-secondary",
+				onClick: () => {
+					if (!armed) {
+						armed = true;
+						button.textContent = armedLabel;
+						timer = setTimeout(disarm, 4000);
+						return;
+					}
+					disarm();
+					onConfirm();
+				},
+			},
+			label
+		);
+		function disarm() {
+			armed = false;
+			clearTimeout(timer);
+			button.textContent = label;
+		}
+		return button;
 	}
 
-	async function copyText(text) {
-		try {
-			await navigator.clipboard.writeText(text);
-		} catch {
-			try {
-				Spicetify.Platform.ClipboardAPI.copy(text);
-			} catch {
-				return;
+	// The "Enable playback" switch and the setup guide of the local Wisp server. The switch shows the saved
+	// state; turning it on only sticks once the local Wisp answers. Returns the elements to show, and reset()
+	// which cancels a running check, hides the guide and shows the saved state again.
+	function createPlaybackSection() {
+		const playback = h("input", { type: "checkbox" });
+		playback.checked = config.playbackEnabled;
+		const playbackSwitch = h("span", { class: "ss-switch" }, playback, h("span", {}));
+		const guideStatus = h("div", { class: "ss-guide-status" });
+		const checkButton = h("button", { class: "ss-primary", onClick: () => checkLocalWisp() }, t("guideCheck"));
+		const guide = h(
+			"div",
+			{ class: "ss-guide", style: "display:none" },
+			h("strong", {}, t("guideTitle")),
+			h("div", { class: "ss-desc" }, t("guideIntro", config.localWisp)),
+			h(
+				"ol",
+				{},
+				h("li", {}, t("guideStep1")),
+				h(
+					"li",
+					{},
+					t("guideStep2"),
+					commandBlock("Linux / macOS", `curl -fsSLO ${WISP_SCRIPT_URL} && python3 wisp_ondemand.py install`),
+					commandBlock("Windows (PowerShell)", `curl.exe -fsSLO ${WISP_SCRIPT_URL}; py -3 wisp_ondemand.py install`)
+				),
+				h("li", {}, t("guideStep3"))
+			),
+			h(
+				"div",
+				{ class: "ss-buttons" },
+				checkButton,
+				h(
+					"button",
+					{
+						class: "ss-secondary",
+						onClick: () => window.open("https://github.com/kagamiomochi/Synthesis-Spicetify#setting-up-the-local-wisp-server", "_blank", "noopener,noreferrer"),
+					},
+					t("guideReadme")
+				)
+			),
+			guideStatus
+		);
+		const guideToggle = h(
+			"button",
+			{
+				class: "ss-link",
+				style: "margin-top:6px",
+				onClick: () => {
+					guide.style.display = guide.style.display === "none" ? "block" : "none";
+				},
+			},
+			t("showGuide")
+		);
+
+		let checkToken = 0;
+		let checking = false;
+		// While the connection is being verified the switch stays off and shows a spinner instead of the knob.
+		function setChecking(value) {
+			checking = value;
+			playbackSwitch.classList.toggle("ss-checking", value);
+			checkButton.disabled = value;
+		}
+		function setPlayback(enabled) {
+			saveConfig({ playbackEnabled: enabled });
+			playback.checked = enabled;
+			if (!enabled && state.status !== "idle") stopTrack(false);
+			resetNetwork();
+			renderSearch();
+			notify(t(enabled ? "playbackOnToast" : "playbackOffToast"));
+		}
+		async function checkLocalWisp() {
+			const token = ++checkToken;
+			guideStatus.textContent = t("guideChecking");
+			guide.style.display = "block";
+			// Do not show the switch as on until the connection is confirmed.
+			if (!config.playbackEnabled) playback.checked = false;
+			setChecking(true);
+			const ok = await probeLocalWisp(config.localWisp);
+			if (token !== checkToken) return; // a newer check or the switch took over
+			setChecking(false);
+			if (ok) {
+				guideStatus.textContent = t("guideOk");
+				if (!config.playbackEnabled) setPlayback(true);
+			} else {
+				guideStatus.textContent = t("guideFailed", config.localWisp);
+				playback.checked = config.playbackEnabled;
 			}
 		}
-		notify(t("copied"));
+
+		playback.addEventListener("change", () => {
+			if (!playback.checked) {
+				checkToken++;
+				setChecking(false);
+				guide.style.display = "none";
+				guideStatus.textContent = "";
+				if (config.playbackEnabled) setPlayback(false);
+				return;
+			}
+			if (checking) {
+				// Clicked again while verifying: cancel the check and keep the switch off.
+				checkToken++;
+				setChecking(false);
+				guideStatus.textContent = "";
+				playback.checked = config.playbackEnabled;
+				return;
+			}
+			checkLocalWisp();
+		});
+
+		return {
+			nodes: [h("label", { class: "ss-toggle" }, playbackSwitch, t("playbackLabel")), h("div", { class: "ss-desc" }, t("playbackDesc")), guideToggle, guide],
+			reset() {
+				checkToken++;
+				setChecking(false);
+				guide.style.display = "none";
+				guideStatus.textContent = "";
+				playback.checked = config.playbackEnabled;
+			},
+		};
 	}
 
 	function openSettings() {
@@ -3198,171 +3402,31 @@
 				clients: clientList.length ? clientList : DEFAULT_CONFIG.clients,
 			};
 		};
-
-		// Playback toggle. The switch shows the saved state; turning it on only sticks once the local Wisp answers.
-		const playback = h("input", { type: "checkbox" });
-		playback.checked = config.playbackEnabled;
-		const playbackSwitch = h("span", { class: "ss-switch" }, playback, h("span", {}));
-		const guideStatus = h("div", { class: "ss-guide-status" });
-		const checkButton = h("button", { class: "ss-primary", onClick: () => checkLocalWisp() }, t("guideCheck"));
-		const command = (label, text) =>
-			h(
-				"div",
-				{},
-				label && h("div", { class: "ss-desc" }, label),
-				h("pre", { class: "ss-cmd", title: t("copyHint"), onClick: () => copyText(text) }, text)
-			);
-		const guide = h(
-			"div",
-			{ class: "ss-guide", style: "display:none" },
-			h("strong", {}, t("guideTitle")),
-			h("div", { class: "ss-desc" }, t("guideIntro", config.localWisp)),
-			h(
-				"ol",
-				{},
-				h("li", {}, t("guideStep1")),
-				h(
-					"li",
-					{},
-					t("guideStep2"),
-					command("Linux / macOS", `curl -fsSLO ${WISP_SCRIPT_URL} && python3 wisp_ondemand.py install`),
-					command("Windows (PowerShell)", `curl.exe -fsSLO ${WISP_SCRIPT_URL}; py -3 wisp_ondemand.py install`)
-				),
-				h("li", {}, t("guideStep3"))
-			),
-			h(
-				"div",
-				{ class: "ss-buttons" },
-				checkButton,
-				h(
-					"button",
-					{
-						class: "ss-secondary",
-						onClick: () =>
-							window.open("https://github.com/kagamiomochi/Synthesis-Spicetify#setting-up-the-local-wisp-server", "_blank", "noopener,noreferrer"),
-					},
-					t("guideReadme")
-				)
-			),
-			guideStatus
-		);
-
-		let checkToken = 0;
-		let checking = false;
-		// While the connection is being verified the switch stays off and shows a spinner instead of the knob.
-		const setChecking = (value) => {
-			checking = value;
-			playbackSwitch.classList.toggle("ss-checking", value);
-			checkButton.disabled = value;
-		};
-		const setPlayback = (enabled) => {
-			saveConfig({ playbackEnabled: enabled });
-			playback.checked = enabled;
-			if (!enabled && state.status !== "idle") stopYT(false);
+		const apply = () => {
+			saveConfig(collect());
 			resetNetwork();
-			renderSearch();
-			notify(t(enabled ? "playbackOnToast" : "playbackOffToast"));
 		};
-		const checkLocalWisp = async () => {
-			const token = ++checkToken;
-			guideStatus.textContent = t("guideChecking");
-			guide.style.display = "block";
-			// Do not show the switch as on until the connection is confirmed.
-			if (!config.playbackEnabled) playback.checked = false;
-			setChecking(true);
-			const ok = await probeLocalWisp(config.localWisp);
-			if (token !== checkToken) return; // a newer check or the switch took over
-			setChecking(false);
-			if (ok) {
-				guideStatus.textContent = t("guideOk");
-				if (!config.playbackEnabled) setPlayback(true);
-			} else {
-				guideStatus.textContent = t("guideFailed", config.localWisp);
-				playback.checked = config.playbackEnabled;
-			}
-		};
-		playback.addEventListener("change", () => {
-			if (!playback.checked) {
-				checkToken++;
-				setChecking(false);
-				guide.style.display = "none";
-				guideStatus.textContent = "";
-				if (config.playbackEnabled) setPlayback(false);
-				return;
-			}
-			if (checking) {
-				// Clicked again while verifying: cancel the check and keep the switch off.
-				checkToken++;
-				setChecking(false);
-				guideStatus.textContent = "";
-				playback.checked = config.playbackEnabled;
-				return;
-			}
-			checkLocalWisp();
-		});
 
-		// Reset button. The first click arms it, the second click within a few seconds actually resets.
-		let resetArmed = false;
-		let resetTimer = null;
-		const disarmReset = () => {
-			resetArmed = false;
-			clearTimeout(resetTimer);
-			resetButton.textContent = t("resetSettings");
-		};
-		const performReset = () => {
-			// Cancel any running connection check and hide the setup guide.
-			checkToken++;
-			setChecking(false);
-			guide.style.display = "none";
-			guideStatus.textContent = "";
-			output.style.display = "none";
-			output.textContent = "";
-			// Defaults have playback off, so stop the current YouTube track like the switch does.
-			if (config.playbackEnabled && state.status !== "idle") stopYT(false);
+		const playbackSection = createPlaybackSection();
+		const resetButton = createConfirmButton(t("resetSettings"), t("resetConfirm"), () => {
+			// Defaults have playback off, so stop the current track like the switch does.
+			if (config.playbackEnabled && state.status !== "idle") stopTrack(false);
 			resetConfig();
 			// Sync the form with the restored defaults.
 			wisp.value = config.wispServers.join("\n");
 			clients.value = config.clients.join(", ");
-			playback.checked = config.playbackEnabled;
+			output.style.display = "none";
+			output.textContent = "";
+			playbackSection.reset();
 			resetNetwork();
 			renderSearch();
 			notify(t("resetDone"));
-		};
-		const resetButton = h(
-			"button",
-			{
-				class: "ss-secondary",
-				onClick: () => {
-					if (!resetArmed) {
-						resetArmed = true;
-						resetButton.textContent = t("resetConfirm");
-						resetTimer = setTimeout(disarmReset, 4000);
-						return;
-					}
-					disarmReset();
-					performReset();
-				},
-			},
-			t("resetSettings")
-		);
+		});
 
 		const content = h(
 			"div",
 			{ class: "ss-settings" },
-			h("label", { class: "ss-toggle" }, playbackSwitch, t("playbackLabel")),
-			h("div", { class: "ss-desc" }, t("playbackDesc")),
-			h(
-				"button",
-				{
-					class: "ss-link",
-					style: "margin-top:6px",
-					onClick: () => {
-						guide.style.display = guide.style.display === "none" ? "block" : "none";
-					},
-				},
-				t("showGuide")
-			),
-			guide,
+			...playbackSection.nodes,
 			h("label", {}, t("wispLabel")),
 			wisp,
 			h("label", {}, t("clientsLabel")),
@@ -3370,21 +3434,40 @@
 			h(
 				"div",
 				{ class: "ss-buttons" },
-				h("button", { class: "ss-primary", onClick: () => { saveConfig(collect()); resetNetwork(); notify(t("saved")); } }, t("save")),
+				h(
+					"button",
+					{
+						class: "ss-primary",
+						onClick: () => {
+							apply();
+							notify(t("saved"));
+						},
+					},
+					t("save")
+				),
 				h(
 					"button",
 					{
 						class: "ss-secondary",
 						onClick: async () => {
-							saveConfig(collect());
-							resetNetwork();
+							apply();
 							output.textContent = "";
 							await runDiagnostics(log);
 						},
 					},
 					t("test")
 				),
-				h("button", { class: "ss-secondary", onClick: () => { clearAudioCache(); notify(t("cacheCleared")); } }, t("clearCache")),
+				h(
+					"button",
+					{
+						class: "ss-secondary",
+						onClick: () => {
+							clearAudioCache();
+							notify(t("cacheCleared"));
+						},
+					},
+					t("clearCache")
+				),
 				resetButton
 			),
 			output,
@@ -3396,11 +3479,13 @@
 	// ---------------------------------------------------------------------
 	// Registration
 	// ---------------------------------------------------------------------
+
 	try {
 		new Spicetify.Menu.Item(t("menu"), false, () => openSettings()).register();
 	} catch (error) {
 		console.warn("[Synthesis Spicetify] Failed to register menu item", error);
 	}
+
 	// Warm up the heavy libraries while the app is idle so the first search feels fast.
 	(window.requestIdleCallback || ((fn) => setTimeout(fn, 4000)))(() => {
 		getInnertube().catch((error) => console.warn("[Synthesis Spicetify] warm-up failed", error));
