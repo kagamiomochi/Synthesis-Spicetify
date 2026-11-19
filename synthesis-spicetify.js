@@ -58,7 +58,7 @@
 	// Constants and configuration
 	// ---------------------------------------------------------------------
 
-	/* VERSION */ const VERSION = "v0.6.0";
+	/* VERSION */ const VERSION = "v0.6.1";
 	const WISP_SCRIPT_URL = "https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/main/wisp-launcher/portable/wisp_ondemand.py";
 	const LIBCURL_URL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.5/libcurl_full.mjs";
 	const YTJS_URL = "https://cdn.jsdelivr.net/npm/youtubei.js@18.3.0/bundle/browser.js";
