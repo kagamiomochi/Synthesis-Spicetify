@@ -18,8 +18,7 @@ Currently supported service: YouTube Music (YouTube). More services are planned.
 - Spotify's search results page gets "Spotify" and "YouTube Music" tabs, so you can switch between the standard results and the YouTube Music results
 - Play a result, add it to the queue, or play it next
 - Every YouTube track goes through a silent local file, so it plays, queues and saves like a normal Spotify track (see [How playback works](#how-playback-works))
-- While a YouTube track is active, Spotify's own player bar shows it (cover, title, progress bar) and its play/pause,
-  previous and next buttons control it. A small mini player is only shown if the player bar cannot be used
+- While a YouTube track is active, Spotify's own player bar shows it (cover, title). Spotify plays the silent placeholder as the clock of the track and the audio follows it, so the progress bar, play/pause, previous / next, repeat and shuffle all work natively. A small mini player is only shown if the player bar cannot be used
 - Save tracks to your Spotify playlists (see [Saving tracks to playlists](#saving-tracks-to-playlists))
 - Playback is opt-in: without the optional local Wisp server you can still search and open results in the browser
 
@@ -251,8 +250,7 @@ Spotify に YouTube Music を統合する [Spicetify](https://spicetify.app/) �
 - Spotify の検索結果ページに「Spotify」「YouTube Music」のタブを追加し、標準の検索結果と YouTube Music の結果をタブで切り替えて表示
 - 結果から再生、次に再生、キューに追加
 - YouTube の曲はすべて無音のローカルファイル経由で扱うため、Spotify の曲と同じように再生・キュー・プレイリスト保存ができます([ダミー曲を経由した再生](#ダミー曲を経由した再生)を参照)
-- YouTube の曲の再生中は、Spotify 本体のプレイヤーバー(カバー・曲名・シークバー)にその曲を表示し、
-  再生/一時停止・前へ・次へボタンでそのまま操作できます。プレイヤーバーを使えない場合だけ、小さなミニプレイヤーを表示します
+- YouTube の曲の再生中は、Spotify 本体のプレイヤーバー(カバー・曲名)にその曲を表示します。Spotify が無音のダミー曲を「時計」として再生し、実際の音声がそれに追従するため、シークバー・再生/一時停止・前へ/次へ・リピート・シャッフルがそのまま動きます。プレイヤーバーを使えない場合だけ、小さなミニプレイヤーを表示します
 - Spotify のプレイリストに曲を保存可能([プレイリストに保存する](#プレイリストに保存する)を参照)
 - 再生機能は任意でオンにする方式です。ローカル Wisp サーバーが無くても、検索と「ブラウザで開く」は使えます
 

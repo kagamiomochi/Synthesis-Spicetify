@@ -302,9 +302,6 @@
 	const ICONS = {
 		play: svg("M3 1.7v12.6a.7.7 0 0 0 1.05.6l10.5-6.3a.7.7 0 0 0 0-1.2L4.05 1.1A.7.7 0 0 0 3 1.7z"),
 		pause: svg("M2.7 1h3.6v14H2.7zM9.7 1h3.6v14H9.7z"),
-		// Same shapes as the icons of Spotify's own play/pause button (rounded bars, slightly larger triangle).
-		barPlay: svg("M3 1.713a.7.7 0 0 1 1.05-.607l10.89 6.288a.7.7 0 0 1 0 1.212L4.05 14.894A.7.7 0 0 1 3 14.288V1.713z"),
-		barPause: svg("M2.7 1a.7.7 0 0 0-.7.7v12.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V1.7a.7.7 0 0 0-.7-.7H2.7zm8 0a.7.7 0 0 0-.7.7v12.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V1.7a.7.7 0 0 0-.7-.7h-2.6z"),
 		next: svg("M12.7 1h1.6v14h-1.6zM1.7 1.6v12.8a.5.5 0 0 0 .8.4l8.6-6.4a.5.5 0 0 0 0-.8L2.5 1.2a.5.5 0 0 0-.8.4z"),
 		plus: svg("M15 7H9V1H7v6H1v2h6v6h2V9h6z"),
 		savePlaylist: svg("M1 2h9v1.5H1zM1 6.25h9v1.5H1zM1 10.5h5v1.5H1zM12 8v2.5h2.5V12H12v2.5h-1.5V12H8v-1.5h2.5V8z"),
@@ -339,7 +336,6 @@
 	}
 
 	// Playback position of the player bar; an unknown value shows 0:00.
-	const clock = (sec) => mmss(Math.max(0, Math.floor(Number.isFinite(sec) ? sec : 0)));
 
 	const setText = (el, text) => {
 		if (el.textContent !== text) el.textContent = text;
@@ -953,6 +949,7 @@
 		placeholderUri: null, // spotify:local: URI of the placeholder Spotify is paused on while our track plays
 		suppressUntil: 0, // ignore Spotify events until this timestamp
 		advancingUntil: 0, // Spotify is being moved to another item: what it does meanwhile is not a new start
+		holding: false, // we stopped Spotify's clock ourselves (loading, or the audio has not been downloaded that far yet)
 	};
 	let playToken = 0;
 
@@ -1327,16 +1324,6 @@
 		return true;
 	}
 
-	// Fraction (0..1) of the track that can actually be played right now.
-	function loadedFraction(duration) {
-		if (!(duration > 0)) return 0;
-		// Not streaming means the track plays from a finished download.
-		if (!activeStream || activeStream.sink.isComplete()) return 1;
-		const ranges = audio.buffered;
-		if (!ranges.length) return 0;
-		return Math.min(1, ranges.end(ranges.length - 1) / duration);
-	}
-
 	// While streaming, only positions inside the buffered data can be played.
 	function seekAudio(seconds) {
 		if (activeStream && !activeStream.sink.isComplete()) {
@@ -1427,6 +1414,7 @@
 
 			state.status = "playing";
 			updateMediaSession(track);
+			releaseClock();
 			renderMini();
 			prefetchNext();
 		} catch (error) {
@@ -1467,36 +1455,121 @@
 		state.status = "idle";
 		state.progress = 0;
 		state.placeholderUri = null;
+		state.holding = false;
 		renderMini();
 		if (advance) moveSpotify("next");
 	}
 
-	function togglePause() {
-		if (state.status === "playing") {
-			audio.pause();
-			state.status = "paused";
-		} else if (state.status === "paused") {
-			audio.play().catch(() => {});
-			state.status = "playing";
+	// Closes our track at the user's request (close button, playback switched off): unlike stopTrack(false)
+	// this also stops Spotify, which is playing the silent placeholder as the clock of our track.
+	function closeTrack() {
+		const onPlaceholder = state.status !== "idle" && readSpotify().uri === state.placeholderUri;
+		stopTrack(false);
+		if (onPlaceholder && Spicetify.Player.isPlaying()) {
+			state.suppressUntil = Date.now() + 500;
+			Spicetify.Player.pause();
 		}
-		renderMini();
 	}
 
-	// Next button of Spotify's player bar while a non-Spotify track is active.
+	// Spotify is the master clock of our track: the buttons below drive Spotify, and syncSlave() moves the
+	// audio along with it. This is why pause, seek, previous / next, repeat and shuffle all work natively.
+	function togglePause() {
+		if (state.status === "loading") return; // nothing to play yet
+		Spicetify.Player.togglePlay();
+	}
+
 	function skipNext() {
-		stopTrack(true);
+		Spicetify.Player.next();
 	}
 
-	// Previous button of Spotify's player bar: restart the track, or go back to the item before it.
-	function skipPrev() {
-		if (state.status === "loading") return;
-		if (audio.currentTime > 3) {
-			seekAudio(0);
+	// Seeks Spotify. Spicetify reads values up to 1 as a fraction, so a tiny position is sent as 0.
+	function seekSpotify(seconds) {
+		const ms = Math.round(seconds * 1000);
+		Spicetify.Player.seek(ms > 1 ? ms : 0);
+	}
+
+	function spotifyPosition() {
+		return (Spicetify.Player.getProgress() || 0) / 1000;
+	}
+
+	const SYNC_TOLERANCE = 0.4; // seconds the audio may be off Spotify's position before it is moved
+	const RESUME_MARGIN = 1.5; // seconds that must be downloaded beyond a position before the clock runs from there
+
+	// True when the audio can play from this position right now (it is downloaded far enough).
+	function audioCanPlayAt(seconds) {
+		if (!activeStream || activeStream.sink.isComplete() || activeStream.job.finished) return true;
+		const duration = trackDurationSec();
+		const ranges = audio.buffered;
+		for (let i = 0; i < ranges.length; i++) {
+			if (seconds < ranges.start(i) - 0.05) continue;
+			if (ranges.end(i) >= seconds + RESUME_MARGIN || ranges.end(i) >= duration - 0.1) return true;
+		}
+		return false;
+	}
+
+	// Stops Spotify's clock until the audio has caught up (the data behind a seek has not arrived yet).
+	function holdClock() {
+		state.holding = true;
+		audio.pause();
+		state.suppressUntil = Date.now() + 500; // our own pause must not look like a user action
+		Spicetify.Player.pause();
+	}
+
+	// The track has loaded while Spotify was held on its placeholder: bring Spotify's clock to the audio and
+	// let it run. The audio keeps following it from here on.
+	function releaseClock() {
+		if (!state.holding) return;
+		state.holding = false;
+		const at = audio.currentTime;
+		if (Math.abs(at - spotifyPosition()) > SYNC_TOLERANCE) seekSpotify(at);
+		Spicetify.Player.play();
+	}
+
+	// Keeps the audio on Spotify's clock. Runs on Spotify's play / pause events and on a timer.
+	function syncSlave() {
+		if (state.status === "idle" || state.status === "loading") return; // playTrack() hands the clock over
+		if (!state.placeholderUri || readSpotify().uri !== state.placeholderUri) return;
+		const position = spotifyPosition();
+
+		if (state.holding) {
+			if (!audioCanPlayAt(position)) {
+				// Spotify must not run while there is nothing to hear (a play press, for example).
+				if (Spicetify.Player.isPlaying()) {
+					state.suppressUntil = Date.now() + 300;
+					Spicetify.Player.pause();
+				}
+				return;
+			}
+			state.holding = false;
+			Spicetify.Player.play(); // Spotify's play event calls this function again
 			return;
 		}
-		stopTrack(false);
-		moveSpotify("back");
+
+		if (!Spicetify.Player.isPlaying()) {
+			if (!audio.paused) audio.pause();
+			if (state.status !== "paused") {
+				state.status = "paused";
+				renderMini();
+			}
+			return;
+		}
+
+		// Spotify runs. After the audio has ended, Spotify may still be inside the last seconds of its placeholder.
+		const tail = audio.ended && position >= audio.currentTime - 2;
+		if (!tail && Math.abs(audio.currentTime - position) > SYNC_TOLERANCE) {
+			if (!audioCanPlayAt(position)) {
+				holdClock();
+				return;
+			}
+			seekAudio(position);
+		}
+		if (audio.paused && !tail) audio.play().catch(() => {});
+		if (state.status !== "playing") {
+			state.status = "playing";
+			renderMini();
+		}
 	}
+	setInterval(syncSlave, 250);
 
 	function requirePlayback() {
 		if (config.playbackEnabled) return true;
@@ -1505,7 +1578,12 @@
 	}
 
 	// Audio element events
-	audio.addEventListener("ended", () => stopTrack(true));
+	audio.addEventListener("ended", () => {
+		if (state.status === "idle" || state.holding || readSpotify().uri !== state.placeholderUri) return;
+		// Let Spotify run out its placeholder by itself, so that repeat and shuffle apply as usual.
+		const duration = Spicetify.Player.getDuration();
+		if (duration - spotifyPosition() * 1000 > 300) seekSpotify((duration - 150) / 1000);
+	});
 	audio.addEventListener("error", () => {
 		if (!audio.getAttribute("src")) return;
 		notify(t("playFailed", audio.error?.message || "media error"), true);
@@ -1515,7 +1593,6 @@
 		activeStream?.sink.poke();
 		updateSeek();
 	});
-	audio.addEventListener("progress", () => updateTakeoverProgress());
 
 	// Keep the volume in sync with Spotify's volume slider.
 	function syncVolume() {
@@ -2013,8 +2090,9 @@
 		// The same track is already active: restart it instead of asking Spotify to play its placeholder
 		// again, which would look like a press of the play/pause button.
 		if (state.current && trackKey(state.current) === trackKey(track) && state.status !== "idle") {
-			seekAudio(0);
-			if (state.status === "paused") togglePause();
+			if (state.status === "loading") return;
+			seekSpotify(0);
+			if (state.status === "paused") Spicetify.Player.play();
 			return;
 		}
 		try {
@@ -2092,6 +2170,7 @@
 		if (Spicetify.Player.data?.item?.uri !== uri) return; // Spotify moved on while we were searching
 
 		state.placeholderUri = uri;
+		state.holding = true; // Spotify stays paused on the placeholder until the audio is ready (see releaseClock)
 		playTrack({ ...track });
 	}
 
@@ -2108,17 +2187,19 @@
 	}
 
 	Spicetify.Player.addEventListener("onplaypause", () => {
-		if (!Spicetify.Player.isPlaying() || Date.now() < state.suppressUntil) return;
-		if (state.status !== "idle") {
-			// Spotify's play button (or a media key) was pressed while a non-Spotify track is active:
-			// keep Spotify silent and use the button as play/pause for our track.
-			if (readSpotify().uri === state.placeholderUri || !isPlaceholderItem()) {
+		if (Date.now() < state.suppressUntil) return;
+		if (state.status !== "idle" && readSpotify().uri === state.placeholderUri) {
+			// Spotify is the clock of the active track: a play or pause press moves the audio along with it.
+			if (state.status === "loading" && Spicetify.Player.isPlaying()) {
+				// Nothing to hear yet, so keep the clock stopped until the track has loaded.
 				state.suppressUntil = Date.now() + 300;
 				Spicetify.Player.pause();
-				togglePause();
 				return;
 			}
+			syncSlave();
+			return;
 		}
+		if (!Spicetify.Player.isPlaying()) return;
 		reconcilePlaceholder();
 	});
 
@@ -2557,31 +2638,6 @@
 		.ss-np-title { padding: 0; border: 0; background: transparent; color: var(--text-base, #fff); font: inherit; font-size: 14px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 		.ss-np-title:hover { text-decoration: underline; }
 		.ss-np-sub { font-size: 12px; color: var(--text-subdued, #a7a7a7); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-		.ss-takeover .ss-pb { display: flex; align-items: center; gap: 8px; width: 100%; }
-		.ss-pb-time { flex: none; min-width: 40px; font-size: 11px; color: var(--text-subdued, #a7a7a7); font-variant-numeric: tabular-nums; }
-		.ss-pb-pos { text-align: right; }
-		/* Progress bar that mimics Spotify's own: 12px hit area, 4px track, white fill that turns green on hover, thumb and time tooltip on hover */
-		.ss-pb-bar { --ss-fill: var(--text-base, #fff); --ss-pct: 0%; --ss-buf: 100%; --ss-prev: 0%; position: relative; display: flex; align-items: center; flex: 1; min-width: 0; height: 12px; cursor: pointer; touch-action: none; outline: none; }
-		.ss-pb-bar:hover, .ss-pb-bar.ss-seeking { --ss-fill: var(--essential-bright-accent, #1ed760); }
-		.ss-pb-bar.ss-disabled { cursor: progress; }
-		.ss-pb-bar.ss-disabled:hover { --ss-fill: var(--text-base, #fff); }
-		.ss-pb-track { position: relative; width: 100%; height: 4px; border-radius: 2px; overflow: hidden; background: #4d4d4d; }
-		.ss-pb-track > div { position: absolute; top: 0; bottom: 0; left: 0; }
-		/* Part of the track that cannot be played yet while the audio is still streaming */
-		.ss-pb-unloaded { left: var(--ss-buf) !important; right: 0; background: rgba(0, 0, 0, 0.35); }
-		/* Lighter highlight between the playhead and the mouse pointer */
-		.ss-pb-preview { width: var(--ss-prev); background: #cacaca; opacity: 0; }
-		.ss-pb-bar:hover:not(.ss-disabled) .ss-pb-preview, .ss-pb-bar.ss-seeking .ss-pb-preview { opacity: 1; }
-		.ss-pb-fill { width: var(--ss-pct); background: var(--ss-fill); }
-		.ss-pb-thumb { position: absolute; top: 50%; left: var(--ss-pct); width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: #fff; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5); opacity: 0; pointer-events: none; }
-		.ss-pb-bar:hover:not(.ss-disabled) .ss-pb-thumb, .ss-pb-bar.ss-seeking .ss-pb-thumb, .ss-pb-bar:focus-visible .ss-pb-thumb { opacity: 1; }
-		.ss-pb-tip { position: fixed; z-index: 100000; display: none; padding: 4px 8px; border-radius: 4px; background: #2a2a2a; color: #fff; font-size: 12px; font-weight: 700; line-height: 16px; font-variant-numeric: tabular-nums; white-space: nowrap; pointer-events: none; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4); }
-		.ss-pb-tip.ss-visible { display: block; }
-		/* Spotify's own play/pause circle lives in a child element that is hidden above, so draw the circle here */
-		.ss-takeover .ss-pp-icon { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 32px; height: 32px; border-radius: 50%; background: var(--text-base, #fff); color: var(--background-base, #000); transition: transform 0.03s linear; }
-		.ss-takeover .ss-pp-icon svg { display: block; width: 16px; height: 16px; }
-		.ss-takeover [data-ss-host]:hover > .ss-pp-icon { transform: scale(1.06); }
-		.ss-takeover [data-ss-host]:active > .ss-pp-icon { transform: scale(1); filter: brightness(0.7); }
 
 		.ss-settings label { display: block; margin: 12px 0 4px; font-size: 13px; color: var(--text-subdued, #a7a7a7); }
 		.ss-settings textarea, .ss-settings input[type="text"] { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 6px; border: 1px solid rgba(128, 128, 128, 0.5); background: rgba(128, 128, 128, 0.15); color: var(--text-base, #fff); font-family: monospace; font-size: 12px; }
@@ -2622,12 +2678,12 @@
 		const sub = h("div", { class: "ss-mini-sub" });
 		const seek = h("input", { class: "ss-mini-seek", type: "range", min: "0", max: "1000", value: "0" });
 		seek.addEventListener("input", () => {
-			const duration = trackDurationSec();
-			if (duration > 0) seekAudio((Number(seek.value) / 1000) * duration);
+			const duration = Spicetify.Player.getDuration() / 1000;
+			if (duration > 0) seekSpotify((Number(seek.value) / 1000) * duration);
 		});
 		const toggle = h("button", { class: "ss-btn", onClick: togglePause });
 		const next = h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.next, onClick: skipNext });
-		const close = h("button", { class: "ss-btn", html: ICONS.close, onClick: () => stopTrack(false) });
+		const close = h("button", { class: "ss-btn", html: ICONS.close, onClick: closeTrack });
 		const root = h(
 			"div",
 			{ class: "ss-mini" },
@@ -2661,7 +2717,6 @@
 	}
 
 	function updateSeek() {
-		updateTakeoverProgress();
 		if (!mini || state.status === "loading") return;
 		const duration = trackDurationSec();
 		if (duration > 0) mini.seek.value = String(Math.round((audio.currentTime / duration) * 1000));
@@ -2679,15 +2734,9 @@
 	const PLAYBAR = {
 		// "-v2" is what current Spotify builds use; the plain name is kept for older builds.
 		widget: '[data-testid="now-playing-widget-v2"], [data-testid="now-playing-widget"]',
-		position: '[data-testid="playback-position"]',
-		bar: '[data-testid="playback-progressbar"]',
-		duration: '[data-testid="playback-duration"]',
-		playPause: '[data-testid="control-button-playpause"]',
-		skipForward: '[data-testid="control-button-skip-forward"]',
-		skipBack: '[data-testid="control-button-skip-back"]',
 	};
 
-	const takeover = { active: false, ui: null, widget: null, progressHost: null, playPause: null };
+	const takeover = { active: false, ui: null, widget: null };
 
 	const isTrackActive = () => Boolean(state.current) && state.status !== "idle";
 
@@ -2701,113 +2750,13 @@
 		});
 		const sub = h("div", { class: "ss-np-sub" });
 		const np = h("div", { class: "ss-own ss-np" }, cover, h("div", { class: "ss-np-text" }, title, sub));
-
-		const pos = h("span", { class: "ss-pb-time ss-pb-pos" });
-		const dur = h("span", { class: "ss-pb-time" });
-		const fill = h("div", { class: "ss-pb-fill" });
-		const preview = h("div", { class: "ss-pb-preview" });
-		const unloaded = h("div", { class: "ss-pb-unloaded" });
-		const track = h("div", { class: "ss-pb-track" }, unloaded, preview, fill);
-		const thumb = h("div", { class: "ss-pb-thumb" });
-		const tip = h("div", { class: "ss-pb-tip" });
-		const seek = h("div", { class: "ss-pb-bar", role: "slider", tabindex: "0", "aria-label": "Seek", "aria-valuemin": "0" }, track, thumb);
-		const ui = { np, cover, title, sub, pos, dur, seek, tip, seeking: false, dragFraction: 0, lastCoverUrl: "", lastIcon: "" };
-
-		// Fraction (0..1) of the bar under the pointer.
-		const fractionAt = (event) => {
-			const rect = seek.getBoundingClientRect();
-			return rect.width > 0 ? Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)) : 0;
-		};
-		const hideTip = () => tip.classList.remove("ss-visible");
-		// Show the time under the pointer in a tooltip above the bar. It is attached to the body so that
-		// no overflow rule of Spotify's player bar can clip it.
-		const showTip = (event, fraction) => {
-			const duration = trackDurationSec();
-			if (!(duration > 0) || state.status === "loading") return hideTip();
-			if (!tip.isConnected) document.body.append(tip);
-			setText(tip, clock(fraction * duration));
-			tip.classList.add("ss-visible");
-			const rect = seek.getBoundingClientRect();
-			const half = tip.offsetWidth / 2;
-			const x = Math.min(Math.max(event.clientX, rect.left + half), rect.right - half);
-			tip.style.left = `${Math.round(x - half)}px`;
-			tip.style.top = `${Math.round(rect.top - tip.offsetHeight - 2)}px`;
-		};
-		// Draw the playhead at the given fraction while dragging (the audio is only moved on release).
-		const previewDrag = (fraction) => {
-			ui.dragFraction = fraction;
-			seek.style.setProperty("--ss-pct", `${(fraction * 100).toFixed(2)}%`);
-			setText(pos, clock(fraction * trackDurationSec()));
-		};
-		const endDrag = (commit) => {
-			if (!ui.seeking) return;
-			ui.seeking = false;
-			seek.classList.remove("ss-seeking");
-			const duration = trackDurationSec();
-			if (commit && duration > 0) seekAudio(ui.dragFraction * duration);
-			updateTakeoverProgress();
-		};
-
-		seek.addEventListener("pointerdown", (event) => {
-			if (event.button !== 0 || state.status === "loading" || !(trackDurationSec() > 0)) return;
-			seek.setPointerCapture(event.pointerId);
-			ui.seeking = true;
-			seek.classList.add("ss-seeking");
-			previewDrag(fractionAt(event));
-		});
-		seek.addEventListener("pointermove", (event) => {
-			const fraction = fractionAt(event);
-			seek.style.setProperty("--ss-prev", `${(fraction * 100).toFixed(2)}%`);
-			if (ui.seeking) previewDrag(fraction);
-			showTip(event, fraction);
-		});
-		seek.addEventListener("pointerup", () => endDrag(true));
-		seek.addEventListener("pointercancel", () => endDrag(false));
-		seek.addEventListener("pointerleave", () => {
-			// While dragging, the pointer is captured, so the tooltip keeps following it.
-			if (!ui.seeking) hideTip();
-		});
-		seek.addEventListener("pointerup", () => {
-			if (!seek.matches(":hover")) hideTip();
-		});
-		// Keyboard: arrow keys move by 5 seconds like Spotify's own bar, Home and End jump to the edges.
-		seek.addEventListener("keydown", (event) => {
-			const duration = trackDurationSec();
-			if (!(duration > 0) || state.status === "loading") return;
-			const current = audio.currentTime;
-			let target = null;
-			if (event.key === "ArrowRight" || event.key === "ArrowUp") target = current + 5;
-			else if (event.key === "ArrowLeft" || event.key === "ArrowDown") target = current - 5;
-			else if (event.key === "Home") target = 0;
-			else if (event.key === "End") target = duration;
-			if (target == null) return;
-			event.preventDefault();
-			event.stopPropagation();
-			seekAudio(Math.min(Math.max(target, 0), duration));
-			updateTakeoverProgress();
-		});
-		ui.pb = h("div", { class: "ss-own ss-pb" }, pos, seek, dur);
-		ui.icon = h("span", { class: "ss-own ss-pp-icon" });
-		takeover.ui = ui;
-		return ui;
+		takeover.ui = { np, cover, title, sub, lastCoverUrl: "" };
+		return takeover.ui;
 	}
 
-	// Find the smallest element that contains the position label, the bar and the duration label.
-	function findProgressHost() {
-		const pos = document.querySelector(PLAYBAR.position);
-		const bar = document.querySelector(PLAYBAR.bar);
-		const dur = document.querySelector(PLAYBAR.duration);
-		if (!pos || !bar || !dur) return null;
-		let el = pos.parentElement;
-		while (el && el !== document.body && !(el.contains(bar) && el.contains(dur))) el = el.parentElement;
-		return el && el !== document.body ? el : null;
-	}
-
-	// Cached lookups: renderMini() runs often while a track is loading.
+	// Cached lookup: renderMini() runs often while a track is loading.
 	function lookupHosts() {
 		if (!takeover.widget?.isConnected) takeover.widget = document.querySelector(PLAYBAR.widget);
-		if (!takeover.progressHost?.isConnected) takeover.progressHost = findProgressHost();
-		if (!takeover.playPause?.isConnected) takeover.playPause = document.querySelector(PLAYBAR.playPause);
 	}
 
 	function mountInto(host, own) {
@@ -2815,7 +2764,9 @@
 		if (own.parentElement !== host) host.append(own);
 	}
 
-	// Returns true while Spotify's player bar is showing the active non-Spotify track.
+	// Returns true while Spotify's now playing widget is showing the active non-Spotify track.
+	// Only the widget is replaced. The progress bar and the buttons of the player bar stay Spotify's own,
+	// because Spotify is the clock of the track (see syncSlave).
 	function syncTakeover() {
 		if (!isTrackActive()) {
 			if (takeover.active) {
@@ -2825,8 +2776,8 @@
 			return false;
 		}
 		lookupHosts();
-		const { widget, progressHost, playPause } = takeover;
-		if (!widget || !progressHost) {
+		const { widget } = takeover;
+		if (!widget) {
 			takeover.active = false;
 			document.body.classList.remove("ss-takeover");
 			return false;
@@ -2834,8 +2785,6 @@
 
 		const ui = ensureTakeoverUi();
 		mountInto(widget, ui.np);
-		mountInto(progressHost, ui.pb);
-		if (playPause) mountInto(playPause, ui.icon);
 
 		const track = state.current;
 		const providerLabel = providers[track.provider]?.label;
@@ -2843,55 +2792,11 @@
 		setText(ui.title, track.title);
 		setText(ui.sub, state.status === "loading" ? `${t("loading", state.progress)}  -  ${artists}` : artists);
 		setCover(ui, track.thumbnail);
-		const icon = state.status === "playing" ? "barPause" : "barPlay";
-		if (ui.lastIcon !== icon) {
-			ui.lastIcon = icon;
-			ui.icon.innerHTML = ICONS[icon];
-		}
 
 		document.body.classList.add("ss-takeover");
 		takeover.active = true;
-		updateTakeoverProgress();
 		return true;
 	}
-
-	function updateTakeoverProgress() {
-		const ui = takeover.ui;
-		if (!ui || !takeover.active || ui.seeking) return;
-		const loading = state.status === "loading";
-		const duration = trackDurationSec();
-		const fraction = loading ? state.progress : duration > 0 ? Math.min(1, audio.currentTime / duration) : 0;
-		ui.seek.classList.toggle("ss-disabled", loading);
-		ui.seek.style.setProperty("--ss-pct", `${(fraction * 100).toFixed(2)}%`);
-		const loaded = loading ? 1 : loadedFraction(duration);
-		ui.seek.style.setProperty("--ss-buf", `${(loaded * 100).toFixed(2)}%`);
-		if (loading) ui.seek.removeAttribute("aria-valuenow");
-		else {
-			ui.seek.setAttribute("aria-valuemax", String(Math.round(duration)));
-			ui.seek.setAttribute("aria-valuenow", String(Math.round(audio.currentTime)));
-			ui.seek.setAttribute("aria-valuetext", clock(audio.currentTime));
-		}
-		setText(ui.pos, loading ? "" : clock(audio.currentTime));
-		setText(ui.dur, duration > 0 ? clock(duration) : "");
-	}
-
-	// Route the buttons of Spotify's player bar to our track while it is taken over. This runs in the
-	// capture phase on the document, before React sees the click, so Spotify never starts its own track.
-	document.addEventListener(
-		"click",
-		(event) => {
-			if (!takeover.active || !(event.target instanceof Element)) return;
-			let action = null;
-			if (event.target.closest(PLAYBAR.playPause)) action = togglePause;
-			else if (event.target.closest(PLAYBAR.skipForward)) action = skipNext;
-			else if (event.target.closest(PLAYBAR.skipBack)) action = skipPrev;
-			if (!action) return;
-			event.preventDefault();
-			event.stopImmediatePropagation();
-			action();
-		},
-		true
-	);
 
 	// ---------------------------------------------------------------------
 	// Search page integration
@@ -3393,7 +3298,7 @@
 		function setPlayback(enabled) {
 			saveConfig({ playbackEnabled: enabled });
 			playback.checked = enabled;
-			if (!enabled && state.status !== "idle") stopTrack(false);
+			if (!enabled && state.status !== "idle") closeTrack();
 			resetNetwork();
 			renderSearch();
 			notify(t(enabled ? "playbackOnToast" : "playbackOffToast"));
@@ -3488,7 +3393,7 @@
 		const playbackSection = createPlaybackSection();
 		const resetButton = createConfirmButton(t("resetSettings"), t("resetConfirm"), () => {
 			// Defaults have playback off, so stop the current track like the switch does.
-			if (config.playbackEnabled && state.status !== "idle") stopTrack(false);
+			if (config.playbackEnabled && state.status !== "idle") closeTrack();
 			resetConfig();
 			// Sync the form with the restored defaults.
 			wisp.value = config.wispServers.join("\n");
