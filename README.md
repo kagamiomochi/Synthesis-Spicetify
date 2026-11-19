@@ -103,7 +103,7 @@ This needs the same folder setup as saving to playlists (below). The first time 
 
 The playlist button on a result saves the track to one of your Spotify playlists. A Spotify playlist can only hold Spotify tracks and local files, so each saved track is stored as a silent local file (the same file that playing uses), and when Spotify starts it, the extension pauses Spotify and plays the real track from YouTube Music instead.
 
-1. In Spotify's settings, add a folder as a Local Files source.
+1. Turning on playback also turns on Spotify's Local Files. A folder dialog asks for the placeholder folder once, and the extension adds it as a Local Files source (you can also add one yourself in Spotify's settings).
 2. Click the playlist button on a result and pick a playlist. The first time, choose that same folder in the dialog. It is remembered afterwards; if a permission prompt appears again, allow it.
 3. The track shows up in the playlist as the artist "YouTube" and the album "Synthesis", with only its video ID as the title. The placeholder file holds no other song information (the title and thumbnail shown while playing are kept in the extension data, not in the file). Inside Spotify, the extension rewrites the displayed text of these rows (and of the queue, the now playing panel and the player bar) to the real title and artist, and lays the real cover art over the placeholder icon; the file and Spotify's data are not changed. If the extension data is missing, the title and artist are looked up from YouTube instead. Playing it streams the real track, and when it ends the playlist moves on to the next item.
 
@@ -323,7 +323,7 @@ Spotify のプレイヤー、キュー、プレイリストには、Spotify の�
 
 結果のプレイリストボタンで、曲を Spotify のプレイリストに保存できます。Spotify のプレイリストには Spotify の曲とローカルファイルしか入れられないため、保存した曲は無音のローカルファイル(ダミー曲。再生にも同じファイルを使います)として入れます。Spotify がそのダミー曲を再生し始めると、拡張機能が Spotify を一時停止し、代わりに YouTube Music の実際の曲を再生します。
 
-1. Spotify の設定で、ローカルファイルのソースとしてフォルダを追加します。
+1. 再生機能をオンにすると、Spotify のローカルファイルも自動で有効になります。フォルダ選択のダイアログが一度出るので、ダミー曲を置くフォルダを選ぶと、拡張機能がローカルファイルのソースに追加します(Spotify の設定で自分で追加しても構いません)。
 2. 結果のプレイリストボタンを押してプレイリストを選びます。初回はダイアログで同じフォルダを選んでください。以降は記憶されます。権限の確認が再び出たら許可してください。
 3. プレイリストには、アーティスト「YouTube」、アルバム「Synthesis」、曲名が動画 ID だけの曲として並びます。ダミー曲のファイルには、これ以外の曲の情報は入りません(再生中に表示する曲名やサムネイルは、ファイルではなく拡張機能のデータに保存されます)。Spotify 上の表示だけは、拡張機能がこれらの行(キュー、再生中パネル、プレイヤーバーも含む)の文字を本物の曲名とアーティスト名に書き換え、プレースホルダのアイコンの上に本物のアルバムアートを重ねて表示します。ファイルや Spotify のデータは変更しません。拡張機能のデータが無い場合は、YouTube から曲名とアーティスト名を取得します。再生すると実際の曲が流れ、終わるとプレイリストの次の曲に進みます。
 

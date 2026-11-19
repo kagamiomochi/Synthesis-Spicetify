@@ -74,6 +74,8 @@
 		localWisp: "ws://localhost:6001/",
 		// Playback needs the local Wisp server, so it is opt-in.
 		playbackEnabled: false,
+		// Absolute path of the folder registered as a Spotify Local Files source for the placeholders.
+		placeholderFolder: "",
 		// InnerTube clients tried in order to obtain a directly playable audio URL.
 		clients: ["visionos", "tv_samsung"],
 		resultLimit: 20,
@@ -202,6 +204,14 @@
 			saveFailed: (m) => `保存に失敗しました: ${m}`,
 			badTrackId: "この曲は扱えません (IDが不正です)。",
 			pickFolder: "ダミー曲を置くフォルダを選んでください (Spotify のローカルファイルのソースに追加済みのフォルダ)。",
+			pickFolderAt: (path) => `ダミー曲を置くフォルダとして ${path} を選んでください。`,
+			folderMismatch: (path) => `選んだフォルダが登録済みのフォルダ (${path}) と違う可能性があります。違う場合、ダミー曲が Spotify に現れません。`,
+			localFilesPick: "ダミー曲を置くフォルダを選んでください。Spotify のローカルファイルのソースに自動で追加します。",
+			localFilesReady: "ローカルファイルは有効で、フォルダも登録済みです。",
+			localFilesAdded: (path) => `ローカルファイルを有効にし、${path} をソースに追加しました。`,
+			localFilesCancelled: "フォルダの選択がキャンセルされました。Spotify の設定でローカルファイルのソースにフォルダを追加してください。",
+			localFilesFailed: "ローカルファイルの自動設定に失敗しました。Spotify の設定で手動で追加してください。",
+			localFilesUnsupported: "この Spotify ではローカルファイルを自動設定できません。Spotify の設定で手動で追加してください。",
 			placeholderNotPlayed: "Spotify がダミー曲を再生しませんでした。",
 		},
 		en: {
@@ -267,6 +277,14 @@
 			saveFailed: (m) => `Saving failed: ${m}`,
 			badTrackId: "This track cannot be used (invalid ID).",
 			pickFolder: "Choose the folder for the placeholder files (it must be a Local Files source in Spotify).",
+			pickFolderAt: (path) => `Choose ${path} as the folder for the placeholder files.`,
+			folderMismatch: (path) => `The chosen folder may differ from the registered one (${path}). If it does, the placeholders will not show up in Spotify.`,
+			localFilesPick: "Choose the folder for the placeholder files. It is added to Spotify's Local Files sources automatically.",
+			localFilesReady: "Local Files is on and the folder is already registered.",
+			localFilesAdded: (path) => `Turned on Local Files and added ${path} as a source.`,
+			localFilesCancelled: "Folder selection was cancelled. Add a folder as a Local Files source in Spotify's settings.",
+			localFilesFailed: "Could not set up Local Files automatically. Add the folder in Spotify's settings instead.",
+			localFilesUnsupported: "This Spotify version cannot set up Local Files automatically. Add the folder in Spotify's settings instead.",
 			placeholderNotPlayed: "Spotify did not play the placeholder.",
 		},
 	};
@@ -1634,14 +1652,63 @@
 		} catch (error) {
 			console.warn("[Synthesis Spicetify] stored folder is not usable", error);
 		}
-		notify(t("pickFolder"));
+		notify(config.placeholderFolder ? t("pickFolderAt", config.placeholderFolder) : t("pickFolder"));
 		dir = await window.showDirectoryPicker({ id: "synthesis-saved", mode: "readwrite" });
+		// The picker only returns a handle (no path), so the folder name is the only thing that can be compared.
+		const registeredName = normalizeFolder(config.placeholderFolder).split("/").pop();
+		if (registeredName && dir.name !== registeredName) notify(t("folderMismatch", config.placeholderFolder), true);
 		try {
 			await handleStore("readwrite", (store) => store.put(dir, "dir"));
 		} catch (error) {
 			console.warn("[Synthesis Spicetify] failed to remember the folder", error);
 		}
 		return dir;
+	}
+
+	// Compares folder paths regardless of separator style, a trailing separator and (on Windows) letter case.
+	const normalizeFolder = (path) => {
+		const normalized = String(path || "").replace(/\\/g, "/").replace(/\/+$/, "");
+		return /^[a-z]:/i.test(normalized) ? normalized.toLowerCase() : normalized;
+	};
+
+	// Turns on Spotify's Local Files and registers the placeholder folder as a source, using Spotify's own
+	// LocalFilesAPI. Returns "ready", "added", "cancelled", "failed" or "unsupported". It needs no user gesture.
+	async function setupLocalFiles() {
+		const api = Spicetify.Platform?.LocalFilesAPI;
+		const required = ["getIsEnabled", "setIsEnabled", "getSources", "addFolder", "browseForFolder"];
+		if (!api || required.some((name) => typeof api[name] !== "function")) return "unsupported";
+		const hasFolder = async (path) => {
+			const wanted = normalizeFolder(path);
+			const sources = await api.getSources();
+			return (sources?.folders ?? []).some((folder) => normalizeFolder(folder.path) === wanted);
+		};
+		// The source list can lag a little behind addFolder, so look a few times before giving up.
+		const waitForFolder = async (path) => {
+			for (let i = 0; i < 10; i++) {
+				if (await hasFolder(path)) return true;
+				await sleep(500);
+			}
+			return false;
+		};
+		try {
+			if (!api.getIsEnabled()) {
+				api.setIsEnabled(true); // returns nothing; the pending flag is private, so it is only read defensively
+				for (let i = 0; i < 20 && api._hasPendingEnabledChange; i++) await sleep(250);
+			}
+			if (config.placeholderFolder && (await hasFolder(config.placeholderFolder))) return "ready";
+			notify(t("localFilesPick"));
+			const picked = await api.browseForFolder();
+			if (!picked?.path) return "cancelled";
+			if (!(await hasFolder(picked.path))) {
+				await api.addFolder({ path: picked.path });
+				if (!(await waitForFolder(picked.path))) return "failed";
+			}
+			saveConfig({ placeholderFolder: picked.path });
+			return "added";
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] could not set up local files", error);
+			return "failed";
+		}
 	}
 
 	// Waits until Spotify's local file index lists the new placeholder and returns the URI Spotify uses for
@@ -3344,6 +3411,17 @@
 			if (ok) {
 				guideStatus.textContent = t("guideOk");
 				if (!config.playbackEnabled) setPlayback(true);
+				// Playback needs Spotify's Local Files for the placeholders, so set that up as well.
+				const result = await setupLocalFiles();
+				if (token !== checkToken) return;
+				const messages = {
+					ready: t("localFilesReady"),
+					added: t("localFilesAdded", config.placeholderFolder),
+					cancelled: t("localFilesCancelled"),
+					failed: t("localFilesFailed"),
+					unsupported: t("localFilesUnsupported"),
+				};
+				guideStatus.textContent = `${t("guideOk")} ${messages[result]}`;
 			} else {
 				guideStatus.textContent = t("guideFailed", config.localWisp);
 				playback.checked = config.playbackEnabled;
