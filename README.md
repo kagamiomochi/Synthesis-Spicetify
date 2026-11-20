@@ -4,8 +4,7 @@
   <img src="./logo.png" alt="logo" width="300">
 </div>
 
-
-[![Latest Version](https://img.shields.io/github/v/tag/kagamiomochi/Synthesis-Spicetify?sort=semver)](https://github.com/kagamiomochi/Synthesis-Spicetify/tags)
+![GitHub Tag](https://img.shields.io/github/v/tag/kagamiomochi/Synthesis-Spicetify?sort=semver&label=Latest%20Version)
 
 A [Spicetify](https://spicetify.app/) extension that brings YouTube Music into Spotify.
 
