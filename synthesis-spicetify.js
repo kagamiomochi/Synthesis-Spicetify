@@ -12,8 +12,7 @@
  *              Media Source Extensions, so playback starts as soon as the first chunk has arrived.
  *              The finished download is kept as a Blob URL cache (also the fallback without MSE).
  *  - Spotify:  search page injection, and Spotify's own player bar, which shows and controls a non-Spotify
- *              track while it is active (a small mini player is only the fallback when the player bar
- *              cannot be used).
+ *              track while it is active.
  *  - Playback: every non-Spotify track goes through a silent local-file placeholder (a spotify:local: item).
  *              Play, queue and playlist actions hand that placeholder to Spotify's own player, queue and
  *              playlists. When Spotify starts it, the extension pauses Spotify and streams the real track
@@ -24,7 +23,7 @@
  * The file is one script (the Marketplace installs a single file), laid out top to bottom in dependency order:
  * boot, constants and config, i18n, utilities, network, images, YouTube Music provider, playback state and
  * registries, audio cache, progressive playback, playback control, placeholders (files, registry, playlist
- * picker, handing them to Spotify, real names, cover art), styles, mini player, player bar takeover, search
+ * picker, handing them to Spotify, real names, cover art), styles, player bar takeover, search
  * page, diagnostics, settings, registration.
  */
 
@@ -311,13 +310,10 @@
 	const svg = (path) => `<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="${path}"/></svg>`;
 	const ICONS = {
 		play: svg("M3 1.7v12.6a.7.7 0 0 0 1.05.6l10.5-6.3a.7.7 0 0 0 0-1.2L4.05 1.1A.7.7 0 0 0 3 1.7z"),
-		pause: svg("M2.7 1h3.6v14H2.7zM9.7 1h3.6v14H9.7z"),
-		next: svg("M12.7 1h1.6v14h-1.6zM1.7 1.6v12.8a.5.5 0 0 0 .8.4l8.6-6.4a.5.5 0 0 0 0-.8L2.5 1.2a.5.5 0 0 0-.8.4z"),
 		plus: svg("M15 7H9V1H7v6H1v2h6v6h2V9h6z"),
 		savePlaylist: svg("M1 2h9v1.5H1zM1 6.25h9v1.5H1zM1 10.5h5v1.5H1zM12 8v2.5h2.5V12H12v2.5h-1.5V12H8v-1.5h2.5V8z"),
 		playNext: svg("M1 2h9v1.5H1zM1 6.25h9v1.5H1zM1 10.5h5v1.5H1zM10 9.5v5l4.5-2.5z"),
 		external: svg("M7 2v1.5H3.5v9h9V9H14v5.5H2V2zM9 1h6v6h-1.5V3.56L8.53 8.53 7.47 7.47l4.97-4.97H9z"),
-		close: svg("M2.47 2.47a.75.75 0 0 1 1.06 0L8 6.94l4.47-4.47a.75.75 0 1 1 1.06 1.06L9.06 8l4.47 4.47a.75.75 0 1 1-1.06 1.06L8 9.06l-4.47 4.47a.75.75 0 0 1-1.06-1.06L6.94 8 2.47 3.53a.75.75 0 0 1 0-1.06z"),
 	};
 
 	function h(tag, props = {}, ...children) {
@@ -1445,7 +1441,7 @@
 		}
 	}
 
-	// Called on every state change (from renderMini). Metadata is only replaced when the track changes.
+	// Called on every state change (from syncPlayerUi). Metadata is only replaced when the track changes.
 	function syncMediaSession() {
 		if (!("mediaSession" in navigator)) return;
 		const track = state.current;
@@ -1498,14 +1494,14 @@
 		state.current = track;
 		state.status = "loading";
 		state.progress = 0;
-		renderMini();
+		syncPlayerUi();
 
 		try {
 			// The progress is only shown while loading; after playback has started it is no longer needed.
 			const onProgress = (p) => {
 				if (token !== playToken || state.status !== "loading") return;
 				state.progress = p;
-				renderMini();
+				syncPlayerUi();
 			};
 
 			let url = peekAudioUrl(track);
@@ -1534,7 +1530,7 @@
 			state.status = "playing";
 			consecutiveFailures = 0;
 			releaseClock();
-			renderMini();
+			syncPlayerUi();
 			prefetchNext();
 		} catch (error) {
 			if (token !== playToken || error?.name === "AbortError") return;
@@ -1583,7 +1579,7 @@
 		state.progress = 0;
 		state.placeholderUri = null;
 		state.holding = false;
-		renderMini();
+		syncPlayerUi();
 		if (advance) moveSpotify("next");
 	}
 
@@ -1600,11 +1596,6 @@
 
 	// Spotify is the master clock of our track: the buttons below drive Spotify, and syncSlave() moves the
 	// audio along with it. This is why pause, seek, previous / next, repeat and shuffle all work natively.
-	function togglePause() {
-		if (state.status === "loading") return; // nothing to play yet
-		Spicetify.Player.togglePlay();
-	}
-
 	function skipNext() {
 		Spicetify.Player.next();
 	}
@@ -1676,7 +1667,7 @@
 			if (!audio.paused) audio.pause();
 			if (state.status !== "paused") {
 				state.status = "paused";
-				renderMini();
+				syncPlayerUi();
 			}
 			return;
 		}
@@ -1693,7 +1684,7 @@
 		if (audio.paused && !tail) audio.play().catch(() => {});
 		if (state.status !== "playing") {
 			state.status = "playing";
-			renderMini();
+			syncPlayerUi();
 		}
 	}
 	setInterval(syncSlave, 250);
@@ -1719,7 +1710,6 @@
 	});
 	audio.addEventListener("timeupdate", () => {
 		activeStream?.sink.poke();
-		updateSeek();
 		updatePositionState(false);
 	});
 
@@ -2759,13 +2749,6 @@
 		.ss-picker-item:hover, .ss-picker-item:focus-visible { background: rgba(255, 255, 255, 0.1); outline: none; }
 		.ss-picker-note { padding: 8px 10px; color: var(--text-subdued, #a7a7a7); }
 
-		.ss-mini { position: fixed; left: 16px; bottom: 104px; z-index: 9999; width: 340px; display: none; grid-template-columns: 48px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px; border-radius: 10px; background: var(--background-elevated-base, #242424); color: var(--text-base, #fff); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
-		.ss-mini.ss-visible { display: grid; }
-		.ss-mini-cover { width: 48px; height: 48px; border-radius: 6px; object-fit: cover; background: rgba(128, 128, 128, 0.3); }
-		.ss-mini-title { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-		.ss-mini-sub { font-size: 12px; color: var(--text-subdued, #a7a7a7); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-		.ss-mini-seek { width: 100%; margin: 6px 0 0; accent-color: var(--essential-bright-accent, #1ed760); }
-		.ss-mini-ctrl { display: flex; gap: 2px; }
 
 		.ss-own { display: none; }
 		.ss-takeover [data-ss-host] > :not(.ss-own) { display: none !important; }
@@ -2802,62 +2785,10 @@
 	`)
 	);
 
-	// ---------------------------------------------------------------------
-	// Mini player (visible while a non-Spotify track is active)
-	// ---------------------------------------------------------------------
-
-	let mini = null;
-
-	function ensureMini() {
-		if (mini) return mini;
-		const cover = h("img", { class: "ss-mini-cover", alt: "" });
-		const title = h("div", { class: "ss-mini-title" });
-		const sub = h("div", { class: "ss-mini-sub" });
-		const seek = h("input", { class: "ss-mini-seek", type: "range", min: "0", max: "1000", value: "0" });
-		seek.addEventListener("input", () => {
-			const duration = Spicetify.Player.getDuration() / 1000;
-			if (duration > 0) seekSpotify((Number(seek.value) / 1000) * duration);
-		});
-		const toggle = h("button", { class: "ss-btn", onClick: togglePause });
-		const next = h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.next, onClick: skipNext });
-		const close = h("button", { class: "ss-btn", html: ICONS.close, onClick: closeTrack });
-		const root = h(
-			"div",
-			{ class: "ss-mini" },
-			cover,
-			h("div", { style: "min-width:0" }, title, sub, seek),
-			h("div", { class: "ss-mini-ctrl" }, toggle, next, close)
-		);
-		document.body.append(root);
-		mini = { root, cover, title, sub, seek, toggle, lastCoverUrl: "" };
-		return mini;
-	}
-
-	function renderMini() {
+	// Called on every state change: keeps the Media Session and Spotify's player bar in sync with the active track.
+	function syncPlayerUi() {
 		syncMediaSession();
-		const ui = ensureMini();
-		const track = state.current;
-		// The mini player is only a fallback for when Spotify's own player bar cannot be used.
-		const takenOver = syncTakeover();
-		ui.root.classList.toggle("ss-visible", Boolean(track) && state.status !== "idle" && !takenOver);
-		if (!track) return;
-
-		ui.title.textContent = track.title;
-		ui.sub.textContent =
-			state.status === "loading"
-				? `${t("loading", state.progress)}  -  ${track.artists.join(", ")}`
-				: track.artists.join(", ");
-		setCover(ui, track.thumbnail);
-		ui.toggle.innerHTML = state.status === "playing" ? ICONS.pause : ICONS.play;
-		ui.toggle.title = state.status === "playing" ? "Pause" : t("play");
-		ui.seek.disabled = state.status === "loading";
-		if (state.status === "loading") ui.seek.value = String(Math.round(state.progress * 1000));
-	}
-
-	function updateSeek() {
-		if (!mini || state.status === "loading") return;
-		const duration = trackDurationSec();
-		if (duration > 0) mini.seek.value = String(Math.round((audio.currentTime / duration) * 1000));
+		syncTakeover();
 	}
 
 	// ---------------------------------------------------------------------
@@ -2866,7 +2797,6 @@
 	// the now playing widget, the progress bar and the play/pause, previous and next buttons.
 	// Spotify's React nodes are never modified: our elements are appended next to them and
 	// the originals are only hidden with CSS, so a re-render of Spotify cannot break anything.
-	// If a part of the player bar cannot be found, the mini player is shown instead.
 	// ---------------------------------------------------------------------
 
 	const PLAYBAR = {
@@ -2874,7 +2804,7 @@
 		widget: '[data-testid="now-playing-widget-v2"], [data-testid="now-playing-widget"]',
 	};
 
-	const takeover = { active: false, ui: null, widget: null };
+	const takeover = { active: false, ui: null, widget: null, warned: false };
 
 	const isTrackActive = () => Boolean(state.current) && state.status !== "idle";
 
@@ -2892,7 +2822,7 @@
 		return takeover.ui;
 	}
 
-	// Cached lookup: renderMini() runs often while a track is loading.
+	// Cached lookup: syncPlayerUi() runs often while a track is loading.
 	function lookupHosts() {
 		if (!takeover.widget?.isConnected) takeover.widget = document.querySelector(PLAYBAR.widget);
 	}
@@ -2918,8 +2848,14 @@
 		if (!widget) {
 			takeover.active = false;
 			document.body.classList.remove("ss-takeover");
+			// Warn once per missing period, so a changed Spotify layout does not fail silently.
+			if (!takeover.warned) {
+				takeover.warned = true;
+				console.warn("[Synthesis Spicetify] now playing widget not found, the track is not shown in the player bar", PLAYBAR.widget);
+			}
 			return false;
 		}
+		takeover.warned = false;
 
 		const ui = ensureTakeoverUi();
 		mountInto(widget, ui.np);
