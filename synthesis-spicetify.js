@@ -420,16 +420,25 @@
 		return [config.localWisp, ...config.wispServers.filter((url) => url !== config.localWisp)];
 	}
 
+	// Returns { url, session }. Every Wisp gets its own HTTPSession: libcurl.js keeps a connection cache per
+	// session, so reusing the default session after switching the Wisp URL would keep sending requests to
+	// youtube.com over the old (public) Wisp, which YouTube answers with LOGIN_REQUIRED.
 	async function pickWispServer(libcurl) {
 		const failures = [];
 		for (const url of activeWispServers()) {
+			libcurl.set_websocket(url);
+			const session = new libcurl.HTTPSession();
 			try {
-				libcurl.set_websocket(url);
-				const res = await withTimeout(libcurl.fetch("https://www.gstatic.com/generate_204"), 10000, `Wisp ${url}`);
-				if (res.status === 204 || res.ok) return url;
+				const res = await withTimeout(session.fetch("https://www.gstatic.com/generate_204"), 10000, `Wisp ${url}`);
+				if (res.status === 204 || res.ok) return { url, session };
 				failures.push(`${url}: HTTP ${res.status}`);
 			} catch (error) {
 				failures.push(`${url}: ${error?.message || error}`);
+			}
+			try {
+				session.close();
+			} catch {
+				// ignore
 			}
 		}
 		throw new Error(`No usable Wisp server. ${failures.join(" / ")}`);
@@ -441,8 +450,10 @@
 			const libcurl = mod.libcurl;
 			// The "full" build embeds the WASM binary, so no URL is needed here.
 			await libcurl.load_wasm();
-			libcurl.activeWisp = await pickWispServer(libcurl);
-			activeWisp = libcurl.activeWisp;
+			const picked = await pickWispServer(libcurl);
+			libcurl.activeWisp = picked.url;
+			libcurl.session = picked.session;
+			activeWisp = picked.url;
 			return libcurl;
 		})().catch((error) => {
 			curlPromise = null;
@@ -477,7 +488,7 @@
 			headers.set("Cookie", [...cookieJar].map(([k, v]) => `${k}=${v}`).join("; "));
 		}
 
-		const res = await libcurl.fetch(url, {
+		const res = await libcurl.session.fetch(url, {
 			method: init.method || (isRequest ? input.method : "GET"),
 			headers,
 			body,
@@ -945,11 +956,30 @@
 
 	function resetNetwork() {
 		// Reset the lazily created singletons so new Wisp settings take effect.
+		const old = curlPromise;
 		curlPromise = null;
+		activeWisp = "";
 		innertubes.plain = null;
 		innertubes.player = null;
 		warmUpPromise = null;
+		lastPlayerUserAgent = null;
 		cookieJar.clear();
+		// Close the old session and its Wisp sockets, otherwise pooled connections keep going out through the
+		// previous Wisp (the public one while playback was off).
+		old?.then((libcurl) => {
+			try {
+				libcurl.session?.close();
+			} catch {
+				// ignore
+			}
+			for (const connection of Object.values(libcurl.wisp?.wisp_connections ?? {})) {
+				try {
+					connection.ws?.close();
+				} catch {
+					// ignore
+				}
+			}
+		}).catch(() => {});
 	}
 
 	// ---------------------------------------------------------------------
@@ -1452,6 +1482,10 @@
 	// Playback control
 	// ---------------------------------------------------------------------
 
+	// How many tracks in a row may fail before we stop skipping to the next one.
+	const MAX_CONSECUTIVE_FAILURES = 2;
+	let consecutiveFailures = 0;
+
 	// Streams the real track. Only called once Spotify has started a placeholder (see startFromPlaceholder), and
 	// Spotify has already been paused on it by then.
 	async function playTrack(track) {
@@ -1498,6 +1532,7 @@
 			}
 
 			state.status = "playing";
+			consecutiveFailures = 0;
 			releaseClock();
 			renderMini();
 			prefetchNext();
@@ -1505,6 +1540,14 @@
 			if (token !== playToken || error?.name === "AbortError") return;
 			console.error("[Synthesis Spicetify] playback failed", error);
 			notify(t("playFailed", error?.message || error), true);
+			// Skipping ahead only makes sense while failures are isolated. When several tracks in a row fail the
+			// cause is the connection (e.g. LOGIN_REQUIRED), so stop instead of looping through the queue.
+			consecutiveFailures++;
+			if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+				consecutiveFailures = 0;
+				closeTrack();
+				return;
+			}
 			stopTrack(true);
 		}
 	}
