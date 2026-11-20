@@ -74,6 +74,8 @@
 		localWisp: "ws://localhost:6001/",
 		// Playback needs the local Wisp server, so it is opt-in.
 		playbackEnabled: false,
+		// Set when a trial over the public Wisp actually started playing: playback is then kept on without a local Wisp.
+		publicPlayback: false,
 		// Absolute path of the folder registered as a Spotify Local Files source for the placeholders.
 		placeholderFolder: "",
 		// InnerTube clients tried in order to obtain a directly playable audio URL.
@@ -110,6 +112,10 @@
 	}
 
 	let config = loadConfig();
+
+	// One-shot trial: the video ID the user explicitly asked to try over a public Wisp while playback is off.
+	// Never saved, and it only unlocks that one track; it is cleared as soon as the download starts or fails.
+	let trialTrackId = null;
 
 	function saveConfig(patch) {
 		config = { ...config, ...patch };
@@ -160,6 +166,8 @@
 			addedQueue: "キューに追加しました",
 			addedNext: "次に再生します",
 			playFailed: (m) => `再生に失敗しました: ${m}`,
+			tryPlay: "公開 Wisp で試しに再生 (ほぼ通らないです)",
+			trialSaved: "公開 Wisp で再生できたため、再生機能を有効のまま保存しました",
 			settingsTitle: "Synthesis Spicetify 設定",
 			wispLabel: "公開 Wisp プロキシ (1行に1つ、上から順に試行)",
 			clientsLabel: "InnerTube クライアント (visionos / tv_samsung、カンマ区切り、上から順に試行)",
@@ -233,6 +241,8 @@
 			addedQueue: "Added to queue",
 			addedNext: "Will play next",
 			playFailed: (m) => `Playback failed: ${m}`,
+			tryPlay: "Try playing via public Wisp (often blocked)",
+			trialSaved: "Playback worked over the public Wisp, so it stays enabled",
 			settingsTitle: "Synthesis Spicetify settings",
 			wispLabel: "Public Wisp proxies (one per line, tried in order)",
 			clientsLabel: "InnerTube clients (visionos / tv_samsung, comma separated, tried in order)",
@@ -406,7 +416,7 @@
 
 	// Playback needs a Wisp server on the user's own IP, so the local one is only tried when enabled.
 	function activeWispServers() {
-		if (!config.playbackEnabled) return config.wispServers;
+		if (!config.playbackEnabled || config.publicPlayback) return config.wispServers;
 		return [config.localWisp, ...config.wispServers.filter((url) => url !== config.localWisp)];
 	}
 
@@ -875,7 +885,9 @@
 	}
 
 	async function youtubeFetchAudio(track, { signal, onProgress, onStart, onChunk } = {}) {
-		if (!config.playbackEnabled) throw new Error(t("playbackDisabled"));
+		const trial = !config.playbackEnabled && track.id === trialTrackId;
+		trialTrackId = null; // a trial is single-use
+		if (!config.playbackEnabled && !trial) throw new Error(t("playbackDisabled"));
 		const errors = [];
 		let started = false;
 
@@ -894,6 +906,11 @@
 					onChunk,
 					onStart: () => {
 						started = true;
+						if (trial && !config.playbackEnabled) {
+							saveConfig({ playbackEnabled: true, publicPlayback: true });
+							renderSearch();
+							notify(t("trialSaved"));
+						}
 						onStart?.(format.mimeType);
 					},
 					userAgent: CLIENT_DEFS[client].client.userAgent,
@@ -1638,8 +1655,9 @@
 	}
 	setInterval(syncSlave, 250);
 
-	function requirePlayback() {
+	function requirePlayback(track) {
 		if (config.playbackEnabled) return true;
+		if (track?.id && track.id === trialTrackId) return true;
 		notify(t("playbackDisabled"), true);
 		return false;
 	}
@@ -2154,7 +2172,7 @@
 	}
 
 	async function playNow(track) {
-		if (!requirePlayback()) return;
+		if (!requirePlayback(track)) return;
 		// The same track is already active: restart it instead of asking Spotify to play its placeholder
 		// again, which would look like a press of the play/pause button.
 		if (state.current && trackKey(state.current) === trackKey(track) && state.status !== "idle") {
@@ -2168,8 +2186,16 @@
 			const uri = await ensurePlaceholder(track, t("preparing"));
 			await playPlaceholder(uri, track.id);
 		} catch (error) {
+			trialTrackId = null;
 			reportPlaceholderError(error);
 		}
+	}
+
+	// Explicit one-off attempt while the playback switch is off. Only this click unlocks this one track.
+	function tryPlay(track) {
+		if (config.playbackEnabled) return playNow(track);
+		trialTrackId = track.id;
+		return playNow(track);
 	}
 
 	async function addToQueue(track, { next = false } = {}) {
@@ -2204,7 +2230,7 @@
 		if (!uri || (state.status !== "idle" && uri === state.placeholderUri)) return; // already handling it
 		state.suppressUntil = Date.now() + 500; // our own pause must not look like a user action
 		Spicetify.Player.pause();
-		if (!requirePlayback()) return;
+		if (!requirePlayback(savedTracks[uri] ?? placeholderTracks.get(uri) ?? { id: item.name })) return;
 
 		let track = savedTracks[uri] ?? placeholderTracks.get(uri);
 		if (!track) {
@@ -2902,6 +2928,7 @@
 			canPlay && h("button", { class: "ss-btn", title: t("playNext"), html: ICONS.playNext, onClick: () => addToQueue(track, { next: true }) }),
 			canPlay && h("button", { class: "ss-btn", title: t("addQueue"), html: ICONS.plus, onClick: () => addToQueue(track) }),
 			canPlay && h("button", { class: "ss-btn", title: t("saveToPlaylist"), html: ICONS.savePlaylist, onClick: (event) => openPlaylistPicker(track, event.currentTarget) }),
+			!canPlay && h("button", { class: "ss-btn", title: t("tryPlay"), html: ICONS.play, onClick: () => tryPlay(track) }),
 			h("button", { class: "ss-btn", title: t("openBrowser"), html: ICONS.external, onClick: () => openInBrowser(track) })
 		);
 	}
@@ -3365,7 +3392,7 @@
 			checkButton.disabled = value;
 		}
 		function setPlayback(enabled) {
-			saveConfig({ playbackEnabled: enabled });
+			saveConfig({ playbackEnabled: enabled, publicPlayback: false });
 			playback.checked = enabled;
 			if (!enabled && state.status !== "idle") closeTrack();
 			resetNetwork();
@@ -3384,7 +3411,7 @@
 			setChecking(false);
 			if (ok) {
 				guideStatus.textContent = t("guideOk");
-				if (!config.playbackEnabled) setPlayback(true);
+				if (!config.playbackEnabled || config.publicPlayback) setPlayback(true);
 				// Playback needs Spotify's Local Files for the placeholders, so set that up as well.
 				const result = await setupLocalFiles();
 				if (token !== checkToken) return;
