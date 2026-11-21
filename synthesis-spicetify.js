@@ -7,7 +7,8 @@
  *
  * Architecture overview:
  *  - Network:  libcurl.js (WASM libcurl + Wisp websocket proxy) replaces fetch() to bypass CORS.
- *  - Data:     youtubei.js (YouTube.js) talks to YouTube Music through that custom fetch.
+ *  - Data:     youtubei.js (YouTube.js) talks to YouTube Music through that custom fetch. SoundCloud is read
+ *              from the web client's api-v2 (the client_id is taken from soundcloud.com's own scripts).
  *  - Audio:    the audio stream is downloaded in ranged chunks and fed to a hidden <audio> through
  *              Media Source Extensions, so playback starts as soon as the first chunk has arrived.
  *              The finished download is kept as a Blob URL cache (also the fallback without MSE).
@@ -21,7 +22,7 @@
  * Both libraries are loaded lazily from jsDelivr (pinned versions) on first use.
  *
  * The file is one script (the Marketplace installs a single file), laid out top to bottom in dependency order:
- * boot, constants and config, i18n, utilities, network, images, YouTube Music provider, playback state and
+ * boot, constants and config, i18n, utilities, network, images, YouTube Music and SoundCloud providers, playback state and
  * registries, audio cache, progressive playback, playback control, placeholders (files, registry, playlist
  * picker, handing them to Spotify, real names, cover art), styles, player bar takeover, search
  * page, diagnostics, settings, registration.
@@ -61,6 +62,7 @@
 	const WISP_SCRIPT_URL = "https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/main/wisp-launcher/portable/wisp_ondemand.py";
 	const LIBCURL_URL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.5/libcurl_full.mjs";
 	const YTJS_URL = "https://cdn.jsdelivr.net/npm/youtubei.js@18.3.0/bundle/browser.js";
+	const FAAD2_URL = "https://cdn.jsdelivr.net/npm/@ohrstrom/faad2-wasm@2.11.2-rc.4/faad2_wasm.mjs"; // AAC decoder (SoundCloud)
 	const CONFIG_KEY = "synthesis-spicetify:config";
 	const MAX_CACHED_TRACKS = 4;
 	const SEARCH_DEBOUNCE_MS = 700;
@@ -209,6 +211,8 @@
 			saveNotIndexed: "ダミー曲が Spotify のローカルファイルに現れませんでした。選んだフォルダが Spotify の設定でローカルファイルのソースに入っているか確認してください。",
 			saveFailed: (m) => `保存に失敗しました: ${m}`,
 			badTrackId: "この曲は扱えません (IDが不正です)。",
+			soundcloudRestricted: "この曲は SoundCloud 側の制限で全編を再生できません (プレビューのみ、または地域制限・非公開)。",
+			soundcloudNoFormat: (formats) => `この曲は、この Spotify で再生できる形式が SoundCloud から提供されていません (提供: ${formats})。`,
 			pickFolder: "ダミー曲を置くフォルダを選んでください (Spotify のローカルファイルのソースに追加済みのフォルダ)。",
 			pickFolderAt: (path) => `ダミー曲を置くフォルダとして ${path} を選んでください。`,
 			folderMismatch: (path) => `選んだフォルダが登録済みのフォルダ (${path}) と違う可能性があります。違う場合、ダミー曲が Spotify に現れません。`,
@@ -283,6 +287,8 @@
 			saveNotIndexed: "The placeholder did not show up in Spotify's local files. Check that the chosen folder is a local files source in Spotify's settings.",
 			saveFailed: (m) => `Saving failed: ${m}`,
 			badTrackId: "This track cannot be used (invalid ID).",
+			soundcloudRestricted: "This track cannot be played in full (SoundCloud only offers a preview, or it is restricted or private).",
+			soundcloudNoFormat: (formats) => `SoundCloud offers no format of this track that this Spotify can play (offered: ${formats}).`,
 			pickFolder: "Choose the folder for the placeholder files (it must be a Local Files source in Spotify).",
 			pickFolderAt: (path) => `Choose ${path} as the folder for the placeholder files.`,
 			folderMismatch: (path) => `The chosen folder may differ from the registered one (${path}). If it does, the placeholders will not show up in Spotify.`,
@@ -348,6 +354,15 @@
 	const notify = (message, isError = false) => Spicetify.showNotification(message, isError);
 
 	const abortError = () => new DOMException("Aborted", "AbortError");
+
+	// Console log of what the player and the services are doing (open the devtools of Spotify and filter by
+	// "Synthesis Spicetify"). Signed URLs and keys are never logged in full.
+	const debug = (scope, ...args) => console.log(`[Synthesis Spicetify][${scope}]`, ...args);
+	const debugError = (scope, ...args) => console.error(`[Synthesis Spicetify][${scope}]`, ...args);
+	const rangesText = (ranges) =>
+		Array.from({ length: ranges.length }, (_, i) => `${ranges.start(i).toFixed(2)}-${ranges.end(i).toFixed(2)}`).join(", ") || "(none)";
+	const audioStateText = (el) =>
+		`time ${el.currentTime.toFixed(2)}, readyState ${el.readyState}, networkState ${el.networkState}, buffered ${rangesText(el.buffered)}`;
 
 	function throwIfAborted(signal) {
 		if (signal?.aborted) throw abortError();
@@ -907,10 +922,25 @@
 		return yt.session.player.decipher(format.url, format.signatureCipher, format.cipher);
 	}
 
-	async function youtubeFetchAudio(track, { signal, onProgress, onStart, onChunk } = {}) {
+	// Playback needs "Enable playback", except for the single trial of one track (see trialKey). Returns whether this
+	// download is that trial.
+	function claimPlayback(track) {
 		const trial = !config.playbackEnabled && trackKey(track) === trialKey;
 		trialKey = null; // a trial is single-use
 		if (!config.playbackEnabled && !trial) throw new Error(t("playbackDisabled"));
+		return trial;
+	}
+
+	// A trial that got as far as receiving audio over the public Wisp keeps playback enabled.
+	function confirmTrial(trial) {
+		if (!trial || config.playbackEnabled) return;
+		saveConfig({ playbackEnabled: true, publicPlayback: true });
+		renderSearch();
+		notify(t("trialSaved"));
+	}
+
+	async function youtubeFetchAudio(track, { signal, onProgress, onStart, onChunk } = {}) {
+		const trial = claimPlayback(track);
 		const errors = [];
 		let started = false;
 
@@ -929,11 +959,7 @@
 					onChunk,
 					onStart: () => {
 						started = true;
-						if (trial && !config.playbackEnabled) {
-							saveConfig({ playbackEnabled: true, publicPlayback: true });
-							renderSearch();
-							notify(t("trialSaved"));
-						}
+						confirmTrial(trial);
 						onStart?.(format.mimeType);
 					},
 					userAgent: CLIENT_DEFS[client].client.userAgent,
@@ -951,6 +977,706 @@
 		const joined = errors.join(" | ") || "no client available";
 		if (/not a bot/i.test(joined) && !isLocalWisp()) throw new Error(`${joined} (${t("botHint")})`);
 		throw new Error(joined);
+	}
+
+	// ---------------------------------------------------------------------
+	// SoundCloud provider (unofficial: the web client's api-v2 and its public client_id)
+	// ---------------------------------------------------------------------
+	// SoundCloud's official API needs an Artist Pro account for its credentials, cannot keep a secret in an
+	// extension, and its terms forbid mixing SoundCloud with other services. So this talks to
+	// api-v2.soundcloud.com the way soundcloud.com itself (and yt-dlp) does: the client_id is read from the site's
+	// own JS and cached, and read again when SoundCloud rejects it (HTTP 401 / 403). This may violate SoundCloud's
+	// Terms of Service. If it breaks, compare with yt_dlp/extractor/soundcloud.py in yt-dlp.
+
+	const SOUNDCLOUD_WEB = "https://soundcloud.com/";
+	const SOUNDCLOUD_API = "https://api-v2.soundcloud.com";
+	const SOUNDCLOUD_CLIENT_ID_KEY = "synthesis-spicetify:soundcloud-client-id";
+	const SOUNDCLOUD_HEADERS = {
+		accept: "application/json, text/javascript, */*; q=0.01",
+		origin: "https://soundcloud.com",
+		referer: "https://soundcloud.com/",
+		"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.105 Safari/537.36",
+	};
+	let soundcloudClientIdPromise = null;
+
+	// Logging helpers: the client_id is public but still only shown shortened, and signed URLs lose their query.
+	const soundcloudMask = (id) => `${String(id).slice(0, 4)}...`;
+	const soundcloudShortUrl = (url) => {
+		try {
+			const parsed = new URL(url);
+			return parsed.origin + parsed.pathname;
+		} catch {
+			return String(url);
+		}
+	};
+	const soundcloudHead = (bytes) => Array.from(bytes.subarray(0, 12), (b) => b.toString(16).padStart(2, "0")).join(" ");
+
+	function storedSoundcloudClientId() {
+		try {
+			return localStorage.getItem(SOUNDCLOUD_CLIENT_ID_KEY) || "";
+		} catch {
+			return "";
+		}
+	}
+
+	// The web client keeps its client_id in one of the scripts of the main page: client_id:"<32 characters>".
+	async function extractSoundcloudClientId() {
+		debug("soundcloud", "client_id: reading soundcloud.com");
+		const page = await curlFetch(SOUNDCLOUD_WEB, { headers: { ...SOUNDCLOUD_HEADERS, accept: "text/html" } });
+		if (!page.ok) throw new Error(`soundcloud.com returned HTTP ${page.status}`);
+		const html = await page.text();
+		// Only SoundCloud's own scripts are read, newest bundle first (the same order yt-dlp uses).
+		const scripts = [...html.matchAll(/<script[^>]+src="([^"]+)"/g)]
+			.map((match) => new URL(match[1], SOUNDCLOUD_WEB))
+			.filter((url) => url.hostname.endsWith("sndcdn.com"))
+			.reverse();
+		debug("soundcloud", `client_id: ${scripts.length} SoundCloud scripts to search`);
+		for (const url of scripts) {
+			try {
+				const res = await curlFetch(url.href, { headers: { ...SOUNDCLOUD_HEADERS, accept: "*/*" } });
+				if (!res.ok) {
+					debug("soundcloud", `client_id: ${url.pathname} returned HTTP ${res.status}`);
+					continue;
+				}
+				const found = /client_id\s*:\s*"([0-9a-zA-Z]{32})"/.exec(await res.text());
+				if (found) {
+					debug("soundcloud", `client_id: found ${soundcloudMask(found[1])} in ${url.pathname}`);
+					return found[1];
+				}
+			} catch (error) {
+				debug("soundcloud", `client_id: ${url.pathname} failed:`, error?.message || error);
+			}
+		}
+		throw new Error("could not find a SoundCloud client_id");
+	}
+
+	// `rejected` is a client_id SoundCloud just refused: the cached one is then replaced (unless a concurrent call
+	// has already replaced it).
+	function soundcloudClientId(rejected = "") {
+		if (!soundcloudClientIdPromise || rejected) {
+			const previous = soundcloudClientIdPromise;
+			const promise = (async () => {
+				if (rejected && previous) {
+					const current = await previous.catch(() => "");
+					if (current && current !== rejected) return current;
+				}
+				if (!rejected) {
+					const stored = storedSoundcloudClientId();
+					if (stored) {
+						debug("soundcloud", `client_id: using the stored ${soundcloudMask(stored)}`);
+						return stored;
+					}
+				} else {
+					debug("soundcloud", `client_id: ${soundcloudMask(rejected)} was rejected, getting a new one`);
+				}
+				const id = await extractSoundcloudClientId();
+				try {
+					localStorage.setItem(SOUNDCLOUD_CLIENT_ID_KEY, id);
+				} catch {
+					// keep it in memory only
+				}
+				return id;
+			})();
+			soundcloudClientIdPromise = promise;
+			promise.catch(() => {
+				if (soundcloudClientIdPromise === promise) soundcloudClientIdPromise = null;
+			});
+		}
+		return soundcloudClientIdPromise;
+	}
+
+	// GET a JSON document of api-v2 (also used for the media URLs it hands out), with the client_id attached.
+	async function soundcloudCall(url, query = {}, signal) {
+		let rejected = "";
+		for (let attempt = 0; ; attempt++) {
+			const clientId = await soundcloudClientId(rejected);
+			const target = new URL(url);
+			for (const [key, value] of Object.entries(query)) target.searchParams.set(key, value);
+			target.searchParams.set("client_id", clientId);
+			const began = performance.now();
+			const res = await curlFetch(target.href, { method: "GET", headers: SOUNDCLOUD_HEADERS, signal });
+			debug("soundcloud", `GET ${soundcloudShortUrl(target.href)} -> HTTP ${res.status} (${Math.round(performance.now() - began)} ms)`);
+			if ((res.status === 401 || res.status === 403) && attempt === 0) {
+				rejected = clientId;
+				continue;
+			}
+			if (!res.ok) {
+				const error = new Error(`SoundCloud returned HTTP ${res.status}`);
+				error.status = res.status;
+				throw error;
+			}
+			return res.json();
+		}
+	}
+
+	// ---- Tracks and covers ----
+	const SOUNDCLOUD_COVER_RE = /^(https:\/\/i\d*\.sndcdn\.com\/.+-)(?:mini|tiny|small|badge|t67x67|large|t300x300|crop|t500x500|t1080x1080|original)(\.(?:jpg|jpeg|png))(\?.*)?$/;
+
+	// Covers come in fixed sizes that are named in the file name (-large.jpg is 100 px, -t500x500.jpg is 500 px).
+	function soundcloudResizeThumbnail(url, size) {
+		const match = SOUNDCLOUD_COVER_RE.exec(url);
+		if (!match) return null;
+		const name = size <= 67 ? "t67x67" : size <= 100 ? "large" : size <= 300 ? "t300x300" : "t500x500";
+		return `${match[1]}${name}${match[2]}`;
+	}
+
+	// An api-v2 track object as a track of this extension, or null for what cannot be played in full.
+	function soundcloudToTrack(item) {
+		if (!item || (item.kind && item.kind !== "track") || !item.id || !item.title) return null;
+		// BLOCK: not available here. SNIP: a 30 second preview (SoundCloud Go+ content, which is not touched).
+		if (item.policy === "BLOCK" || item.policy === "SNIP" || item.streamable === false) return null;
+		const cover = item.artwork_url || item.user?.avatar_url || "";
+		return {
+			provider: "soundcloud",
+			id: String(item.id),
+			title: String(item.title),
+			artists: [item.publisher_metadata?.artist || item.user?.username || ""].filter(Boolean),
+			album: item.publisher_metadata?.album_title || "",
+			durationMs: item.full_duration || item.duration || 0,
+			thumbnail: (cover && soundcloudResizeThumbnail(cover, 500)) || cover,
+			url: item.permalink_url || "",
+		};
+	}
+
+	function createSoundcloudSearch(query) {
+		const seen = new Set();
+		let buffer = [];
+		let next = null; // next_href of the last page
+		let started = false;
+		let done = false;
+
+		async function fillBuffer() {
+			const page = started
+				? await soundcloudCall(next)
+				: await soundcloudCall(`${SOUNDCLOUD_API}/search/tracks`, { q: query, limit: 20, linked_partitioning: 1 });
+			started = true;
+			next = page?.next_href || null;
+			const items = page?.collection ?? [];
+			if (!next || !items.length) done = true;
+			for (const item of items) {
+				const track = soundcloudToTrack(item);
+				if (!track || seen.has(track.id)) continue;
+				seen.add(track.id);
+				buffer.push(track);
+			}
+		}
+
+		return {
+			get hasMore() {
+				return buffer.length > 0 || !done;
+			},
+			async take(count) {
+				// A page can be entirely unplayable or duplicates, so allow a few fetches before giving up.
+				for (let attempt = 0; attempt < 5 && buffer.length < count && !done; attempt++) await fillBuffer();
+				return buffer.splice(0, count);
+			},
+		};
+	}
+
+	const soundcloudSearch = (query, limit) => createSoundcloudSearch(query).take(limit);
+	const soundcloudOpenUrl = (track) => track.url || null;
+
+	async function soundcloudFetchDisplay(id) {
+		const item = await soundcloudCall(`${SOUNDCLOUD_API}/tracks/${encodeURIComponent(id)}`);
+		if (!item?.title) return null;
+		const track = soundcloudToTrack({ ...item, policy: "ALLOW", streamable: true });
+		return { title: track.title, artist: track.artists.join(", "), album: track.album, thumbnail: track.thumbnail, letterbox: false };
+	}
+
+	// ---- Audio ----
+
+	// The downloadable full-length transcodings of a track, best first. Progressive MP3 is a plain file, HLS MP3
+	// is a list of MP3 pieces that simply follow each other, Opus is Ogg Opus (played from the finished download,
+	// MSE has no Ogg), HLS AAC is a fragmented MP4. Previews and DRM / encrypted HLS are left out.
+	function soundcloudCandidates(info) {
+		// AAC comes last: the Chromium inside Spotify has no AAC decoder (see soundcloudCanPlay).
+		const rank = { "progressive:mp3": 0, "hls:mp3": 1, "progressive:opus": 2, "hls:opus": 3, "hls:aac": 4 };
+		const candidates = [];
+		for (const transcoding of info?.media?.transcodings ?? []) {
+			if (!transcoding?.url || !transcoding.preset) continue;
+			if (transcoding.snipped || transcoding.url.includes("/preview/")) continue;
+			const protocol = transcoding.format?.protocol || "progressive";
+			const codec = transcoding.preset.split("_")[0];
+			const order = rank[`${protocol}:${codec}`];
+			if (order === undefined) continue;
+			candidates.push({ url: transcoding.url, protocol, codec, order });
+		}
+		return candidates.sort((a, b) => a.order - b.order);
+	}
+
+	const SOUNDCLOUD_MIME = { mp3: "audio/mpeg", opus: 'audio/ogg; codecs="opus"', aac: 'audio/mp4; codecs="mp4a.40.2"' };
+
+	// Whether the <audio> of this Spotify build can decode the format. The Chromium inside Spotify can play MP3 and
+	// Opus but has no AAC ("FFmpegDemuxer: no supported streams"), and SoundCloud often offers AAC only.
+	function soundcloudCanPlay(mime) {
+		try {
+			return document.createElement("audio").canPlayType(mime) !== "";
+		} catch {
+			return false;
+		}
+	}
+
+	const soundcloudLabel = (candidate) => `${candidate.protocol}_${candidate.codec}`;
+	const soundcloudNeedsDecoding = (candidate) => candidate.protocol === "hls" && candidate.codec === "aac" && !soundcloudCanPlay(SOUNDCLOUD_MIME.aac);
+
+	// Reads an HLS playlist. A master playlist yields `variant` (the media playlist to read instead).
+	function parseHlsPlaylist(text, baseUrl) {
+		const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+		if (lines[0] !== "#EXTM3U") throw new Error("not an HLS playlist");
+		const parsed = { variant: null, init: null, segments: [], encrypted: false };
+		let expectVariant = false;
+		for (const line of lines) {
+			if (line.startsWith("#EXT-X-STREAM-INF")) {
+				expectVariant = true;
+			} else if (line.startsWith("#EXT-X-MAP:")) {
+				const uri = /URI="([^"]+)"/.exec(line);
+				if (uri) parsed.init = new URL(uri[1], baseUrl).href;
+			} else if (line.startsWith("#EXT-X-KEY:")) {
+				if (!/METHOD=NONE/.test(line)) parsed.encrypted = true;
+			} else if (!line.startsWith("#")) {
+				const url = new URL(line, baseUrl).href;
+				if (expectVariant) parsed.variant ??= url;
+				else parsed.segments.push(url);
+				expectVariant = false;
+			}
+		}
+		return parsed;
+	}
+
+	const soundcloudMediaHeaders = { ...SOUNDCLOUD_HEADERS, accept: "*/*" };
+
+	// A progressive file: one request, streamed.
+	async function soundcloudDownloadFile(url, codec, { signal, onProgress, onStart, onChunk } = {}) {
+		const mime = SOUNDCLOUD_MIME[codec] || "audio/mpeg";
+		const res = await curlFetch(url, { method: "GET", headers: soundcloudMediaHeaders, signal });
+		if (!res.ok) throw new Error(`SoundCloud media returned HTTP ${res.status}`);
+		const total = Number(res.headers?.get?.("content-length")) || 0;
+		debug("soundcloud", `file: ${soundcloudShortUrl(url)}, content-length ${total || "unknown"}, mime ${mime}`);
+		onStart?.(mime);
+		const parts = [];
+		let received = 0;
+		const reader = res.body.getReader();
+		for (;;) {
+			throwIfAborted(signal);
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!parts.length) debug("soundcloud", `file: first bytes ${soundcloudHead(value)}`);
+			parts.push(value);
+			onChunk?.(value);
+			received += value.byteLength;
+			if (total) onProgress?.(Math.min(received / total, 1));
+		}
+		throwIfAborted(signal);
+		debug("soundcloud", `file: received ${received} bytes`);
+		if (!received || (total && received < total * 0.98)) throw new Error("incomplete download");
+		return new Blob(parts, { type: mime });
+	}
+
+	// HLS: the pieces (and the init segment of an fMP4) are fetched in order, one ahead, and handed on as they come.
+	async function soundcloudDownloadHls(url, codec, { signal, onProgress, onStart, onChunk, out } = {}) {
+		const readPlaylist = async (playlistUrl) => {
+			const res = await curlFetch(playlistUrl, { method: "GET", headers: soundcloudMediaHeaders, signal });
+			if (!res.ok) throw new Error(`SoundCloud playlist returned HTTP ${res.status}`);
+			return parseHlsPlaylist(await res.text(), playlistUrl);
+		};
+		let playlist = await readPlaylist(url);
+		if (playlist.variant) playlist = await readPlaylist(playlist.variant);
+		if (playlist.encrypted) throw new Error("encrypted HLS is not supported");
+		if (!playlist.segments.length) throw new Error("empty HLS playlist");
+
+		const mime = codec === "aac" && !playlist.init ? "audio/aac" : SOUNDCLOUD_MIME[codec] || "audio/mpeg";
+		const urls = playlist.init ? [playlist.init, ...playlist.segments] : playlist.segments;
+		debug("soundcloud", `HLS: ${playlist.segments.length} pieces, init ${playlist.init ? soundcloudShortUrl(playlist.init) : "none"}, mime ${mime}`);
+		if (out) out.hasInit = Boolean(playlist.init); // out.pieces gets the downloaded pieces (init first)
+		const began = performance.now();
+		let total = 0;
+		const fetchPart = async (partUrl) => {
+			const res = await curlFetch(partUrl, { method: "GET", headers: soundcloudMediaHeaders, signal });
+			if (!res.ok) throw new Error(`SoundCloud media returned HTTP ${res.status}`);
+			return new Uint8Array(await res.arrayBuffer());
+		};
+
+		const parts = [];
+		let started = false;
+		let pending = fetchPart(urls[0]);
+		for (let i = 0; i < urls.length; i++) {
+			throwIfAborted(signal);
+			const current = pending;
+			pending = i + 1 < urls.length ? fetchPart(urls[i + 1]) : null;
+			pending?.catch(() => {}); // not awaited when this loop ends early; its error is not unhandled
+			const bytes = await current;
+			total += bytes.byteLength;
+			// The first bytes tell the container: "00 00 00 xx 66 74 79 70" (ftyp) is MP4, "ff f1" / "ff f9" is ADTS AAC.
+			if (i < 3 || (i + 1) % 10 === 0 || i === urls.length - 1) {
+				// For Ogg Opus: does a piece start its own stream (OpusHead)? Then the pieces are chained streams.
+				const opusHead = codec === "opus" ? `, OpusHead ${new TextDecoder("latin1").decode(bytes.subarray(0, 128)).includes("OpusHead")}` : "";
+				debug("soundcloud", `HLS: piece ${i + 1}/${urls.length}, ${bytes.byteLength} bytes, first bytes ${soundcloudHead(bytes)}${opusHead}`);
+			}
+			if (!started) {
+				started = true;
+				onStart?.(mime);
+			}
+			parts.push(bytes);
+			out?.pieces.push(bytes);
+			onChunk?.(bytes);
+			onProgress?.((i + 1) / urls.length);
+		}
+		debug("soundcloud", `HLS: done, ${total} bytes in ${Math.round(performance.now() - began)} ms`);
+		return new Blob(parts, { type: mime });
+	}
+
+	// ---- AAC without an AAC decoder in the player ----
+	// The Chromium inside Spotify has no AAC decoder and SoundCloud offers AAC only. So the fragmented MP4 is taken
+	// apart here, the AAC frames are decoded by FAAD2 (WebAssembly, loaded from the CDN like libcurl.js) and the
+	// PCM is played as a WAV file. That needs the whole track first; the decoding takes a few seconds.
+
+	const FAAD2_SAMPLE_RATES = { 1: 8000, 2: 16000, 3: 22050, 4: 32000, 5: 44100, 6: 48000, 7: 64000, 8: 88200, 9: 96000 };
+	const FAAD2_INPUT_CAPACITY = 1 << 15;
+	const FAAD2_OUTPUT_BYTES = 4096 * 2 * 4; // up to 4096 samples of two channels as float32
+
+	// The boxes of an MP4 between `start` and `end`: { type, start, body, end }.
+	function* mp4Boxes(bytes, start = 0, end = bytes.length) {
+		const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		let pos = start;
+		while (pos + 8 <= end) {
+			let size = view.getUint32(pos);
+			const type = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+			let header = 8;
+			if (size === 1) {
+				size = Number(view.getBigUint64(pos + 8));
+				header = 16;
+			} else if (size === 0) {
+				size = end - pos;
+			}
+			if (size < header || pos + size > end) break; // truncated
+			yield { type, start: pos, body: pos + header, end: pos + size };
+			pos += size;
+		}
+	}
+
+	function mp4Child(bytes, parent, type, skip = 0) {
+		for (const box of mp4Boxes(bytes, parent.body + skip, parent.end)) if (box.type === type) return box;
+		return null;
+	}
+
+	function mp4Path(bytes, root, path) {
+		let box = root;
+		for (const type of path) {
+			box = box && mp4Child(bytes, box, type);
+			if (!box) return null;
+		}
+		return box;
+	}
+
+	// The AudioSpecificConfig, the channel count and the default sample size of an AAC init segment.
+	function readAacInit(init) {
+		const view = new DataView(init.buffer, init.byteOffset, init.byteLength);
+		const moov = mp4Child(init, { body: 0, end: init.length }, "moov");
+		const stsd = mp4Path(init, moov, ["trak", "mdia", "minf", "stbl", "stsd"]);
+		if (!stsd) throw new Error("no sample description in the init segment");
+		// stsd: version + flags (4), entry count (4), then the sample entries
+		const entry = mp4Boxes(init, stsd.body + 8, stsd.end).next().value;
+		if (entry?.type !== "mp4a") throw new Error(`unexpected sample entry ${entry?.type}`);
+		const channels = view.getUint16(entry.body + 16);
+		// The entry has 28 bytes of audio fields, then child boxes; esds holds the descriptors.
+		const esds = mp4Child(init, entry, "esds", 28);
+		if (!esds) throw new Error("no esds box in the init segment");
+		let p = esds.body + 4; // version + flags
+		const descriptor = () => {
+			const tag = init[p++];
+			let length = 0;
+			for (let i = 0; i < 4; i++) {
+				const b = init[p++];
+				length = (length << 7) | (b & 0x7f);
+				if (!(b & 0x80)) break;
+			}
+			return { tag, length };
+		};
+		if (descriptor().tag !== 0x03) throw new Error("bad ES descriptor");
+		p += 2; // ES_ID
+		const flags = init[p++];
+		if (flags & 0x80) p += 2; // stream dependence
+		if (flags & 0x40) p += init[p] + 1; // URL
+		if (flags & 0x20) p += 2; // OCR
+		if (descriptor().tag !== 0x04) throw new Error("bad decoder config descriptor");
+		p += 13; // object type, stream type, buffer size, max and average bitrate
+		const specific = descriptor();
+		if (specific.tag !== 0x05) throw new Error("no AudioSpecificConfig");
+		const asc = init.slice(p, p + specific.length);
+		const trex = mp4Path(init, moov, ["mvex", "trex"]);
+		return { asc, channels, defaultSize: trex ? view.getUint32(trex.body + 16) : 0 };
+	}
+
+	// The raw AAC frames of one media segment (styp? moof mdat), found through the sample sizes of the trun box.
+	function readAacFragment(bytes, defaultSize = 0) {
+		const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		const frames = [];
+		const mdat = mp4Child(bytes, { body: 0, end: bytes.length }, "mdat");
+		for (const moof of mp4Boxes(bytes)) {
+			if (moof.type !== "moof") continue;
+			for (const traf of mp4Boxes(bytes, moof.body, moof.end)) {
+				if (traf.type !== "traf") continue;
+				let sampleSize = defaultSize;
+				for (const box of mp4Boxes(bytes, traf.body, traf.end)) {
+					const flags = box.type === "tfhd" || box.type === "trun" ? view.getUint32(box.body) & 0xffffff : 0;
+					if (box.type === "tfhd") {
+						let q = box.body + 8; // version + flags, track ID
+						if (flags & 0x1) q += 8; // base data offset: the offsets below stay relative to the moof box
+						if (flags & 0x2) q += 4; // sample description index
+						if (flags & 0x8) q += 4; // default sample duration
+						if (flags & 0x10) sampleSize = view.getUint32(q);
+					} else if (box.type === "trun") {
+						const count = view.getUint32(box.body + 4);
+						let q = box.body + 8;
+						let pos = mdat ? mdat.body : 0;
+						if (flags & 0x1) {
+							pos = moof.start + view.getInt32(q);
+							q += 4;
+						}
+						if (flags & 0x4) q += 4; // first sample flags
+						for (let i = 0; i < count; i++) {
+							if (flags & 0x100) q += 4; // duration
+							let size = sampleSize;
+							if (flags & 0x200) {
+								size = view.getUint32(q);
+								q += 4;
+							}
+							if (flags & 0x400) q += 4; // flags
+							if (flags & 0x800) q += 4; // composition time offset
+							if (!size || pos + size > bytes.length) throw new Error("truncated AAC fragment");
+							frames.push(bytes.subarray(pos, pos + size));
+							pos += size;
+						}
+					}
+				}
+			}
+		}
+		return frames;
+	}
+
+	let soundcloudFaad2Promise = null;
+
+	// FAAD2 as a WebAssembly module. If the page may not fetch the .wasm itself, it is fetched through the proxy.
+	function loadFaad2() {
+		soundcloudFaad2Promise ??= (async () => {
+			const factory = (await import(FAAD2_URL)).default;
+			try {
+				return await factory({});
+			} catch (error) {
+				debug("soundcloud", "FAAD2: loading the wasm directly failed, fetching it through the proxy:", error?.message || error);
+				const res = await curlFetch(new URL("faad2_wasm.wasm", FAAD2_URL).href, { method: "GET" });
+				if (!res.ok) throw new Error(`FAAD2 wasm returned HTTP ${res.status}`);
+				return factory({ wasmBinary: new Uint8Array(await res.arrayBuffer()) });
+			}
+		})();
+		soundcloudFaad2Promise.catch(() => {
+			soundcloudFaad2Promise = null;
+		});
+		return soundcloudFaad2Promise;
+	}
+
+	// The FAAD2 module has one decoder, so tracks are decoded one at a time.
+	let soundcloudDecodeLock = Promise.resolve();
+	function withSoundcloudDecodeLock(task) {
+		const run = soundcloudDecodeLock.then(task, task);
+		soundcloudDecodeLock = run.catch(() => {});
+		return run;
+	}
+
+	function wavHeader(dataBytes, sampleRate, channels) {
+		const view = new DataView(new ArrayBuffer(44));
+		const text = (offset, value) => [...value].forEach((char, i) => view.setUint8(offset + i, char.charCodeAt(0)));
+		text(0, "RIFF");
+		view.setUint32(4, 36 + dataBytes, true);
+		text(8, "WAVEfmt ");
+		view.setUint32(16, 16, true); // fmt chunk size
+		view.setUint16(20, 1, true); // PCM
+		view.setUint16(22, channels, true);
+		view.setUint32(24, sampleRate, true);
+		view.setUint32(28, sampleRate * channels * 2, true);
+		view.setUint16(32, channels * 2, true);
+		view.setUint16(34, 16, true);
+		text(36, "data");
+		view.setUint32(40, dataBytes, true);
+		return view.buffer;
+	}
+
+	// Decodes the AAC of an fMP4 (init segment + media segments) to a 16 bit WAV Blob.
+	async function soundcloudDecodeAac(init, pieces, { signal, onProgress } = {}) {
+		const { asc, defaultSize } = readAacInit(init);
+		const frames = pieces.flatMap((piece) => readAacFragment(piece, defaultSize));
+		if (!frames.length) throw new Error("no AAC frames found");
+		const faad = await loadFaad2();
+		return withSoundcloudDecodeLock(async () => {
+			const began = performance.now();
+			const inPtr = faad._malloc(FAAD2_INPUT_CAPACITY + 64);
+			const outPtr = faad._malloc(FAAD2_OUTPUT_BYTES);
+			try {
+				const ascPtr = faad._malloc(asc.length);
+				faad.HEAPU8.set(asc, ascPtr);
+				const result = faad._init_decoder(ascPtr, asc.length);
+				faad._free(ascPtr);
+				if (result < 0) throw new Error(`FAAD2 could not start the decoder (${result}), ASC ${Array.from(asc, (b) => b.toString(16)).join(" ")}`);
+
+				const parts = [];
+				let sampleRate = 0;
+				let channels = 0;
+				let dataBytes = 0;
+				let skipped = 0;
+				for (let i = 0; i < frames.length; i++) {
+					if (i % 256 === 0) {
+						await new Promise((resolve) => setTimeout(resolve)); // keep the UI alive
+						throwIfAborted(signal);
+						onProgress?.(i / frames.length);
+					}
+					const frame = frames[i];
+					if (frame.length > FAAD2_INPUT_CAPACITY) throw new Error(`AAC frame of ${frame.length} bytes is too large`);
+					faad.HEAPU8.set(frame, inPtr);
+					faad.HEAPU8.fill(0, inPtr + frame.length, inPtr + frame.length + 64);
+					const packed = faad._decode_frame(inPtr, frame.length, outPtr, FAAD2_OUTPUT_BYTES);
+					if (packed === 0 || (packed < 0 && packed > -1000)) {
+						skipped++; // no output (decoder start-up) or a broken frame
+						continue;
+					}
+					const rate = FAAD2_SAMPLE_RATES[(packed >>> 28) & 0xf];
+					const count = packed & 0xffffff;
+					const frameChannels = (packed >>> 24) & 0xf;
+					if (!rate || !frameChannels || !count) {
+						skipped++;
+						continue;
+					}
+					if (!sampleRate) {
+						sampleRate = rate;
+						channels = frameChannels;
+					} else if (rate !== sampleRate || frameChannels !== channels) {
+						throw new Error("the AAC stream changes its format");
+					}
+					const raw = new Float32Array(faad.HEAPU8.buffer, outPtr, count);
+					const pcm = new Int16Array(count);
+					for (let k = 0; k < count; k++) pcm[k] = Math.round(Math.max(-1, Math.min(1, raw[k])) * 32767);
+					parts.push(pcm);
+					dataBytes += pcm.byteLength;
+				}
+				throwIfAborted(signal);
+				if (!parts.length) throw new Error("FAAD2 decoded no audio");
+				onProgress?.(1);
+				debug("soundcloud", `FAAD2: ${frames.length} frames (${skipped} without output) -> ${dataBytes} bytes of PCM, ${sampleRate} Hz, ${channels} ch, ${Math.round(performance.now() - began)} ms`);
+				return { blob: new Blob([wavHeader(dataBytes, sampleRate, channels), ...parts], { type: "audio/wav" }), sampleRate, channels, frames: frames.length };
+			} finally {
+				faad._free(inPtr);
+				faad._free(outPtr);
+			}
+		});
+	}
+
+	// HLS AAC: download everything, decode it and hand the WAV on.
+	async function soundcloudDownloadAacDecoded(url, codec, { signal, onProgress, onStart } = {}) {
+		const out = { pieces: [], hasInit: false };
+		await soundcloudDownloadHls(url, codec, { signal, onProgress: (p) => onProgress?.(p * 0.6), out });
+		if (!out.hasInit) throw new Error("AAC without an init segment (ADTS) is not supported");
+		const [init, ...pieces] = out.pieces;
+		const decoded = await soundcloudDecodeAac(init, pieces, { signal, onProgress: (p) => onProgress?.(0.6 + p * 0.4) });
+		// A WAV cannot be fed to MSE, so the player waits for the finished download instead.
+		onStart?.("audio/wav");
+		return decoded.blob;
+	}
+
+	async function soundcloudFetchAudio(track, { signal, onProgress, onStart, onChunk } = {}) {
+		const trial = claimPlayback(track);
+		const info = await soundcloudCall(`${SOUNDCLOUD_API}/tracks/${encodeURIComponent(track.id)}`, {}, signal);
+		const offered = soundcloudCandidates(info);
+		// AAC is always usable: when the player cannot decode it, it is decoded here.
+		const candidates = offered.filter((candidate) => candidate.codec === "aac" || soundcloudCanPlay(SOUNDCLOUD_MIME[candidate.codec]));
+		debug("soundcloud", `track ${track.id}: policy ${info.policy}, access ${info.access}, streamable ${info.streamable}, duration ${info.duration} / full ${info.full_duration}`);
+		debug("soundcloud", `transcodings: ${(info.media?.transcodings ?? []).map((x) => `${x.format?.protocol}/${x.preset}${x.snipped ? " (snipped)" : ""}`).join(", ")}`);
+		debug("soundcloud", `this player can play: ${Object.entries(SOUNDCLOUD_MIME).map(([codec, mime]) => `${codec}=${soundcloudCanPlay(mime)}`).join(", ")}`);
+		debug("soundcloud", `offered, best first: ${offered.map(soundcloudLabel).join(", ") || "(none)"}; playable here: ${candidates.map((c) => soundcloudLabel(c) + (soundcloudNeedsDecoding(c) ? " (decoded here)" : "")).join(", ") || "(none)"}`);
+		if (!offered.length) throw new Error(t("soundcloudRestricted"));
+		if (!candidates.length) throw new Error(t("soundcloudNoFormat", offered.map(soundcloudLabel).join(", ")));
+		const query = info.track_authorization ? { track_authorization: info.track_authorization } : {};
+		const errors = [];
+		let started = false;
+
+		for (const candidate of candidates) {
+			throwIfAborted(signal);
+			const label = soundcloudLabel(candidate);
+			try {
+				debug("soundcloud", `trying ${label}`);
+				const data = await soundcloudCall(candidate.url, query, signal);
+				if (!data?.url) throw new Error("no stream URL in the response");
+				debug("soundcloud", `${label}: stream URL ${soundcloudShortUrl(data.url)}`);
+				const download = soundcloudNeedsDecoding(candidate) ? soundcloudDownloadAacDecoded : candidate.protocol === "hls" ? soundcloudDownloadHls : soundcloudDownloadFile;
+				const blob = await download(data.url, candidate.codec, {
+					signal,
+					onProgress,
+					onChunk,
+					onStart: (mime) => {
+						started = true;
+						confirmTrial(trial);
+						debug("soundcloud", `${label}: handing audio to the player as ${mime}`);
+						onStart?.(mime);
+					},
+				});
+				debug("soundcloud", `${label}: download finished, ${blob.size} bytes`);
+				return { blob, mime: blob.type };
+			} catch (error) {
+				if (signal?.aborted || error?.name === "AbortError") throw abortError();
+				debugError("soundcloud", `${label} failed${started ? " after the audio had started" : ""}:`, error);
+				// Chunks already handed to the player cannot be taken back, so a failure mid-stream is final.
+				if (started) throw error;
+				errors.push(`${label}: ${error?.message || error}`);
+			}
+		}
+		throw new Error(errors.join(" | "));
+	}
+
+	// The SoundCloud steps of the connection test: client_id + search, then the first bytes of a stream.
+	async function soundcloudDiagnose(log, step) {
+		let tracks = [];
+		if (!(await step("SoundCloud client_id + search", async () => {
+			tracks = await soundcloudSearch("daft punk one more time", 3);
+			if (!tracks.length) throw new Error("0 results");
+			return `${tracks.length} results`;
+		}))) return;
+
+		if (!config.playbackEnabled) {
+			log("Playback is disabled, so the SoundCloud stream steps are skipped.");
+			return;
+		}
+		let sample = null; // init segment and first piece of an AAC track that this player cannot decode itself
+		const streamOk = await step("SoundCloud stream (first bytes)", async () => {
+			const info = await soundcloudCall(`${SOUNDCLOUD_API}/tracks/${tracks[0].id}`);
+			const offered = soundcloudCandidates(info);
+			if (!offered.length) throw new Error("no full-length transcoding");
+			const candidate = offered.find((c) => c.codec === "aac" || soundcloudCanPlay(SOUNDCLOUD_MIME[c.codec]));
+			if (!candidate) throw new Error(`no format this player can play (offered: ${offered.map(soundcloudLabel).join(", ")})`);
+			const query = info.track_authorization ? { track_authorization: info.track_authorization } : {};
+			const data = await soundcloudCall(candidate.url, query);
+			if (!data?.url) throw new Error("no stream URL in the response");
+			if (candidate.protocol === "hls") {
+				let playlist = parseHlsPlaylist(await (await curlFetch(data.url, { headers: soundcloudMediaHeaders })).text(), data.url);
+				if (playlist.variant) playlist = parseHlsPlaylist(await (await curlFetch(playlist.variant, { headers: soundcloudMediaHeaders })).text(), playlist.variant);
+				const first = playlist.init || playlist.segments[0];
+				const res = await curlFetch(first, { headers: soundcloudMediaHeaders });
+				if (!res.ok) throw new Error(`HTTP ${res.status}`);
+				const firstBytes = new Uint8Array(await res.arrayBuffer());
+				if (playlist.init && soundcloudNeedsDecoding(candidate)) {
+					const piece = await curlFetch(playlist.segments[0], { headers: soundcloudMediaHeaders });
+					if (!piece.ok) throw new Error(`HTTP ${piece.status}`);
+					sample = { init: firstBytes, piece: new Uint8Array(await piece.arrayBuffer()) };
+				}
+				return `hls_${candidate.codec}, ${playlist.segments.length} pieces${playlist.init ? ", fMP4" : ""}, first piece ${firstBytes.byteLength} bytes`;
+			}
+			const res = await curlFetch(data.url, { headers: { ...soundcloudMediaHeaders, range: "bytes=0-65535" } });
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			return `${candidate.protocol}_${candidate.codec}, ${(await res.arrayBuffer()).byteLength} bytes`;
+		});
+		if (streamOk && sample) {
+			await step("SoundCloud AAC decoder (FAAD2, WebAssembly)", async () => {
+				const decoded = await soundcloudDecodeAac(sample.init, [sample.piece]);
+				return `${decoded.frames} frames, ${decoded.sampleRate} Hz, ${decoded.channels} ch, ${decoded.blob.size} bytes of WAV`;
+			});
+		}
 	}
 
 	// Registry of the music services. Everything that belongs to one service sits behind this interface, so
@@ -989,6 +1715,21 @@
 			reset: youtubeReset,
 			warmUp: () => getInnertube(),
 			diagnose: youtubeDiagnose,
+		},
+		soundcloud: {
+			id: "soundcloud",
+			label: "SoundCloud",
+			tag: "sc",
+			artist: "SoundCloud",
+			idPattern: /^\d{1,20}$/,
+			search: soundcloudSearch,
+			createSearch: createSoundcloudSearch,
+			fetchAudio: soundcloudFetchAudio,
+			streamable: true,
+			openUrl: soundcloudOpenUrl,
+			fetchDisplay: soundcloudFetchDisplay,
+			resizeThumbnail: soundcloudResizeThumbnail,
+			diagnose: soundcloudDiagnose,
 		},
 	};
 
@@ -1102,6 +1843,7 @@
 			album: track.album,
 			durationMs: track.durationMs,
 			thumbnail: track.thumbnail,
+			url: track.url, // for the services whose track page cannot be derived from the ID alone
 		};
 	}
 
@@ -1218,8 +1960,12 @@
 		let blocked = false;
 		let ended = false;
 		let dead = false;
+		let appended = 0;
+		let updates = 0;
 
 		function fail(error) {
+			// An unsupported format is expected (the player then waits for the whole download), not an error.
+			(error?.streamUnsupported ? debug : debugError)("mse", "failed:", error?.name, error?.message, "|", audioStateText(audio), "| audio.error:", audio.error?.code, audio.error?.message);
 			dead = true;
 			pending = [];
 			stalled = null;
@@ -1242,6 +1988,7 @@
 			if (!stalled && !pending.length) {
 				if (ended) {
 					try {
+						debug("mse", `endOfStream (${appended} appends), ${audioStateText(audio)}`);
 						mediaSource.endOfStream();
 					} catch (error) {
 						console.warn("[Synthesis Spicetify] endOfStream failed", error);
@@ -1265,13 +2012,16 @@
 			}
 			try {
 				buffer.appendBuffer(chunk);
+				if (appended++ < 3) debug("mse", `append #${appended}: ${chunk.byteLength} bytes`);
 				stalled = null;
 				blocked = false;
 			} catch (error) {
 				if (error?.name !== "QuotaExceededError") {
+					debugError("mse", `appendBuffer #${appended + 1} (${chunk.byteLength} bytes) threw`, error);
 					fail(error);
 					return;
 				}
+				debug("mse", "buffer full, waiting for playback to advance");
 				// The browser's buffer is full of data ahead of the playhead (long tracks). Keep the chunk and
 				// retry as playback advances: the browser then drops what has been played to make room.
 				stalled = chunk;
@@ -1285,6 +2035,7 @@
 		return {
 			start(mime) {
 				if (dead || mediaSource) return;
+				debug("mse", `start: ${mime}, supported: ${typeof MediaSource !== "undefined" && MediaSource.isTypeSupported(mime)}`);
 				if (typeof MediaSource === "undefined" || !MediaSource.isTypeSupported(mime)) {
 					const error = new Error(`MediaSource does not support ${mime}`);
 					error.streamUnsupported = true;
@@ -1299,10 +2050,13 @@
 					try {
 						buffer = mediaSource.addSourceBuffer(mime);
 					} catch (error) {
+						debugError("mse", "addSourceBuffer threw", error);
 						fail(error);
 						return;
 					}
+					debug("mse", `sourceopen: SourceBuffer created, mode ${buffer.mode}`);
 					buffer.addEventListener("updateend", () => {
+						if (updates++ < 3) debug("mse", `updateend #${updates}: ${audioStateText(audio)}`);
 						applyDuration();
 						pump();
 					});
@@ -1345,9 +2099,13 @@
 			if (onProgress) job.listeners.add(onProgress);
 
 			let settled = false;
+			const watchdog = setTimeout(() => {
+				if (!settled) debugError("stream", `no playback 10 s after the start: ${audioStateText(audio)}, paused ${audio.paused}`);
+			}, 10000);
 			const settle = (fn, value) => {
 				if (settled) return;
 				settled = true;
+				clearTimeout(watchdog);
 				fn(value);
 			};
 
@@ -1356,9 +2114,16 @@
 				onAttached: () => {
 					syncVolume();
 					// Resolves as soon as enough data is buffered to start, not when the download is done.
+					debug("stream", "audio.play() called");
 					audio.play().then(
-						() => settle(resolve),
-						(error) => settle(reject, error)
+						() => {
+							debug("stream", `audio.play() resolved: ${audioStateText(audio)}`);
+							settle(resolve);
+						},
+						(error) => {
+							debugError("stream", "audio.play() rejected:", error?.name, error?.message);
+							settle(reject, error);
+						}
 					);
 				},
 				onError: (error) => {
@@ -1761,8 +2526,15 @@
 		const duration = Spicetify.Player.getDuration();
 		if (duration - spotifyPosition() * 1000 > 300) seekSpotify((duration - 150) / 1000);
 	});
+	for (const name of ["loadedmetadata", "canplay", "playing", "waiting", "stalled", "emptied", "abort"]) {
+		audio.addEventListener(name, () => {
+			if (audio.getAttribute("src")) debug("audio", `${name}: ${audioStateText(audio)}`);
+		});
+	}
 	audio.addEventListener("error", () => {
 		if (!audio.getAttribute("src")) return;
+		// MediaError codes: 1 aborted, 2 network, 3 decode, 4 source not supported
+		debugError("audio", `error: code ${audio.error?.code}, message "${audio.error?.message}", ${audioStateText(audio)}`);
 		notify(t("playFailed", audio.error?.message || "media error"), true);
 		stopTrack(true);
 	});

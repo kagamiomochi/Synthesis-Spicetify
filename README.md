@@ -7,9 +7,9 @@
 ![GitHub Tag](https://img.shields.io/github/v/tag/kagamiomochi/Synthesis-Spicetify?sort=semver&style=for-the-badge&label=Latest%20Version&link=https%3A%2F%2Fgithub.com%2Fkagamiomochi%2FSynthesis-Spicetify%2Ftags)
 
 
-A [Spicetify](https://spicetify.app/) extension that brings YouTube Music into Spotify.
+A [Spicetify](https://spicetify.app/) extension that brings YouTube Music and SoundCloud into Spotify.
 
-Currently supported service: YouTube Music (YouTube). More services are planned.
+Currently supported services: YouTube Music (YouTube) and SoundCloud. More services are planned.
 
 [Japanese / 日本語](#日本語) | [Technical details](#technical-details)
 
@@ -146,8 +146,11 @@ On macOS and Windows, logs are written next to the wisp-js directory (`wisp-onde
   which hostnames you connect to (TLS is terminated inside Spotify). With playback enabled and a local server it is
   your own machine.
 - Session cookies from YouTube are kept in memory only.
-- This extension uses unofficial YouTube APIs and may violate YouTube's Terms of Service. Use it at your own risk.
-- Not affiliated with Spotify, Google or YouTube.
+- SoundCloud is reached through the same proxy. The `client_id` that soundcloud.com's own web client uses is read from the site's scripts and cached in the browser's local storage (it is public, not tied to you).
+- This extension uses unofficial YouTube and SoundCloud APIs and may violate their Terms of Service (SoundCloud's API terms also forbid mixing its tracks with other services, and the official API is not used). Use it at your own risk.
+- Only tracks SoundCloud offers in full are shown. Previews, Go+ and encrypted streams are skipped.
+- SoundCloud serves AAC only, which the Chromium inside Spotify cannot decode. The AAC is therefore decoded in the extension with [FAAD2](https://github.com/knik0/faad2) compiled to WebAssembly (`@ohrstrom/faad2-wasm`, loaded from jsDelivr like libcurl.js) and played as WAV. A SoundCloud track starts after it has been downloaded and decoded, which takes a few seconds.
+- Not affiliated with Spotify, Google, YouTube or SoundCloud.
 
 ---
 
