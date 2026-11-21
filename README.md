@@ -172,6 +172,18 @@ Audio is downloaded in chunks and played progressively through Media Source Exte
 download finishes). The finished download is cached as a Blob URL, so there is no streaming proxy. The last few
 tracks are kept in the in-memory cache (see **Clear audio cache** in the settings).
 
+### Services
+
+Everything that belongs to one music service sits behind the `providers` registry in `synthesis-spicetify.js`
+(search, audio download, the service's page, cover helpers, the steps of the connection test). The rest of the
+extension (search tabs, placeholders, playback, the real names shown in Spotify's rows) only talks to that interface,
+so a new service is one more provider entry. The interface is described in the comment above the registry.
+
+A placeholder's title tag tells which service it belongs to: the track ID, with the service's tag in front of it
+(`sc.123`). YouTube has no tag, so its placeholders keep the bare video ID and the artist "YouTube" they have always
+had, and playlists saved by older versions keep working. Every service has its own artist tag, so its
+`spotify:local:` URIs never clash with another service's.
+
 ### Why a local Wisp server is needed
 
 libcurl.js sends its traffic through a Wisp proxy. TLS is terminated inside Spotify, so the proxy only sees
@@ -378,6 +390,12 @@ Spotify のプロフィールメニューから「Synthesis Spicetify 設定」�
 ### 再生の仕組み
 
 音声はチャンクごとにダウンロードしながら Media Source Extensions で逐次再生します(ダウンロード完了を待たずに再生開始)。完了後は Blob URL としてキャッシュするため、ストリーミング用のプロキシは不要です。直近の数曲はメモリ上にキャッシュされます(設定の「音声キャッシュを削除」で解放できます)。
+
+### サービス(プロバイダ)
+
+1 つの音楽サービスに関わる処理(検索、音声のダウンロード、サービス上のページ、カバー画像の補助、接続テストの手順)は、`synthesis-spicetify.js` の `providers` レジストリの裏側にまとまっています。検索タブ、ダミー曲、再生、Spotify の行に表示する本物の名前などは、このインターフェースだけを経由します。そのため、新しいサービスはプロバイダを 1 つ追加すれば足ります。インターフェースの説明はレジストリの上のコメントにあります。
+
+ダミー曲の曲名タグで、どのサービスの曲かを区別します。曲名タグは、曲 ID の前にサービスのタグを付けたもの(`sc.123` など)です。YouTube にはタグがないので、これまでどおり動画 ID だけの曲名とアーティスト「YouTube」のままで、旧バージョンで保存したプレイリストもそのまま動きます。アーティストのタグはサービスごとに別なので、`spotify:local:` の URI が他のサービスと重なることはありません。
 
 ### ローカル Wisp が必要な理由
 

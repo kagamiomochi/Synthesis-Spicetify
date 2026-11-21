@@ -112,9 +112,9 @@
 
 	let config = loadConfig();
 
-	// One-shot trial: the video ID the user explicitly asked to try over a public Wisp while playback is off.
-	// Never saved, and it only unlocks that one track; it is cleared as soon as the download starts or fails.
-	let trialTrackId = null;
+	// One-shot trial: the key (see trackKey) of the track the user explicitly asked to try over a public Wisp while
+	// playback is off. Never saved, and it only unlocks that one track; it is cleared as soon as the download starts or fails.
+	let trialKey = null;
 
 	function saveConfig(patch) {
 		config = { ...config, ...patch };
@@ -148,10 +148,9 @@
 	const STRINGS = {
 		ja: {
 			tabSpotify: "Spotify",
-			tabYouTubeMusic: "YouTube Music",
-			searching: "YouTube Music を検索中...",
-			noResults: "YouTube Music に該当する曲が見つかりませんでした。",
-			failed: "YouTube Music の検索に失敗しました。",
+			searching: (service) => `${service} を検索中...`,
+			noResults: (service) => `${service} に該当する曲が見つかりませんでした。`,
+			failed: (service) => `${service} の検索に失敗しました。`,
 			retry: "再試行",
 			loadingMore: "さらに読み込み中...",
 			loadMoreFailed: "続きの読み込みに失敗しました。",
@@ -223,10 +222,9 @@
 		},
 		en: {
 			tabSpotify: "Spotify",
-			tabYouTubeMusic: "YouTube Music",
-			searching: "Searching YouTube Music...",
-			noResults: "No matching songs on YouTube Music.",
-			failed: "YouTube Music search failed.",
+			searching: (service) => `Searching ${service}...`,
+			noResults: (service) => `No matching songs on ${service}.`,
+			failed: (service) => `${service} search failed.`,
 			retry: "Retry",
 			loadingMore: "Loading more...",
 			loadMoreFailed: "Failed to load more results.",
@@ -732,12 +730,30 @@
 		return createYoutubeSearch(query).take(limit);
 	}
 
-	// Open the track on YouTube Music in the default external browser
-	function openInBrowser(track) {
-		const url = `https://music.youtube.com/watch?v=${encodeURIComponent(track.id)}`;
-		// Do not check the return value: the Spotify client may return null even when the browser opened,
-		// and a fallback would open a second tab
-		window.open(url, "_blank", "noopener,noreferrer");
+	const youtubeOpenUrl = (track) => `https://music.youtube.com/watch?v=${encodeURIComponent(track.id)}`;
+	const youtubeThumbnail = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+
+	// A plain YouTube thumbnail is a small picture with black bars. The full-size frame (when YouTube has one)
+	// has no bars: this is its URL, or null when the URL is not a plain YouTube thumbnail.
+	function youtubeUpgradeThumbnail(url) {
+		const match = /^(https:\/\/i\.ytimg\.com\/vi\/[\w-]{11}\/)\w+\.jpg/.exec(url);
+		return match ? `${match[1]}maxresdefault.jpg` : null;
+	}
+
+	// Title, artist and cover of a video that no stored data knows about: ask YouTube's oEmbed endpoint, which
+	// needs no API key and returns the title and the channel name of any public video.
+	async function youtubeFetchDisplay(id) {
+		const watch = `https://www.youtube.com/watch?v=${id}`;
+		const res = await curlFetch(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(watch)}`, {
+			method: "GET",
+			headers: { accept: "application/json" },
+		});
+		if (!res.ok) throw new Error(`oEmbed returned HTTP ${res.status}`);
+		const data = await res.json();
+		if (!data?.title) return null;
+		// Auto-generated artist channels are called "<artist> - Topic".
+		const artist = String(data.author_name || "").replace(/\s+-\s+Topic$/i, "");
+		return { title: data.title, artist, album: "", thumbnail: data.thumbnail_url || youtubeThumbnail(id), letterbox: true };
 	}
 
 	// ---- Audio download through libcurl (ranged requests, like YouTube's own player) ----
@@ -892,8 +908,8 @@
 	}
 
 	async function youtubeFetchAudio(track, { signal, onProgress, onStart, onChunk } = {}) {
-		const trial = !config.playbackEnabled && track.id === trialTrackId;
-		trialTrackId = null; // a trial is single-use
+		const trial = !config.playbackEnabled && trackKey(track) === trialKey;
+		trialKey = null; // a trial is single-use
 		if (!config.playbackEnabled && !trial) throw new Error(t("playbackDisabled"));
 		const errors = [];
 		let started = false;
@@ -937,29 +953,69 @@
 		throw new Error(joined);
 	}
 
-	// Registry so that more services can be added later.
+	// Registry of the music services. Everything that belongs to one service sits behind this interface, so
+	// that adding a service means implementing it and listing it here:
+	//   id, label              the id (also the id of its search tab) and the name shown to the user
+	//   tag                    prefix of its placeholders' title tag, "<tag>.<id>" ("" = the bare ID, see placeholderTitle)
+	//   artist                 artist tag of its placeholders (fixed, so no song info is written to the file)
+	//   idPattern              what one of its track IDs looks like (recognises a title tag, refuses bad IDs)
+	//   search(query, limit)   one-off search, resolves with tracks
+	//   createSearch(query)    paged search session { take(n), hasMore }
+	//   fetchAudio(track, hooks), streamable   download (see getAudioJob); streamable = reports onStart / onChunk
+	//   openUrl(track)         the track's page on the service
+	// Optional:
+	//   fetchDisplay(id)       title, artist, album and cover of an ID, for when no stored track data is left
+	//   fallbackThumbnail(id)  { url, letterbox } cover derived from the ID alone
+	//   resizeThumbnail(url, size) / upgradeThumbnail(url)   a cover URL at another size, or null if not this service's
+	//   reset(), warmUp(), diagnose(log, step)   network reset, idle-time warm-up, steps of the connection test
+	const LEGACY_PROVIDER = "youtube"; // placeholders without a tag were made when YouTube was the only service
 	const providers = {
 		youtube: {
 			id: "youtube",
 			label: "YouTube Music",
+			tag: "",
+			artist: "YouTube",
+			idPattern: /^[\w-]{11}$/,
 			search: youtubeSearch,
 			createSearch: createYoutubeSearch,
 			fetchAudio: youtubeFetchAudio,
 			// fetchAudio reports onStart(mime) and onChunk(bytes) while downloading.
 			streamable: true,
+			openUrl: youtubeOpenUrl,
+			fetchDisplay: youtubeFetchDisplay,
+			fallbackThumbnail: (id) => ({ url: youtubeThumbnail(id), letterbox: true }),
+			resizeThumbnail: (url, size) => (/=w\d+-h\d+/.test(url) ? resizeThumbnail(url, size) : null),
+			upgradeThumbnail: youtubeUpgradeThumbnail,
+			reset: youtubeReset,
+			warmUp: () => getInnertube(),
+			diagnose: youtubeDiagnose,
 		},
 	};
+
+	// Open the track on its service in the default external browser
+	function openInBrowser(track) {
+		const url = providers[track.provider]?.openUrl(track);
+		if (!url) return;
+		// Do not check the return value: the Spotify client may return null even when the browser opened,
+		// and a fallback would open a second tab
+		window.open(url, "_blank", "noopener,noreferrer");
+	}
+
+	// The YouTube side of resetNetwork(): its sessions, warm-up and cookies belong to the old connection.
+	function youtubeReset() {
+		innertubes.plain = null;
+		innertubes.player = null;
+		warmUpPromise = null;
+		lastPlayerUserAgent = null;
+		cookieJar.clear();
+	}
 
 	function resetNetwork() {
 		// Reset the lazily created singletons so new Wisp settings take effect.
 		const old = curlPromise;
 		curlPromise = null;
 		activeWisp = "";
-		innertubes.plain = null;
-		innertubes.player = null;
-		warmUpPromise = null;
-		lastPlayerUserAgent = null;
-		cookieJar.clear();
+		for (const provider of Object.values(providers)) provider.reset?.();
 		// Close the old session and its Wisp sockets, otherwise pooled connections keep going out through the
 		// previous Wisp (the public one while playback was off).
 		old?.then((libcurl) => {
@@ -1000,7 +1056,10 @@
 
 	function loadSaved() {
 		try {
-			return JSON.parse(localStorage.getItem(SAVED_KEY) || "{}");
+			const saved = JSON.parse(localStorage.getItem(SAVED_KEY) || "{}");
+			// Tracks saved before there was more than one service carry no provider: they are YouTube tracks.
+			for (const track of Object.values(saved)) if (track && !track.provider) track.provider = LEGACY_PROVIDER;
+			return saved;
 		} catch {
 			return {};
 		}
@@ -1018,19 +1077,18 @@
 		}
 	}
 
-	const displayInfo = new Map(); // video ID -> { title, artist, album, thumbnail, letterbox }
+	const displayInfo = new Map(); // placeholder title tag (see placeholderTitle) -> { title, artist, album, thumbnail, letterbox }
 
-	const youtubeThumbnail = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
-
-	// What Spotify's rows show for a track's placeholder. Without a stored cover, YouTube's own thumbnail is used,
-	// which has black bars above and below the picture (hence "letterbox").
+	// What Spotify's rows show for a track's placeholder. Without a stored cover, the service's own thumbnail for
+	// the ID is used (YouTube's has black bars above and below the picture, hence "letterbox").
 	function displayInfoOf(track) {
+		const fallback = track.thumbnail ? null : providers[track.provider]?.fallbackThumbnail?.(track.id);
 		return {
 			title: track.title,
 			artist: (track.artists || []).join(", "),
 			album: track.album || "",
-			thumbnail: track.thumbnail || youtubeThumbnail(track.id),
-			letterbox: !track.thumbnail,
+			thumbnail: track.thumbnail || fallback?.url || "",
+			letterbox: Boolean(fallback?.letterbox),
 		};
 	}
 
@@ -1691,7 +1749,7 @@
 
 	function requirePlayback(track) {
 		if (config.playbackEnabled) return true;
-		if (track?.id && track.id === trialTrackId) return true;
+		if (track && trialKey && trackKey(track) === trialKey) return true;
 		notify(t("playbackDisabled"), true);
 		return false;
 	}
@@ -1738,11 +1796,29 @@
 	// Spotify starts playing that URI the extension pauses Spotify and streams the real track instead.
 
 	const PLACEHOLDER_ALBUM = "Synthesis"; // album tag of every placeholder, also used to recognise them
-	const PLACEHOLDER_ARTIST = "YouTube"; // artist tag of every placeholder (fixed, so no song info is written)
 
 	// The title tag of a placeholder. Only the video ID is written, which is unique per video, so the
 	// playlist row does not reveal the song and the real track can be found again from the ID alone.
-	const placeholderTitle = (track) => track.id;
+	const placeholderArtist = (track) => providers[track.provider].artist;
+
+	// The title tag of a placeholder: the track ID, with the service's tag in front of it ("sc.123") unless the
+	// service has none. YouTube has none, so its placeholders keep the bare video ID they always had.
+	function placeholderTitle(track) {
+		const { tag } = providers[track.provider];
+		return tag ? `${tag}.${track.id}` : track.id;
+	}
+
+	// Reads a title tag back into { provider, id }, or null when the text is not a placeholder title. A text
+	// without a tag belongs to the legacy service (a tag never fits an ID pattern, nor the other way round).
+	function parsePlaceholderTitle(text) {
+		const value = String(text ?? "").trim();
+		if (!value || value.length > 80) return null;
+		const dot = value.indexOf(".");
+		const tagged = dot > 0 ? Object.values(providers).find((p) => p.tag && p.tag === value.slice(0, dot)) : null;
+		const provider = tagged ?? providers[LEGACY_PROVIDER];
+		const id = tagged ? value.slice(dot + 1) : value;
+		return provider.idPattern.test(id) ? { provider, id } : null;
+	}
 
 	const HANDLE_DB = "synthesis-spicetify";
 
@@ -1934,13 +2010,13 @@
 		return null;
 	}
 
-	// Two different videos can share artist, title and length. They must not share a URI, so the length
-	// moves up by a second until the URI is free (or already belongs to the same video).
+	// Two different tracks can share artist, title and length. They must not share a URI, so the length
+	// moves up by a second until the URI is free (or already belongs to the same track).
 	function pickLocalUri(track, seconds) {
 		for (let i = 0; i < 30; i++, seconds++) {
-			const uri = localUri(PLACEHOLDER_ARTIST, PLACEHOLDER_ALBUM, placeholderTitle(track), seconds);
+			const uri = localUri(placeholderArtist(track), PLACEHOLDER_ALBUM, placeholderTitle(track), seconds);
 			const owner = savedTracks[uri];
-			if (!owner || owner.id === track.id) return { uri, seconds };
+			if (!owner || trackKey(owner) === trackKey(track)) return { uri, seconds };
 		}
 		throw new Error("too many saved tracks share this title and length");
 	}
@@ -1959,24 +2035,26 @@
 		}
 	}
 
-	// A video that already has a placeholder keeps its length, so that it keeps its URI even when a later
+	// A track that already has a placeholder keeps its length, so that it keeps its URI even when a later
 	// search reports a slightly different duration.
-	function knownSeconds(id) {
+	function knownSeconds(track) {
+		const wanted = trackKey(track);
 		let uri = null;
-		for (const [key, track] of placeholderTracks) if (track.id === id) uri = key;
-		uri ??= Object.keys(savedTracks).find((key) => savedTracks[key].id === id) ?? null;
+		for (const [key, other] of placeholderTracks) if (trackKey(other) === wanted) uri = key;
+		uri ??= Object.keys(savedTracks).find((key) => trackKey(savedTracks[key]) === wanted) ?? null;
 		const seconds = uri ? Number(uri.split(":").pop()) : NaN;
 		return seconds > 0 ? seconds : null;
 	}
 
 	// ---- Placeholder registry: making a placeholder for a track, and saving it to a playlist ----
 
-	const placeholderJobs = new Map(); // video ID -> promise of a placeholder that is being made
+	const placeholderJobs = new Map(); // track key -> promise of a placeholder that is being made
 
 	async function makePlaceholder(track, busyText) {
 		const title = placeholderTitle(track);
+		const artist = placeholderArtist(track);
 		const base = Math.max(1, Math.round((track.durationMs || 180000) / 1000));
-		const { uri: expected, seconds } = pickLocalUri(track, knownSeconds(track.id) ?? base);
+		const { uri: expected, seconds } = pickLocalUri(track, knownSeconds(track) ?? base);
 
 		// A placeholder that Spotify already lists is reused as it is. No file access is needed then.
 		let uri = await findIndexedUri(expected);
@@ -1985,28 +2063,29 @@
 			const dir = await getPlaceholderDir();
 			// The file name does not matter to Spotify (the URI comes from the tags). Including the length
 			// keeps two placeholders of the same video, if there ever are two, in separate files.
-			const handle = await dir.getFileHandle(`${track.id}-${seconds}.mp3`, { create: true });
+			const handle = await dir.getFileHandle(`${title}-${seconds}.mp3`, { create: true });
 			const writable = await handle.createWritable();
-			await writable.write(makeSilentMp3({ artist: PLACEHOLDER_ARTIST, album: PLACEHOLDER_ALBUM, title, seconds }));
+			await writable.write(makeSilentMp3({ artist, album: PLACEHOLDER_ALBUM, title, seconds }));
 			await writable.close();
-			uri = await waitForLocalUri(expected, { artist: PLACEHOLDER_ARTIST, title, seconds });
+			uri = await waitForLocalUri(expected, { artist, title, seconds });
 			if (!uri) throw new Error(t("saveNotIndexed"));
 		}
 
 		placeholderTracks.set(uri, snapshotTrack(track));
 		// Spotify's rows for the placeholder can show the real text and cover art right away.
-		displayInfo.set(track.id, displayInfoOf(track));
+		displayInfo.set(title, displayInfoOf(track));
 		return uri;
 	}
 
 	// Returns the spotify:local: URI of the track's placeholder, making the file when needed. Call it from a
 	// click handler without awaiting anything first: the folder dialog needs the click's user gesture.
 	function ensurePlaceholder(track, busyText) {
-		if (!/^[\w-]+$/.test(track.id)) return Promise.reject(new Error(t("badTrackId")));
-		let job = placeholderJobs.get(track.id);
+		if (!providers[track.provider]?.idPattern.test(track.id)) return Promise.reject(new Error(t("badTrackId")));
+		const key = trackKey(track);
+		let job = placeholderJobs.get(key);
 		if (!job) {
-			job = makePlaceholder(track, busyText).finally(() => placeholderJobs.delete(track.id));
-			placeholderJobs.set(track.id, job);
+			job = makePlaceholder(track, busyText).finally(() => placeholderJobs.delete(key));
+			placeholderJobs.set(key, job);
 		}
 		return job;
 	}
@@ -2134,13 +2213,13 @@
 	}
 
 	// True once Spotify's current item is the placeholder. Spotify may spell a local file's URI differently from
-	// the local files index, so the tags (title = video ID, album "Synthesis") count as well.
-	async function waitForSpotifyItem(uri, id, timeoutMs) {
+	// the local files index, so the tags (the title tag, album "Synthesis") count as well.
+	async function waitForSpotifyItem(uri, title, timeoutMs) {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
 			const item = Spicetify.Player.data?.item;
 			if (item?.uri === uri) return true;
-			if (item?.uri?.startsWith("spotify:local:") && item.name === id && item.album?.name === PLACEHOLDER_ALBUM) return true;
+			if (item?.uri?.startsWith("spotify:local:") && item.name === title && item.album?.name === PLACEHOLDER_ALBUM) return true;
 			await sleep(100);
 		}
 		return false;
@@ -2150,7 +2229,7 @@
 
 	// Plays a placeholder in Spotify's own player. The songchange handler then takes over and streams the
 	// real track (see startFromPlaceholder).
-	async function playPlaceholder(uri, id) {
+	async function playPlaceholder(uri, title) {
 		// A local file can only be played inside the Local Files context, so start that context at the placeholder.
 		for (const attempt of [
 			() => Spicetify.Player.playUri(LOCAL_FILES_CONTEXT, {}, { skipTo: { uri } }),
@@ -2161,7 +2240,7 @@
 			} catch (error) {
 				console.warn("[Synthesis Spicetify] could not start the placeholder", error);
 			}
-			if (await waitForSpotifyItem(uri, id, 2000)) return;
+			if (await waitForSpotifyItem(uri, title, 2000)) return;
 		}
 		console.warn("[Synthesis Spicetify] Spotify did not switch to the placeholder", { expected: uri, current: Spicetify.Player.data?.item?.uri });
 		// Spotify did not switch. Put the placeholder at the front of the queue and skip to it instead.
@@ -2172,7 +2251,7 @@
 		} catch (error) {
 			console.warn("[Synthesis Spicetify] queue fallback failed", error);
 		}
-		if (await waitForSpotifyItem(uri, id, 2000)) return;
+		if (await waitForSpotifyItem(uri, title, 2000)) return;
 		throw new Error(t("placeholderNotPlayed"));
 	}
 
@@ -2217,9 +2296,9 @@
 		try {
 			// Nothing may be awaited before this: choosing the placeholder folder needs the click's user gesture.
 			const uri = await ensurePlaceholder(track, t("preparing"));
-			await playPlaceholder(uri, track.id);
+			await playPlaceholder(uri, placeholderTitle(track));
 		} catch (error) {
-			trialTrackId = null;
+			trialKey = null;
 			reportPlaceholderError(error);
 		}
 	}
@@ -2227,7 +2306,7 @@
 	// Explicit one-off attempt while the playback switch is off. Only this click unlocks this one track.
 	function tryPlay(track) {
 		if (config.playbackEnabled) return playNow(track);
-		trialTrackId = track.id;
+		trialKey = trackKey(track);
 		return playNow(track);
 	}
 
@@ -2237,7 +2316,7 @@
 			const uri = await ensurePlaceholder(track, t("preparing"));
 			// Nothing is playing at all: there is no queue to add to, so start right away.
 			if (!readSpotify().uri && state.status === "idle") {
-				await playPlaceholder(uri, track.id);
+				await playPlaceholder(uri, placeholderTitle(track));
 				return;
 			}
 			const placedNext = await queuePlaceholder(uri, next);
@@ -2263,28 +2342,36 @@
 		if (!uri || (state.status !== "idle" && uri === state.placeholderUri)) return; // already handling it
 		state.suppressUntil = Date.now() + 500; // our own pause must not look like a user action
 		Spicetify.Player.pause();
-		if (!requirePlayback(savedTracks[uri] ?? placeholderTracks.get(uri) ?? { id: item.name })) return;
-
 		let track = savedTracks[uri] ?? placeholderTracks.get(uri);
+		// No stored mapping (for example the extension data was cleared): the title tag names the service and
+		// the ID, and playback only needs those.
+		const parsed = track ? null : parsePlaceholderTitle(item.name);
+		const known = track ?? (parsed && { provider: parsed.provider.id, id: parsed.id });
+		if (!requirePlayback(known)) return;
+		if (known && !providers[known.provider]) {
+			notify(t("playFailed", known.provider), true);
+			return;
+		}
+
 		if (!track) {
-			// No stored mapping (for example the extension data was cleared): the title tag is the video ID,
-			// and playback only needs the ID. Display details are missing, so the ID stands in for the title.
-			if (/^[\w-]+$/.test(item.name || "")) {
-				const info = displayInfo.get(item.name);
+			// Display details are missing, so the ID stands in for the title.
+			if (parsed) {
+				const info = displayInfo.get(item.name.trim());
 				track = {
-					provider: "youtube",
-					id: item.name,
-					title: info?.title || item.name,
+					provider: parsed.provider.id,
+					id: parsed.id,
+					title: info?.title || parsed.id,
 					artists: info?.artist ? [info.artist] : [],
 					album: "",
 					durationMs: item.duration?.milliseconds ?? 0,
 					thumbnail: info?.thumbnail || "",
 				};
 			} else {
-				// A placeholder made by an older version: its tags hold the artist and title, so search by them.
+				// A placeholder made by an older version: its tags hold the artist and title, so search by them
+				// (a version that old only knew the legacy service).
 				const query = [item.artists?.[0]?.name, item.name].filter(Boolean).join(" ");
 				try {
-					track = (await youtubeSearch(query, 1))[0];
+					track = (await providers[LEGACY_PROVIDER].search(query, 1))[0];
 				} catch (error) {
 					console.warn("[Synthesis Spicetify] placeholder lookup failed", error);
 				}
@@ -2356,52 +2443,45 @@
 	// ---------------------------------------------------------------------
 
 	// ---- Showing real names for placeholders ----
-	// The placeholder file only carries the video ID as its title and a fixed artist / album, so Spotify's own
-	// rows (playlists, queue, player bar) would show "dQw4w9WgXcQ / YouTube / Synthesis". Only the DOM text is
-	// rewritten here: nothing is written to the file or to Spotify's data, and the real values live in memory.
+	// The placeholder file only carries the track ID as its title (with the service's tag in front of it, see
+	// placeholderTitle) and a fixed artist / album, so Spotify's own rows (playlists, queue, player bar) would
+	// show "dQw4w9WgXcQ / YouTube / Synthesis". Only the DOM text is rewritten here: nothing is written to the
+	// file or to Spotify's data, and the real values live in memory.
 
-	const VIDEO_ID_RE = /^[\w-]{11}$/;
-	const displayFetchedAt = new Map(); // video ID -> time of the last lookup, so a failure is retried only rarely
+	const displayFetchedAt = new Map(); // title tag -> time of the last lookup, so a failure is retried only rarely
 
-	function savedById(id) {
-		for (const track of Object.values(savedTracks)) if (track.id === id) return track;
+	function savedByTitle(title) {
+		for (const track of Object.values(savedTracks)) if (providers[track.provider] && placeholderTitle(track) === title) return track;
 		return null;
 	}
 
-	// Display details of a placeholder's video ID, or null while they are still being looked up.
-	function lookupDisplay(id) {
-		const known = displayInfo.get(id);
+	// Display details of a placeholder's title tag, or null while they are still being looked up.
+	function lookupDisplay(title) {
+		const known = displayInfo.get(title);
 		if (known) return known;
-		const saved = savedById(id);
+		const saved = savedByTitle(title);
 		if (saved?.title) {
 			const info = displayInfoOf(saved);
-			displayInfo.set(id, info);
+			displayInfo.set(title, info);
 			return info;
 		}
-		fetchDisplay(id);
+		fetchDisplay(title);
 		return null;
 	}
 
-	// No stored mapping (for example the extension data was cleared): ask YouTube's oEmbed endpoint, which
-	// needs no API key and returns the title and the channel name of any public video.
-	async function fetchDisplay(id) {
-		if (Date.now() - (displayFetchedAt.get(id) || 0) < 60000) return;
-		displayFetchedAt.set(id, Date.now());
+	// No stored mapping (for example the extension data was cleared): ask the service about the ID, if it can say.
+	async function fetchDisplay(title) {
+		const parsed = parsePlaceholderTitle(title);
+		if (!parsed?.provider.fetchDisplay) return;
+		if (Date.now() - (displayFetchedAt.get(title) || 0) < 60000) return;
+		displayFetchedAt.set(title, Date.now());
 		try {
-			const watch = `https://www.youtube.com/watch?v=${id}`;
-			const res = await curlFetch(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(watch)}`, {
-				method: "GET",
-				headers: { accept: "application/json" },
-			});
-			if (!res.ok) throw new Error(`oEmbed returned HTTP ${res.status}`);
-			const data = await res.json();
-			if (!data?.title) return;
-			// Auto-generated artist channels are called "<artist> - Topic".
-			const artist = String(data.author_name || "").replace(/\s+-\s+Topic$/i, "");
-			displayInfo.set(id, { title: data.title, artist, album: "", thumbnail: data.thumbnail_url || youtubeThumbnail(id), letterbox: true });
+			const info = await parsed.provider.fetchDisplay(parsed.id);
+			if (!info?.title) return;
+			displayInfo.set(title, info);
 			scheduleDisplayRewrite(true);
 		} catch (error) {
-			console.warn("[Synthesis Spicetify] display lookup failed", id, error);
+			console.warn("[Synthesis Spicetify] display lookup failed", title, error);
 		}
 	}
 
@@ -2422,26 +2502,26 @@
 		return false;
 	}
 
-	// Number of ID-like text nodes in scope, not counting `except` (the title being handled, which may already
-	// have been rewritten when this runs again for a retry).
+	// Number of placeholder title tags in scope, not counting `except` (the title being handled, which may
+	// already have been rewritten when this runs again for a retry).
 	function countIdNodes(scope, except) {
 		const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
 		let count = 0;
 		for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-			if (node !== except && VIDEO_ID_RE.test(node.nodeValue.trim())) count++;
+			if (node !== except && parsePlaceholderTitle(node.nodeValue)) count++;
 		}
 		return count;
 	}
 
 	// The element that holds exactly one track: a tracklist row, or else (queue, player bar) the nearest
-	// ancestor that has the fixed artist next to this title and no other ID-like text, so that a list
+	// ancestor that has the service's fixed artist next to this title and no other title tag, so that a list
 	// containing several rows is never mistaken for one track.
-	function findTrackScope(owner, titleNode) {
+	function findTrackScope(owner, titleNode, artist) {
 		const row = owner.closest('[data-testid="tracklist-row"], [role="row"]');
-		if (row) return findTextNode(row, PLACEHOLDER_ARTIST) ? row : null;
+		if (row) return findTextNode(row, artist) ? row : null;
 		let scope = owner;
 		for (let depth = 0; depth < 6 && scope; depth++, scope = scope.parentElement) {
-			if (!findTextNode(scope, PLACEHOLDER_ARTIST)) continue;
+			if (!findTextNode(scope, artist)) continue;
 			return countIdNodes(scope, titleNode) === 0 ? scope : null;
 		}
 		return null;
@@ -2496,27 +2576,33 @@
 		return null;
 	}
 
-	// URL of the stored cover at about the size it is shown at (YT Music covers accept a size in the URL).
+	// URL of the stored cover at about the size it is shown at (for the services whose cover URLs take a size).
 	function sizedThumbnail(url, cssSize) {
-		const wanted = Math.min(1200, Math.ceil((cssSize * (window.devicePixelRatio || 1)) / 64) * 64);
-		if (/=w\d+-h\d+/.test(url)) return resizeThumbnail(url, Math.max(226, wanted));
+		const wanted = Math.max(226, Math.min(1200, Math.ceil((cssSize * (window.devicePixelRatio || 1)) / 64) * 64));
+		for (const provider of Object.values(providers)) {
+			const resized = provider.resizeThumbnail?.(url, wanted);
+			if (resized) return resized;
+		}
 		return url;
 	}
 
-	// A plain YouTube thumbnail is a small picture with black bars. For a big cover, swap in the full-size
-	// frame when YouTube has one (it has no bars, so the crop that hides them is dropped as well).
-	function upgradeYoutubeThumbnail(art, img, url) {
-		const match = /^(https:\/\/i\.ytimg\.com\/vi\/[\w-]{11}\/)\w+\.jpg/.exec(url);
-		if (!match) return;
-		const maxres = `${match[1]}maxresdefault.jpg`;
+	// A plain thumbnail can be a small picture with black bars (YouTube's is). For a big cover, swap in the
+	// full-size frame when the service has one (it has no bars, so the crop that hides them is dropped as well).
+	function upgradeLetterboxThumbnail(art, img, url) {
+		let better = null;
+		for (const provider of Object.values(providers)) {
+			better = provider.upgradeThumbnail?.(url) ?? null;
+			if (better) break;
+		}
+		if (!better) return;
 		const probe = new Image();
 		probe.onload = () => {
 			// A missing full-size frame comes back as a tiny placeholder picture.
 			if (probe.naturalWidth < 640 || !art.isConnected) return;
 			art.classList.remove("ss-letterbox");
-			loadImage(img, maxres);
+			loadImage(img, better);
 		};
-		probe.src = maxres;
+		probe.src = better;
 	}
 
 	function placeArt(titleNode, scope, info) {
@@ -2562,7 +2648,7 @@
 			{ class: info.letterbox ? "ss-art ss-letterbox" : "ss-art", style: `left:${left}px;top:${top}px;width:${rect.width}px;height:${rect.height}px` },
 			img
 		);
-		if (info.letterbox && size * (window.devicePixelRatio || 1) > 240) upgradeYoutubeThumbnail(art, img, info.thumbnail);
+		if (info.letterbox && size * (window.devicePixelRatio || 1) > 240) upgradeLetterboxThumbnail(art, img, info.thumbnail);
 		art._titleNode = titleNode;
 		art._slot = slot;
 		art._slotHeight = slotHeight;
@@ -2609,20 +2695,22 @@
 		}
 	}
 
-	// If this text node is a placeholder's title (a video ID next to the fixed artist), swap in the real text.
-	// Only nodeValue is changed, so React keeps owning the node and simply overwrites it when the row is reused.
+	// If this text node is a placeholder's title (a title tag next to the service's fixed artist), swap in the
+	// real text. Only nodeValue is changed, so React keeps owning the node and simply overwrites it when the row
+	// is reused.
 	function rewriteTextNode(node) {
-		const id = node.nodeValue?.trim();
-		if (!id || !VIDEO_ID_RE.test(id)) return;
+		const title = node.nodeValue?.trim();
+		const parsed = title && parsePlaceholderTitle(title);
+		if (!parsed) return;
 		const owner = node.parentElement;
 		if (!owner || isOwnUi(owner)) return;
 
-		const scope = findTrackScope(owner, node);
+		const scope = findTrackScope(owner, node, parsed.provider.artist);
 		if (!scope) return;
-		const artistNode = findTextNode(scope, PLACEHOLDER_ARTIST);
+		const artistNode = findTextNode(scope, parsed.provider.artist);
 		if (!artistNode) return;
 
-		const info = lookupDisplay(id);
+		const info = lookupDisplay(title);
 		if (!info) return;
 		const entry = { title: info.title, art: placeArt(node, scope, info), scope, info };
 		node.nodeValue = info.title;
@@ -2883,20 +2971,19 @@
 		section: null,
 		body: null,
 		tabs: null,
-		tab: "spotify",
+		tab: "spotify", // "spotify", or the id of a service
+		service: Object.keys(providers)[0], // the service tab selected last: its results are shown, and kept ready while the Spotify tab is open
 		host: null,
-		status: "idle",
-		results: [],
-		error: null,
-		// Infinite scroll: the paged search session, a footer element that doubles as the scroll sentinel,
-		// and the observer that fires when the footer comes close to the visible area.
-		session: null,
-		hasMore: false,
-		loadingMore: false,
-		moreError: null,
-		footer: null,
-		observer: null
+		panes: {}, // service id -> that service's results for the current query
+		observer: null // fires when the footer of the shown pane comes close to the visible area
 	};
+
+	// The results of one service for the current query. Besides the rows it holds the paged search session
+	// (infinite scroll) and a footer element that doubles as the scroll sentinel.
+	const newPane = () => ({ status: "idle", results: [], error: null, session: null, hasMore: false, loadingMore: false, moreError: null, footer: null });
+	const paneOf = (id) => (search.panes[id] ??= newPane());
+	// The service whose results the body shows (on the Spotify tab, the one that was selected last).
+	const shownService = () => (search.tab === "spotify" ? search.service : search.tab);
 
 	// The buttons of a result. Without playback enabled a result only offers "open in browser".
 	function actionButtons(track) {
@@ -2953,11 +3040,11 @@
 			search.tabs = h(
 				"div",
 				{ class: "ss-tabs", role: "tablist" },
-				...["spotify", "youtube"].map((id) =>
+				...["spotify", ...Object.keys(providers)].map((id) =>
 					h(
 						"button",
 						{ class: "ss-tab", role: "tab", "data-tab": id, onClick: () => setTab(id) },
-						t(id === "spotify" ? "tabSpotify" : "tabYouTubeMusic")
+						id === "spotify" ? t("tabSpotify") : providers[id].label
 					)
 				)
 			);
@@ -2975,19 +3062,25 @@
 	// Reflect the selected tab on our section and on the Spotify results rendered next to it
 	function applyTab() {
 		if (!search.section) return;
-		const youtube = search.tab === "youtube";
-		search.section.classList.toggle("ss-tab-spotify", !youtube);
+		const native = search.tab === "spotify";
+		search.section.classList.toggle("ss-tab-spotify", native);
 		for (const btn of search.tabs.children) btn.setAttribute("aria-selected", String(btn.dataset.tab === search.tab));
 		const host = search.section.parentElement;
 		if (search.host && search.host !== host) search.host.classList.remove("ss-native-hidden");
 		search.host = host;
-		host?.classList.toggle("ss-native-hidden", youtube);
+		host?.classList.toggle("ss-native-hidden", !native);
 	}
 
 	function setTab(id) {
 		if (search.tab === id) return;
 		search.tab = id;
+		if (id !== "spotify") search.service = id;
 		applyTab();
+		if (id === "spotify") return;
+		// Only the selected service is searched, so the others are not hit on every keystroke: one that has
+		// not been searched for this query yet is searched now.
+		if (search.query && paneOf(id).status === "idle") runSearch(id);
+		else renderSearch();
 	}
 
 	function playbackNotice() {
@@ -3001,17 +3094,17 @@
 
 	// Footer below the result rows: shows the loading state or a retry button, and is the sentinel that
 	// triggers loading the next page when it scrolls into view.
-	function updateFooter() {
-		if (!search.footer) search.footer = h("div", { class: "ss-more" });
-		const { footer } = search;
-		if (search.loadingMore) {
+	function updateFooter(pane) {
+		pane.footer ??= h("div", { class: "ss-more" });
+		const { footer } = pane;
+		if (pane.loadingMore) {
 			footer.replaceChildren(h("div", { class: "ss-status" }, t("loadingMore")));
-		} else if (search.moreError) {
+		} else if (pane.moreError) {
 			footer.replaceChildren(
 				h(
 					"div",
 					{ class: "ss-status" },
-					h("span", {}, `${t("loadMoreFailed")} ${search.moreError}`),
+					h("span", {}, `${t("loadMoreFailed")} ${pane.moreError}`),
 					h("button", { class: "ss-link", onClick: loadMore }, t("retry"))
 				)
 			);
@@ -3020,9 +3113,10 @@
 		}
 	}
 
-	// (Re)start observing the footer. observe() reports the current state right away, so a footer that is
-	// already visible (few rows, tall window) immediately triggers the next page as well.
+	// (Re)start observing the footer of the shown pane. observe() reports the current state right away, so a
+	// footer that is already visible (few rows, tall window) immediately triggers the next page as well.
 	function armObserver() {
+		const pane = paneOf(shownService());
 		if (!search.observer) {
 			// rootMargin starts loading before the user actually reaches the bottom.
 			search.observer = new IntersectionObserver(
@@ -3033,58 +3127,65 @@
 			);
 		}
 		search.observer.disconnect();
-		if (search.footer && search.hasMore && !search.moreError) search.observer.observe(search.footer);
+		if (pane.footer && pane.hasMore && !pane.moreError) search.observer.observe(pane.footer);
 	}
 
 	async function loadMore() {
-		const { session } = search;
-		if (!session || search.loadingMore || !search.hasMore || search.status !== "done") return;
+		const id = shownService();
+		const pane = paneOf(id);
+		const { session } = pane;
+		if (!session || pane.loadingMore || !pane.hasMore || pane.status !== "done") return;
 		const token = search.token;
-		search.loadingMore = true;
-		search.moreError = null;
-		updateFooter();
+		pane.loadingMore = true;
+		pane.moreError = null;
+		updateFooter(pane);
 		try {
 			const more = await session.take(config.resultLimit);
 			if (token !== search.token) return;
-			search.results.push(...more);
-			search.footer.before(...more.map(trackRow));
-			// An empty page means nothing new is left, even if YouTube still offers a continuation.
-			search.hasMore = more.length > 0 && session.hasMore;
+			pane.results.push(...more);
+			pane.footer.before(...more.map(trackRow));
+			// An empty page means nothing new is left, even if the service still offers a continuation.
+			pane.hasMore = more.length > 0 && session.hasMore;
 		} catch (error) {
 			if (token !== search.token) return;
 			console.error("[Synthesis Spicetify] loading more results failed", error);
-			search.moreError = error?.message || String(error);
+			pane.moreError = error?.message || String(error);
 		} finally {
 			// A newer search resets these fields itself, so a stale call must not touch them.
 			if (token === search.token) {
-				search.loadingMore = false;
-				updateFooter();
-				armObserver();
+				pane.loadingMore = false;
+				updateFooter(pane);
+				if (id === shownService()) armObserver();
 			}
 		}
 	}
 
 	function renderSearch() {
 		if (!search.body) return;
-		const { status } = search;
+		const id = shownService();
+		const pane = paneOf(id);
+		const { status } = pane;
+		const label = providers[id].label;
 		if (status !== "done") search.observer?.disconnect();
-		if (status === "loading") {
-			search.body.replaceChildren(h("div", { class: "ss-status" }, t("searching")));
+		if (status === "idle") {
+			search.body.replaceChildren();
+		} else if (status === "loading") {
+			search.body.replaceChildren(h("div", { class: "ss-status" }, t("searching", label)));
 		} else if (status === "error") {
 			search.body.replaceChildren(
 				h(
 					"div",
 					{ class: "ss-status" },
-					h("span", {}, `${t("failed")} ${search.error || ""}`),
-					h("button", { class: "ss-link", onClick: () => runSearch(search.query) }, t("retry")),
+					h("span", {}, `${t("failed", label)} ${pane.error || ""}`),
+					h("button", { class: "ss-link", onClick: () => runSearch(id) }, t("retry")),
 					h("button", { class: "ss-link", onClick: openSettings }, t("openSettings"))
 				)
 			);
-		} else if (status === "done" && !search.results.length) {
-			search.body.replaceChildren(h("div", { class: "ss-status" }, t("noResults")));
+		} else if (status === "done" && !pane.results.length) {
+			search.body.replaceChildren(h("div", { class: "ss-status" }, t("noResults", label)));
 		} else if (status === "done") {
-			updateFooter();
-			search.body.replaceChildren(...(config.playbackEnabled ? [] : [playbackNotice()]), ...search.results.map((track, i) => (i === 0 ? topResultRow(track) : trackRow(track))), search.footer);
+			updateFooter(pane);
+			search.body.replaceChildren(...(config.playbackEnabled ? [] : [playbackNotice()]), ...pane.results.map((track, i) => (i === 0 ? topResultRow(track) : trackRow(track))), pane.footer);
 			armObserver();
 		}
 	}
@@ -3107,33 +3208,38 @@
 		search.section?.remove();
 	}
 
-	async function runSearch(query) {
-		const token = ++search.token;
+	// A new query: the results of every service are dropped, and the shown service is searched.
+	function startQuery(query) {
+		search.token++;
 		search.query = query;
-		search.status = "loading";
-		search.session = null;
-		search.hasMore = false;
-		search.loadingMore = false;
-		search.moreError = null;
+		search.panes = {};
 		ensureSection();
-		renderSearch();
+		runSearch(shownService());
+	}
+
+	// Searches one service for the current query and shows the outcome if that service is the shown one.
+	async function runSearch(id) {
+		const { token, query } = search;
+		const pane = paneOf(id);
+		Object.assign(pane, newPane(), { status: "loading" });
+		if (id === shownService()) renderSearch();
 		attachSection();
 
 		try {
-			const session = providers.youtube.createSearch(query);
+			const session = providers[id].createSearch(query);
 			const results = await session.take(config.resultLimit);
 			if (token !== search.token) return;
-			search.session = session;
-			search.results = results;
-			search.hasMore = session.hasMore;
-			search.status = "done";
+			pane.session = session;
+			pane.results = results;
+			pane.hasMore = session.hasMore;
+			pane.status = "done";
 		} catch (error) {
 			if (token !== search.token) return;
 			console.error("[Synthesis Spicetify] search failed", error);
-			search.error = error?.message || String(error);
-			search.status = "error";
+			pane.error = error?.message || String(error);
+			pane.status = "error";
 		}
-		renderSearch();
+		if (id === shownService()) renderSearch();
 		attachSection();
 	}
 
@@ -3158,12 +3264,12 @@
 			detachSection();
 			return;
 		}
-		if (query === search.query && search.status !== "error") {
+		if (query === search.query && paneOf(shownService()).status !== "error") {
 			attachSection();
 			return;
 		}
-		// Spotify updates the route while typing, so debounce before hitting YouTube.
-		search.timer = setTimeout(() => runSearch(query), SEARCH_DEBOUNCE_MS);
+		// Spotify updates the route while typing, so debounce before hitting the service.
+		search.timer = setTimeout(() => startQuery(query), SEARCH_DEBOUNCE_MS);
 	}
 
 	Spicetify.Platform.History.listen(onRoute);
@@ -3209,6 +3315,15 @@
 			return;
 		}
 
+		const checked = Object.values(providers).filter((provider) => provider.diagnose);
+		for (const provider of checked) {
+			if (checked.length > 1) log(`--- ${provider.label} ---`);
+			await provider.diagnose(log, step);
+		}
+	}
+
+	// The YouTube steps of the connection test: session and search, every client's player response, a download.
+	async function youtubeDiagnose(log, step) {
 		let tracks = [];
 		if (!(await step("youtubei.js session + YouTube Music search", async () => {
 			tracks = await youtubeSearch("daft punk one more time", 3);
@@ -3546,7 +3661,11 @@
 
 	// Warm up the heavy libraries while the app is idle so the first search feels fast.
 	(window.requestIdleCallback || ((fn) => setTimeout(fn, 4000)))(() => {
-		getInnertube().catch((error) => console.warn("[Synthesis Spicetify] warm-up failed", error));
+		for (const provider of Object.values(providers)) {
+			Promise.resolve()
+				.then(() => provider.warmUp?.())
+				.catch((error) => console.warn(`[Synthesis Spicetify] ${provider.label} warm-up failed`, error));
+		}
 	});
 
 	window.SynthesisSpicetify = { version: VERSION, state, get config() { return config; }, providers, runDiagnostics };
