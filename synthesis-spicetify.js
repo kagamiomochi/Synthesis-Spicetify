@@ -171,8 +171,8 @@
 			settingsTitle: "Synthesis Spicetify 設定",
 			wispLabel: "公開 Wisp プロキシ (1行に1つ、上から順に試行)",
 			clientsLabel: "InnerTube クライアント (visionos / tv_samsung、カンマ区切り、上から順に試行)",
-			save: "保存",
-			saved: "設定を保存しました",
+			clientsInvalid: (names) => `不明なクライアントです: ${names}`,
+			wispInvalid: (urls) => `Wisp の URL は ws:// か wss:// で始めてください: ${urls}`,
 			test: "接続テスト",
 			clearCache: "音声キャッシュを削除",
 			cacheCleared: "音声キャッシュを削除しました",
@@ -247,8 +247,8 @@
 			settingsTitle: "Synthesis Spicetify settings",
 			wispLabel: "Public Wisp proxies (one per line, tried in order)",
 			clientsLabel: "InnerTube clients (visionos / tv_samsung, comma separated, tried in order)",
-			save: "Save",
-			saved: "Settings saved",
+			clientsInvalid: (names) => `Unknown client: ${names}`,
+			wispInvalid: (urls) => `A Wisp URL must start with ws:// or wss://: ${urls}`,
 			test: "Connection test",
 			clearCache: "Clear audio cache",
 			cacheCleared: "Audio cache cleared",
@@ -401,7 +401,8 @@
 	// Network layer: libcurl.js (fetch replacement that is not bound by CORS)
 	// ---------------------------------------------------------------------
 
-	let curlPromise = null;
+	let curlEntry = null; // the load of the current network generation: { generation, promise, session, url }
+	let curlGeneration = 0; // bumped by resetNetwork(); a load that finds it changed is stale and drops its result
 	let activeWisp = "";
 	let lastPlayerUserAgent = null;
 	const isLocalWisp = () => LOCAL_WISP_RE.test(activeWisp);
@@ -429,51 +430,108 @@
 		return [config.localWisp, ...config.wispServers.filter((url) => url !== config.localWisp)];
 	}
 
-	// Returns { url, session }. Every Wisp gets its own HTTPSession: libcurl.js keeps a connection cache per
-	// session, so reusing the default session after switching the Wisp URL would keep sending requests to
-	// youtube.com over the old (public) Wisp, which YouTube answers with LOGIN_REQUIRED.
-	async function pickWispServer(libcurl) {
-		const failures = [];
-		for (const url of activeWispServers()) {
-			libcurl.set_websocket(url);
-			const session = new libcurl.HTTPSession();
+	class StaleNetworkError extends Error {}
+
+	const closeQuietly = (session) => {
+		try {
+			session?.close();
+		} catch {
+			// ignore
+		}
+	};
+
+	// libcurl.js keeps its Wisp sockets in one table keyed by the Wisp URL (always with a trailing slash).
+	const wispKey = (url) => (url.endsWith("/") ? url : `${url}/`);
+
+	// Closes the sockets of every Wisp except `keepUrl`, or only those of `onlyUrl`.
+	function closeWispConnections(libcurl, { keepUrl = null, onlyUrl = null } = {}) {
+		for (const [key, connection] of Object.entries(libcurl.wisp?.wisp_connections ?? {})) {
+			if (keepUrl && key === wispKey(keepUrl)) continue;
+			if (onlyUrl && key !== wispKey(onlyUrl)) continue;
 			try {
-				const res = await withTimeout(session.fetch("https://www.gstatic.com/generate_204"), 10000, `Wisp ${url}`);
-				if (res.status === 204 || res.ok) return { url, session };
-				failures.push(`${url}: HTTP ${res.status}`);
-			} catch (error) {
-				failures.push(`${url}: ${error?.message || error}`);
-			}
-			try {
-				session.close();
+				connection.ws?.close();
 			} catch {
 				// ignore
 			}
 		}
+	}
+
+	// Returns { url, session }. Every Wisp gets its own HTTPSession: libcurl.js keeps a connection cache per
+	// session, so reusing the default session after switching the Wisp URL would keep sending requests to
+	// youtube.com over the old (public) Wisp, which YouTube answers with LOGIN_REQUIRED.
+	// Throws StaleNetworkError as soon as resetNetwork() has started a newer generation: libcurl.js is one shared
+	// module, so an outdated load must not touch its global Wisp URL or session any more.
+	async function pickWispServer(libcurl, generation) {
+		const failures = [];
+		for (const url of activeWispServers()) {
+			if (generation !== curlGeneration) throw new StaleNetworkError();
+			libcurl.set_websocket(url);
+			const session = new libcurl.HTTPSession();
+			try {
+				const res = await withTimeout(session.fetch("https://www.gstatic.com/generate_204"), 10000, `Wisp ${url}`);
+				if (generation !== curlGeneration) {
+					closeQuietly(session);
+					throw new StaleNetworkError();
+				}
+				if (res.status === 204 || res.ok) return { url, session };
+				failures.push(`${url}: HTTP ${res.status}`);
+			} catch (error) {
+				if (error instanceof StaleNetworkError) throw error;
+				failures.push(`${url}: ${error?.message || error}`);
+			}
+			closeQuietly(session);
+		}
 		throw new Error(`No usable Wisp server. ${failures.join(" / ")}`);
 	}
 
-	function loadCurl() {
-		curlPromise ??= (async () => {
+	function startCurl() {
+		const generation = curlGeneration;
+		const entry = { generation, promise: null, session: null, url: "" };
+		entry.promise = (async () => {
 			const mod = await import(LIBCURL_URL);
 			const libcurl = mod.libcurl;
 			// The "full" build embeds the WASM binary, so no URL is needed here.
 			await libcurl.load_wasm();
-			const picked = await pickWispServer(libcurl);
+			if (generation !== curlGeneration) throw new StaleNetworkError();
+			const picked = await pickWispServer(libcurl, generation);
+			if (generation !== curlGeneration) {
+				closeQuietly(picked.session);
+				throw new StaleNetworkError();
+			}
+			entry.session = picked.session;
+			entry.url = picked.url;
 			libcurl.activeWisp = picked.url;
 			libcurl.session = picked.session;
 			activeWisp = picked.url;
+			libcurl.set_websocket(picked.url);
+			// Sockets of an earlier Wisp (or of a probe that was cancelled) would keep going out through it.
+			closeWispConnections(libcurl, { keepUrl: picked.url });
 			return libcurl;
-		})().catch((error) => {
-			curlPromise = null;
-			throw error;
-		});
-		return curlPromise;
+		})();
+		return entry;
+	}
+
+	async function loadCurl() {
+		for (;;) {
+			const generation = curlGeneration;
+			if (!curlEntry || curlEntry.generation !== generation) curlEntry = startCurl();
+			const entry = curlEntry;
+			try {
+				return await entry.promise;
+			} catch (error) {
+				if (curlEntry === entry) curlEntry = null; // a failed load is tried again by the next call
+				// resetNetwork() ran while this load was working: its result was dropped, so ask again with the new settings.
+				if (generation !== curlGeneration) continue;
+				throw error;
+			}
+		}
 	}
 
 	// Drop-in replacement for fetch(), also handed to youtubei.js.
 	async function curlFetch(input, init = {}) {
 		const libcurl = await loadCurl();
+		// libcurl.js reads the Wisp URL when a socket is opened, not when a session is created, so make sure it is ours.
+		if (libcurl.activeWisp && libcurl.websocket_url !== libcurl.activeWisp) libcurl.set_websocket(libcurl.activeWisp);
 		const isRequest = typeof Request !== "undefined" && input instanceof Request;
 		const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 		const headers = new Headers(init.headers || (isRequest ? input.headers : undefined));
@@ -1754,27 +1812,22 @@
 	}
 
 	function resetNetwork() {
-		// Reset the lazily created singletons so new Wisp settings take effect.
-		const old = curlPromise;
-		curlPromise = null;
+		// A new generation: loads that are still running notice it and drop their result (see pickWispServer).
+		curlGeneration++;
+		const old = curlEntry;
+		curlEntry = null;
 		activeWisp = "";
 		for (const provider of Object.values(providers)) provider.reset?.();
-		// Close the old session and its Wisp sockets, otherwise pooled connections keep going out through the
-		// previous Wisp (the public one while playback was off).
-		old?.then((libcurl) => {
-			try {
-				libcurl.session?.close();
-			} catch {
-				// ignore
-			}
-			for (const connection of Object.values(libcurl.wisp?.wisp_connections ?? {})) {
-				try {
-					connection.ws?.close();
-				} catch {
-					// ignore
-				}
-			}
-		}).catch(() => {});
+		// Close the old session and its Wisp socket, otherwise pooled connections keep going out through the previous
+		// Wisp (the public one while playback was off), and a local Wisp would never become idle.
+		old?.promise
+			.then((libcurl) => {
+				closeQuietly(old.session);
+				// Not when the new settings still try this very Wisp: its socket is shared and may be in use already.
+				const wanted = activeWispServers().some((url) => wispKey(url) === wispKey(old.url));
+				if (!wanted) closeWispConnections(libcurl, { onlyUrl: old.url });
+			})
+			.catch(() => {});
 	}
 
 	// ---------------------------------------------------------------------
@@ -4341,19 +4394,39 @@
 			output.textContent += `${line}\n`;
 			output.scrollTop = output.scrollHeight;
 		};
-		const collect = () => {
-			const wispList = wisp.value.split("\n").map((s) => s.trim()).filter(Boolean);
-			const clientList = clients.value.split(",").map((s) => s.trim()).filter(Boolean);
-			// An empty list would leave no usable Wisp server / client, so fall back to the defaults.
-			return {
-				wispServers: wispList.length ? wispList : DEFAULT_CONFIG.wispServers,
-				clients: clientList.length ? clientList : DEFAULT_CONFIG.clients,
-			};
+		const parseList = (text, separator) => text.split(separator).map((item) => item.trim()).filter(Boolean);
+		const sameList = (a, b) => a.length === b.length && a.every((item, i) => item === b[i]);
+		// Settings apply as soon as they are edited. A field that is empty or invalid is left alone (the saved value
+		// stays in effect) and is put back to the saved value when the field loses focus.
+		let commitTimer = null;
+		function commit(final = false) {
+			clearTimeout(commitTimer);
+			const wispList = parseList(wisp.value, "\n");
+			const clientList = parseList(clients.value, ",");
+			const unknown = clientList.filter((name) => !CLIENT_DEFS[name]);
+			const badWisp = wispList.filter((url) => !/^wss?:\/\/\S+$/.test(url));
+			const patch = {};
+			if (wispList.length && !badWisp.length && !sameList(wispList, config.wispServers)) patch.wispServers = wispList;
+			if (clientList.length && !unknown.length && !sameList(clientList, config.clients)) patch.clients = clientList;
+			if (final) {
+				if (unknown.length) notify(t("clientsInvalid", unknown.join(", ")), true);
+				if (badWisp.length) notify(t("wispInvalid", badWisp.join(", ")), true);
+				if (!wispList.length || badWisp.length) wisp.value = config.wispServers.join("\n");
+				if (!clientList.length || unknown.length) clients.value = config.clients.join(", ");
+			}
+			if (!Object.keys(patch).length) return;
+			saveConfig(patch);
+			// Only the Wisp list changes the connection; the client list is read on every player request.
+			if (patch.wispServers) resetNetwork();
+		}
+		const scheduleCommit = () => {
+			clearTimeout(commitTimer);
+			commitTimer = setTimeout(commit, 600);
 		};
-		const apply = () => {
-			saveConfig(collect());
-			resetNetwork();
-		};
+		for (const field of [wisp, clients]) {
+			field.addEventListener("input", scheduleCommit);
+			field.addEventListener("change", () => commit(true));
+		}
 
 		const playbackSection = createPlaybackSection();
 		const resetButton = createConfirmButton(t("resetSettings"), t("resetConfirm"), () => {
@@ -4386,19 +4459,8 @@
 					"button",
 					{
 						class: "ss-primary",
-						onClick: () => {
-							apply();
-							notify(t("saved"));
-						},
-					},
-					t("save")
-				),
-				h(
-					"button",
-					{
-						class: "ss-secondary",
 						onClick: async () => {
-							apply();
+							commit(true); // test what is typed in right now
 							output.textContent = "";
 							await runDiagnostics(log);
 						},
