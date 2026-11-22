@@ -86,7 +86,7 @@
 	};
 
 	const CONFIG_VERSION = 6;
-	const LOCAL_WISP_RE = /^wss?:\/\/(localhost|127\.0\.0\.1|\[::1\])/;
+	const LOCAL_WISP_RE = /^wss?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:[/?#]|$)/;
 
 	function loadConfig() {
 		try {
@@ -544,27 +544,29 @@
 	const imageCache = new Map();
 
 	function loadImage(img, url) {
-		if (!url) return;
+		img.dataset.wanted = url || "";
+		if (!url) {
+			// No cover: do not keep showing the previous track's picture in a reused <img>.
+			img.removeAttribute("src");
+			return;
+		}
 		if (imageCache.has(url)) {
 			img.src = imageCache.get(url);
 			return;
 		}
-		img.addEventListener(
-			"error",
-			async () => {
-				if (img.dataset.fallback) return;
-				img.dataset.fallback = "1";
-				try {
-					const res = await curlFetch(url);
-					const blobUrl = URL.createObjectURL(await res.blob());
-					imageCache.set(url, blobUrl);
-					img.src = blobUrl;
-				} catch {
-					// leave the placeholder
-				}
-			},
-			{ once: true }
-		);
+		// Assigned (not added) so that a reused <img> only ever has the handler of the URL it loads right now.
+		img.onerror = async () => {
+			if (img.dataset.fallback === url) return;
+			img.dataset.fallback = url;
+			try {
+				const res = await curlFetch(url);
+				const blobUrl = URL.createObjectURL(await res.blob());
+				imageCache.set(url, blobUrl);
+				if (img.dataset.wanted === url) img.src = blobUrl; // the <img> may have moved on to another cover
+			} catch {
+				// leave the placeholder
+			}
+		};
 		img.src = url;
 	}
 
@@ -2310,7 +2312,8 @@
 	async function playTrack(track) {
 		const token = ++playToken;
 		const previous = state.current;
-		if (previous && state.status === "loading") abortLoad(previous);
+		// A download that is still running (also while it is streamed) is dropped when another track takes over.
+		if (previous && (state.status === "loading" || trackKey(previous) !== trackKey(track))) abortLoad(previous);
 
 		detachStream();
 		audio.pause();
@@ -4230,7 +4233,7 @@
 					"button",
 					{
 						class: "ss-secondary",
-						onClick: () => window.open("https://github.com/kagamiomochi/Synthesis-Spicetify#setting-up-the-local-wisp-server", "_blank", "noopener,noreferrer"),
+						onClick: () => window.open("https://github.com/kagamiomochi/Synthesis-Spicetify#enabling-playback", "_blank", "noopener,noreferrer"),
 					},
 					t("guideReadme")
 				)
