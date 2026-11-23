@@ -1383,7 +1383,7 @@
 				onStart?.(mime);
 			}
 			parts.push(bytes);
-			out?.pieces.push(bytes);
+			out?.pieces?.push(bytes);
 			onChunk?.(bytes);
 			onProgress?.((i + 1) / urls.length);
 		}
@@ -1393,8 +1393,9 @@
 
 	// ---- AAC without an AAC decoder in the player ----
 	// The Chromium inside Spotify has no AAC decoder and SoundCloud offers AAC only. So the fragmented MP4 is taken
-	// apart here, the AAC frames are decoded by FAAD2 (WebAssembly, loaded from the CDN like libcurl.js) and the
-	// PCM is played as a WAV file. That needs the whole track first; the decoding takes a few seconds.
+	// apart here and the AAC frames are decoded by FAAD2 (WebAssembly, loaded from the CDN like libcurl.js) while
+	// the pieces download. The PCM is played through Web Audio as it comes (see createPcmEngine) and is also
+	// collected into a WAV file for the cache.
 
 	const FAAD2_SAMPLE_RATES = { 1: 8000, 2: 16000, 3: 22050, 4: 32000, 5: 44100, 6: 48000, 7: 64000, 8: 88200, 9: 96000 };
 	const FAAD2_INPUT_CAPACITY = 1 << 15;
@@ -1567,14 +1568,58 @@
 		return view.buffer;
 	}
 
-	// Decodes the AAC of an fMP4 (init segment + media segments) to a 16 bit WAV Blob.
-	async function soundcloudDecodeAac(init, pieces, { signal, onProgress } = {}) {
-		const { asc, defaultSize } = readAacInit(init);
-		const frames = pieces.flatMap((piece) => readAacFragment(piece, defaultSize));
-		if (!frames.length) throw new Error("no AAC frames found");
+	// The mime type that a download reports (onStart) when it hands decoded audio on. Its chunks are then
+	// { pcm: Int16Array (interleaved), sampleRate, channels } blocks instead of bytes (see createPcmEngine).
+	const PCM_STREAM_MIME = "audio/x-synthesis-pcm";
+	const AAC_BLOCK_SECONDS = 1; // how much decoded audio is handed to the player at a time
+	const AAC_YIELD_FRAMES = 256; // AAC frames decoded between two yields to the UI
+
+	// A queue: the downloader pushes the pieces in, the decoder pulls them out.
+	function createPieceQueue() {
+		const items = [];
+		let waiting = null; // { resolve, reject } of a next() that has to wait
+		let closed = false;
+		let failure = null;
+		const settle = (method, value) => {
+			const pending = waiting;
+			waiting = null;
+			pending?.[method](value);
+		};
+		return {
+			push(item) {
+				if (waiting) settle("resolve", item);
+				else items.push(item);
+			},
+			close() {
+				closed = true;
+				settle("resolve", null);
+			},
+			fail(error) {
+				failure = error;
+				settle("reject", error);
+			},
+			next() {
+				if (failure) return Promise.reject(failure);
+				if (items.length) return Promise.resolve(items.shift());
+				if (closed) return Promise.resolve(null);
+				return new Promise((resolve, reject) => {
+					waiting = { resolve, reject };
+				});
+			},
+		};
+	}
+
+	// Decodes an fMP4 AAC stream piece by piece. `pieces.next()` resolves with the init segment first, then with the
+	// media segments, and with null at the end. `onBlock({ pcm, sampleRate, channels })` gets about a second of 16 bit
+	// interleaved PCM at a time. Resolves with all the blocks (for a WAV file) and the format.
+	async function soundcloudDecodeAacStream(pieces, { signal, onBlock, hasInit = () => true } = {}) {
 		const faad = await loadFaad2();
 		return withSoundcloudDecodeLock(async () => {
 			const began = performance.now();
+			const init = await pieces.next();
+			if (!init) throw new Error("empty HLS playlist");
+			if (!hasInit()) throw new Error("AAC without an init segment (ADTS) is not supported");
+			const { asc, defaultSize } = readAacInit(init);
 			const inPtr = faad._malloc(FAAD2_INPUT_CAPACITY + 64);
 			const outPtr = faad._malloc(FAAD2_OUTPUT_BYTES);
 			try {
@@ -1584,50 +1629,69 @@
 				faad._free(ascPtr);
 				if (result < 0) throw new Error(`FAAD2 could not start the decoder (${result}), ASC ${Array.from(asc, (b) => b.toString(16)).join(" ")}`);
 
-				const parts = [];
+				const blocks = [];
+				let work = null; // the block that is being filled
+				let capacity = 0; // samples (all channels) at which a block is handed on
+				let filled = 0;
 				let sampleRate = 0;
 				let channels = 0;
 				let dataBytes = 0;
+				let frameCount = 0;
 				let skipped = 0;
-				for (let i = 0; i < frames.length; i++) {
-					if (i % 256 === 0) {
-						await new Promise((resolve) => setTimeout(resolve)); // keep the UI alive
-						throwIfAborted(signal);
-						onProgress?.(i / frames.length);
+				const flush = () => {
+					if (!filled) return;
+					const block = { pcm: work.slice(0, filled), sampleRate, channels };
+					filled = 0;
+					dataBytes += block.pcm.byteLength;
+					if (!blocks.length) debug("soundcloud", `FAAD2: first block after ${Math.round(performance.now() - began)} ms`);
+					blocks.push(block);
+					onBlock?.(block);
+				};
+
+				for (let piece = await pieces.next(); piece; piece = await pieces.next()) {
+					throwIfAborted(signal);
+					const frames = readAacFragment(piece, defaultSize);
+					for (let i = 0; i < frames.length; i++) {
+						if (i % AAC_YIELD_FRAMES === 0) {
+							await new Promise((resolve) => setTimeout(resolve)); // keep the UI alive
+							throwIfAborted(signal);
+						}
+						frameCount++;
+						const frame = frames[i];
+						if (frame.length > FAAD2_INPUT_CAPACITY) throw new Error(`AAC frame of ${frame.length} bytes is too large`);
+						faad.HEAPU8.set(frame, inPtr);
+						faad.HEAPU8.fill(0, inPtr + frame.length, inPtr + frame.length + 64);
+						const packed = faad._decode_frame(inPtr, frame.length, outPtr, FAAD2_OUTPUT_BYTES);
+						if (packed === 0 || (packed < 0 && packed > -1000)) {
+							skipped++; // no output (decoder start-up) or a broken frame
+							continue;
+						}
+						const rate = FAAD2_SAMPLE_RATES[(packed >>> 28) & 0xf];
+						const count = packed & 0xffffff;
+						const frameChannels = (packed >>> 24) & 0xf;
+						if (!rate || !frameChannels || !count) {
+							skipped++;
+							continue;
+						}
+						if (!sampleRate) {
+							sampleRate = rate;
+							channels = frameChannels;
+							capacity = Math.ceil(sampleRate * AAC_BLOCK_SECONDS) * channels;
+							work = new Int16Array(capacity + FAAD2_OUTPUT_BYTES / 4); // room for the frame that crosses the limit
+						} else if (rate !== sampleRate || frameChannels !== channels) {
+							throw new Error("the AAC stream changes its format");
+						}
+						const raw = new Float32Array(faad.HEAPU8.buffer, outPtr, count);
+						for (let k = 0; k < count; k++) work[filled + k] = Math.round(Math.max(-1, Math.min(1, raw[k])) * 32767);
+						filled += count;
+						if (filled >= capacity) flush();
 					}
-					const frame = frames[i];
-					if (frame.length > FAAD2_INPUT_CAPACITY) throw new Error(`AAC frame of ${frame.length} bytes is too large`);
-					faad.HEAPU8.set(frame, inPtr);
-					faad.HEAPU8.fill(0, inPtr + frame.length, inPtr + frame.length + 64);
-					const packed = faad._decode_frame(inPtr, frame.length, outPtr, FAAD2_OUTPUT_BYTES);
-					if (packed === 0 || (packed < 0 && packed > -1000)) {
-						skipped++; // no output (decoder start-up) or a broken frame
-						continue;
-					}
-					const rate = FAAD2_SAMPLE_RATES[(packed >>> 28) & 0xf];
-					const count = packed & 0xffffff;
-					const frameChannels = (packed >>> 24) & 0xf;
-					if (!rate || !frameChannels || !count) {
-						skipped++;
-						continue;
-					}
-					if (!sampleRate) {
-						sampleRate = rate;
-						channels = frameChannels;
-					} else if (rate !== sampleRate || frameChannels !== channels) {
-						throw new Error("the AAC stream changes its format");
-					}
-					const raw = new Float32Array(faad.HEAPU8.buffer, outPtr, count);
-					const pcm = new Int16Array(count);
-					for (let k = 0; k < count; k++) pcm[k] = Math.round(Math.max(-1, Math.min(1, raw[k])) * 32767);
-					parts.push(pcm);
-					dataBytes += pcm.byteLength;
 				}
+				flush();
 				throwIfAborted(signal);
-				if (!parts.length) throw new Error("FAAD2 decoded no audio");
-				onProgress?.(1);
-				debug("soundcloud", `FAAD2: ${frames.length} frames (${skipped} without output) -> ${dataBytes} bytes of PCM, ${sampleRate} Hz, ${channels} ch, ${Math.round(performance.now() - began)} ms`);
-				return { blob: new Blob([wavHeader(dataBytes, sampleRate, channels), ...parts], { type: "audio/wav" }), sampleRate, channels, frames: frames.length };
+				if (!blocks.length) throw new Error("FAAD2 decoded no audio");
+				debug("soundcloud", `FAAD2: ${frameCount} frames (${skipped} without output) -> ${dataBytes} bytes of PCM, ${sampleRate} Hz, ${channels} ch, ${Math.round(performance.now() - began)} ms`);
+				return { blocks, sampleRate, channels, dataBytes, frames: frameCount };
 			} finally {
 				faad._free(inPtr);
 				faad._free(outPtr);
@@ -1635,16 +1699,62 @@
 		});
 	}
 
-	// HLS AAC: download everything, decode it and hand the WAV on.
-	async function soundcloudDownloadAacDecoded(url, codec, { signal, onProgress, onStart } = {}) {
-		const out = { pieces: [], hasInit: false };
-		await soundcloudDownloadHls(url, codec, { signal, onProgress: (p) => onProgress?.(p * 0.6), out });
-		if (!out.hasInit) throw new Error("AAC without an init segment (ADTS) is not supported");
-		const [init, ...pieces] = out.pieces;
-		const decoded = await soundcloudDecodeAac(init, pieces, { signal, onProgress: (p) => onProgress?.(0.6 + p * 0.4) });
-		// A WAV cannot be fed to MSE, so the player waits for the finished download instead.
-		onStart?.("audio/wav");
-		return decoded.blob;
+	function wavBlob({ blocks, dataBytes, sampleRate, channels }) {
+		return new Blob([wavHeader(dataBytes, sampleRate, channels), ...blocks.map((block) => block.pcm)], { type: "audio/wav" });
+	}
+
+	// Decodes an fMP4 AAC track that is already in memory (init segment + media segments) to a 16 bit WAV Blob.
+	async function soundcloudDecodeAac(init, pieces, { signal } = {}) {
+		const queue = createPieceQueue();
+		for (const piece of [init, ...pieces]) queue.push(piece);
+		queue.close();
+		const decoded = await soundcloudDecodeAacStream(queue, { signal });
+		return { blob: wavBlob(decoded), sampleRate: decoded.sampleRate, channels: decoded.channels, frames: decoded.frames };
+	}
+
+	// HLS AAC: the pieces are decoded while they download, and the decoded audio is handed on as it comes: onStart
+	// with PCM_STREAM_MIME before the first block, then onChunk for every block. The finished WAV is the return
+	// value, for the cache.
+	async function soundcloudDownloadAacStreamed(url, codec, { signal, onProgress, onStart, onChunk } = {}) {
+		const queue = createPieceQueue();
+		const out = { hasInit: false };
+		// The decoder can fail before the download is done: this stops the download then.
+		const inner = new AbortController();
+		const abortInner = () => inner.abort();
+		signal?.addEventListener("abort", abortInner, { once: true });
+		if (signal?.aborted) inner.abort();
+
+		// A failed download reaches the decoder through the queue, so this promise never rejects.
+		const download = soundcloudDownloadHls(url, codec, {
+			signal: inner.signal,
+			out,
+			onProgress: (p) => onProgress?.(p * 0.95),
+			onChunk: (bytes) => queue.push(bytes),
+		}).then(
+			() => queue.close(),
+			(error) => queue.fail(error)
+		);
+
+		let started = false;
+		try {
+			const decoded = await soundcloudDecodeAacStream(queue, {
+				signal,
+				hasInit: () => out.hasInit,
+				onBlock: (block) => {
+					if (!started) {
+						started = true;
+						onStart?.(PCM_STREAM_MIME);
+					}
+					onChunk?.(block);
+				},
+			});
+			await download;
+			onProgress?.(1);
+			return wavBlob(decoded);
+		} finally {
+			signal?.removeEventListener("abort", abortInner);
+			inner.abort(); // nothing is left to stop once the download has finished
+		}
 	}
 
 	async function soundcloudFetchAudio(track, { signal, onProgress, onStart, onChunk } = {}) {
@@ -1671,7 +1781,7 @@
 				const data = await soundcloudCall(candidate.url, query, signal);
 				if (!data?.url) throw new Error("no stream URL in the response");
 				debug("soundcloud", `${label}: stream URL ${soundcloudShortUrl(data.url)}`);
-				const download = soundcloudNeedsDecoding(candidate) ? soundcloudDownloadAacDecoded : candidate.protocol === "hls" ? soundcloudDownloadHls : soundcloudDownloadFile;
+				const download = soundcloudNeedsDecoding(candidate) ? soundcloudDownloadAacStreamed : candidate.protocol === "hls" ? soundcloudDownloadHls : soundcloudDownloadFile;
 				const blob = await download(data.url, candidate.codec, {
 					signal,
 					onProgress,
@@ -1791,6 +1901,7 @@
 			search: soundcloudSearch,
 			createSearch: createSoundcloudSearch,
 			fetchAudio: soundcloudFetchAudio,
+			// Reports bytes, or decoded PCM blocks for AAC (see PCM_STREAM_MIME).
 			streamable: true,
 			openUrl: soundcloudOpenUrl,
 			fetchDisplay: soundcloudFetchDisplay,
@@ -1842,6 +1953,10 @@
 
 	const audio = new Audio();
 	audio.preload = "auto";
+
+	// What the playback logic talks to: the audio element, or the Web Audio engine while a decoded stream is played
+	// (see createPcmEngine). Both offer currentTime, paused, ended, duration, buffered, volume, muted, play() and pause().
+	let player = audio;
 
 	const state = {
 		current: null, // active non-Spotify track
@@ -2155,6 +2270,387 @@
 		};
 	}
 
+	// ---------------------------------------------------------------------
+	// Decoded PCM playback (Web Audio)
+	// ---------------------------------------------------------------------
+
+	// A SoundCloud track that is only offered as AAC is decoded in this page while it downloads (see
+	// soundcloudDownloadAacStreamed). Decoded audio cannot go through MediaSource, so it is scheduled on a Web Audio
+	// graph instead. The engine offers the parts of an audio element that the playback logic uses, so that it can take
+	// the element's place (`player`): Spotify stays the master clock and the engine follows it like the element does.
+
+	const PCM_LOOKAHEAD_SEC = 8; // how far ahead of the playhead decoded audio is handed to the audio graph
+	const PCM_TICK_MS = 200;
+	const PCM_START_DELAY_SEC = 0.03; // from "start" to the first sample, so that nothing is scheduled in the past
+	const PCM_RESUME_TIMEOUT_MS = 2500; // the context is held back by the autoplay policy: fall back to the whole file
+
+	let pcmContext = null;
+
+	// One context per sample rate, so that the decoded audio is not resampled block by block.
+	function getPcmContext(sampleRate) {
+		if (pcmContext && pcmContext.state !== "closed" && pcmContext.sampleRate === sampleRate) return pcmContext;
+		pcmContext?.close().catch(() => {});
+		pcmContext = new AudioContext({ sampleRate, latencyHint: "playback" });
+		return pcmContext;
+	}
+
+	function createPcmEngine({ onEnded, onTick } = {}) {
+		const blocks = []; // { start, pcm, channels }; start is counted in frames (samples per channel)
+		const sources = new Set(); // the buffer sources that are scheduled or playing
+		const waiters = []; // play() calls that wait for the first block
+		let totalFrames = 0;
+		let sampleRate = 0;
+		let channels = 0;
+		let context = null;
+		let gain = null;
+		let timer = 0;
+		let complete = false; // every block has arrived
+		let wantPlay = false; // play() was called and pause() was not
+		let running = false; // blocks are scheduled and the clock runs
+		let stalled = false; // the playhead reached the end of the data that has arrived so far
+		let finished = false; // played to the end of a complete stream
+		let disposed = false;
+		let anchor = 0; // the context time that track time 0 would have
+		let basePosition = 0; // track time while the clock does not run
+		let nextBlock = 0; // the next block to hand to the audio graph
+		let volume = 1;
+		let muted = false;
+
+		const decodedEnd = () => (sampleRate ? totalFrames / sampleRate : 0);
+		const applyGain = () => {
+			if (gain) gain.gain.value = muted ? 0 : volume;
+		};
+
+		function position() {
+			if (!running) return basePosition;
+			return Math.max(basePosition, Math.min(context.currentTime - anchor, decodedEnd()));
+		}
+
+		function stopSources() {
+			for (const source of sources) {
+				source.onended = null;
+				try {
+					source.stop();
+				} catch {
+					// it has ended already
+				}
+				source.disconnect();
+			}
+			sources.clear();
+		}
+
+		// The index of the block that holds this frame.
+		function blockIndexAt(frame) {
+			let low = 0;
+			let high = blocks.length - 1;
+			while (low < high) {
+				const middle = (low + high + 1) >> 1;
+				if (blocks[middle].start <= frame) low = middle;
+				else high = middle - 1;
+			}
+			return low;
+		}
+
+		function toAudioBuffer(block) {
+			const frames = block.pcm.length / block.channels;
+			const buffer = context.createBuffer(block.channels, frames, sampleRate);
+			for (let c = 0; c < block.channels; c++) {
+				const data = buffer.getChannelData(c);
+				for (let i = 0, j = c; i < frames; i++, j += block.channels) data[i] = block.pcm[j] / 32768;
+			}
+			return buffer;
+		}
+
+		function schedule(index, when, offset) {
+			const source = context.createBufferSource();
+			source.buffer = toAudioBuffer(blocks[index]);
+			source.connect(gain);
+			source.onended = () => {
+				sources.delete(source);
+				source.disconnect();
+				pump(); // events are not throttled like timers are while the window is in the background
+			};
+			sources.add(source);
+			source.start(when, offset);
+		}
+
+		// Hands the blocks that are due within the look-ahead to the audio graph.
+		function pump() {
+			if (!running || disposed) return;
+			const now = context.currentTime;
+			while (nextBlock < blocks.length) {
+				const when = anchor + blocks[nextBlock].start / sampleRate;
+				if (when > now + PCM_LOOKAHEAD_SEC) break;
+				if (when < now - 0.05) {
+					// The page was too busy to hand the block over in time: start again from where the playhead is.
+					startAt(Math.min(now - anchor, decodedEnd()));
+					return;
+				}
+				schedule(nextBlock, Math.max(when, now), 0);
+				nextBlock++;
+			}
+		}
+
+		function done() {
+			stopSources();
+			running = false;
+			stalled = false;
+			wantPlay = false;
+			finished = true;
+			basePosition = decodedEnd();
+			onEnded?.();
+		}
+
+		// Starts the clock at a track time (stops whatever was scheduled).
+		function startAt(seconds) {
+			stopSources();
+			running = false;
+			stalled = false;
+			finished = false;
+			const end = decodedEnd();
+			basePosition = Math.min(Math.max(seconds, 0), end);
+			if (!blocks.length) return;
+			if (basePosition >= end - 0.005) {
+				if (complete) done();
+				else stalled = true; // wait for the next block
+				return;
+			}
+			const index = blockIndexAt(Math.floor(basePosition * sampleRate));
+			const when = context.currentTime + PCM_START_DELAY_SEC;
+			anchor = when - basePosition;
+			schedule(index, when, basePosition - blocks[index].start / sampleRate);
+			nextBlock = index + 1;
+			running = true;
+			pump();
+		}
+
+		function tick() {
+			if (disposed) return;
+			if (running) {
+				if (context.currentTime - anchor >= decodedEnd() - 0.005 && nextBlock >= blocks.length) {
+					if (complete) {
+						done();
+					} else {
+						// The decoder has not kept up: wait where the data ends.
+						stopSources();
+						running = false;
+						stalled = true;
+						basePosition = decodedEnd();
+					}
+				} else {
+					pump();
+				}
+			}
+			onTick?.();
+		}
+
+		function init(block) {
+			try {
+				context = getPcmContext(block.sampleRate);
+				gain = context.createGain();
+				gain.connect(context.destination);
+			} catch (error) {
+				error.streamUnsupported = true; // the caller waits for the whole file instead
+				throw error;
+			}
+			sampleRate = block.sampleRate;
+			channels = block.channels;
+			applyGain();
+			timer = setInterval(tick, PCM_TICK_MS);
+			for (const waiter of waiters.splice(0)) waiter.resolve();
+		}
+
+		async function resumeContext() {
+			if (context.state === "running") return;
+			const unsupported = () => {
+				const error = new Error("the audio context did not start");
+				error.streamUnsupported = true;
+				return error;
+			};
+			let timeout = 0;
+			try {
+				await Promise.race([
+					context.resume(),
+					new Promise((resolve, reject) => {
+						timeout = setTimeout(() => reject(unsupported()), PCM_RESUME_TIMEOUT_MS);
+					}),
+				]);
+			} finally {
+				clearTimeout(timeout);
+			}
+			if (context.state !== "running") throw unsupported();
+		}
+
+		// Resolves once there is audio and the context runs.
+		async function play() {
+			if (disposed) throw abortError();
+			wantPlay = true;
+			if (finished) {
+				finished = false;
+				basePosition = 0; // like an audio element that has ended
+			}
+			if (!context) await new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+			await resumeContext();
+			if (disposed) throw abortError();
+			if (wantPlay && !running) startAt(basePosition);
+		}
+
+		function pause() {
+			wantPlay = false;
+			if (running) {
+				basePosition = position();
+				stopSources();
+				running = false;
+			}
+			stalled = false;
+		}
+
+		function seek(seconds) {
+			finished = false;
+			const target = Number.isFinite(seconds) ? seconds : 0;
+			if (wantPlay) startAt(target);
+			else basePosition = Math.min(Math.max(target, 0), decodedEnd());
+		}
+
+		function addBlock(block) {
+			if (disposed) return;
+			if (!context) init(block);
+			else if (block.sampleRate !== sampleRate || block.channels !== channels) throw new Error("the decoded stream changes its format");
+			blocks.push({ start: totalFrames, pcm: block.pcm, channels });
+			totalFrames += block.pcm.length / channels;
+			if (wantPlay && !running) startAt(basePosition);
+			else pump();
+		}
+
+		function end() {
+			complete = true;
+			if (stalled && wantPlay && basePosition >= decodedEnd() - 0.005) done();
+		}
+
+		function dispose() {
+			if (disposed) return;
+			disposed = true;
+			clearInterval(timer);
+			stopSources();
+			try {
+				gain?.disconnect();
+			} catch {
+				// already disconnected
+			}
+			running = false;
+			wantPlay = false;
+			for (const waiter of waiters.splice(0)) waiter.reject(abortError());
+		}
+
+		return {
+			get currentTime() {
+				return position();
+			},
+			set currentTime(seconds) {
+				seek(seconds);
+			},
+			get paused() {
+				return !wantPlay;
+			},
+			get ended() {
+				return finished;
+			},
+			// Only known once everything has been decoded (the callers then use the length of the track).
+			get duration() {
+				return complete ? decodedEnd() : NaN;
+			},
+			// One range: everything that has been decoded so far.
+			get buffered() {
+				const decoded = decodedEnd();
+				return { length: decoded > 0 ? 1 : 0, start: () => 0, end: () => decoded };
+			},
+			get volume() {
+				return volume;
+			},
+			set volume(value) {
+				volume = value;
+				applyGain();
+			},
+			get muted() {
+				return muted;
+			},
+			set muted(value) {
+				muted = Boolean(value);
+				applyGain();
+			},
+			play,
+			pause,
+			addBlock,
+			end,
+			dispose,
+			isComplete: () => complete,
+		};
+	}
+
+	// The sink of a decoded stream: hands the PCM blocks to a PCM engine, which then is the `player`.
+	function createPcmSink({ onAttached, onError }) {
+		let engine = null;
+		let dead = false;
+
+		function fail(error) {
+			(error?.streamUnsupported ? debug : debugError)("pcm", "failed:", error?.name, error?.message);
+			dead = true;
+			onError(error);
+		}
+
+		return {
+			start() {
+				if (dead || engine) return;
+				if (typeof AudioContext === "undefined") {
+					const error = new Error("Web Audio is not available");
+					error.streamUnsupported = true;
+					fail(error);
+					return;
+				}
+				engine = createPcmEngine({ onEnded: handlePlayerEnded, onTick: () => updatePositionState(false) });
+				player = engine;
+				debug("pcm", "start: decoded audio is played through Web Audio");
+				onAttached();
+			},
+			append(block) {
+				if (dead || !engine) return;
+				try {
+					engine.addBlock(block);
+				} catch (error) {
+					fail(error);
+				}
+			},
+			end() {
+				if (!dead) engine?.end();
+			},
+			poke() {},
+			isBlocked: () => false,
+			isComplete: () => Boolean(engine?.isComplete()),
+			dispose() {
+				dead = true;
+				engine?.dispose();
+			},
+		};
+	}
+
+	// Picks the sink for what the download reports: PCM blocks go to the engine, bytes go to a MediaSource.
+	function createStreamSink(options) {
+		let impl = null;
+		return {
+			start(mime) {
+				if (impl) return;
+				impl = mime === PCM_STREAM_MIME ? createPcmSink(options) : createMseSink(options);
+				impl.start(mime);
+			},
+			append: (chunk) => impl?.append(chunk),
+			end: () => impl?.end(),
+			poke: () => impl?.poke(),
+			isBlocked: () => Boolean(impl?.isBlocked()),
+			isComplete: () => Boolean(impl?.isComplete()),
+			dispose: () => impl?.dispose(),
+		};
+	}
+
 	// Plays a track while it is still downloading. Resolves once playback has started. Rejects with an
 	// error whose streamUnsupported flag is set when the caller should fall back to a full download.
 	function streamTrack(track, token, onProgress) {
@@ -2173,19 +2669,19 @@
 				fn(value);
 			};
 
-			const sink = createMseSink({
+			const sink = createStreamSink({
 				expectedSec: (track.durationMs ?? 0) / 1000,
 				onAttached: () => {
 					syncVolume();
 					// Resolves as soon as enough data is buffered to start, not when the download is done.
-					debug("stream", "audio.play() called");
-					audio.play().then(
+					debug("stream", "play() called");
+					player.play().then(
 						() => {
-							debug("stream", `audio.play() resolved: ${audioStateText(audio)}`);
+							debug("stream", `play() resolved: ${audioStateText(player)}`);
 							settle(resolve);
 						},
 						(error) => {
-							debugError("stream", "audio.play() rejected:", error?.name, error?.message);
+							(error?.streamUnsupported ? debug : debugError)("stream", "play() rejected:", error?.name, error?.message);
 							settle(reject, error);
 						}
 					);
@@ -2232,14 +2728,15 @@
 		activeStream = null;
 		job.sinks.delete(sink);
 		sink.dispose();
+		player = audio; // the PCM engine, if there was one, is gone with its sink
 		cancel();
 	}
 
 	// Replaces the stream by the finished download, keeping the position and the play state.
-	function switchToBlob(track, token, position = audio.currentTime) {
+	function switchToBlob(track, token, position = player.currentTime) {
 		const url = peekAudioUrl(track);
 		if (!url || token !== playToken) return false;
-		const wasPlaying = !audio.paused;
+		const wasPlaying = !player.paused;
 		detachStream();
 		audio.src = url;
 		audio.addEventListener(
@@ -2257,7 +2754,7 @@
 	// While streaming, only positions inside the buffered data can be played.
 	function seekAudio(seconds) {
 		if (activeStream && !activeStream.sink.isComplete()) {
-			const ranges = audio.buffered;
+			const ranges = player.buffered;
 			let inside = false;
 			for (let i = 0; i < ranges.length; i++) {
 				if (seconds >= ranges.start(i) && seconds <= ranges.end(i)) inside = true;
@@ -2271,11 +2768,11 @@
 				}
 			}
 		}
-		audio.currentTime = seconds;
+		player.currentTime = seconds;
 	}
 
 	function trackDurationSec() {
-		return Number.isFinite(audio.duration) ? audio.duration : (state.current?.durationMs ?? 0) / 1000;
+		return Number.isFinite(player.duration) ? player.duration : (state.current?.durationMs ?? 0) / 1000;
 	}
 
 	// The OS media controller (MPRIS, SMTC) and tools built on it (Discord RPC, scrobblers) see two players: Spotify's
@@ -2505,7 +3002,7 @@
 	function audioCanPlayAt(seconds) {
 		if (!activeStream || activeStream.sink.isComplete() || activeStream.job.finished) return true;
 		const duration = trackDurationSec();
-		const ranges = audio.buffered;
+		const ranges = player.buffered;
 		for (let i = 0; i < ranges.length; i++) {
 			if (seconds < ranges.start(i) - 0.05) continue;
 			if (ranges.end(i) >= seconds + RESUME_MARGIN || ranges.end(i) >= duration - 0.1) return true;
@@ -2516,7 +3013,7 @@
 	// Stops Spotify's clock until the audio has caught up (the data behind a seek has not arrived yet).
 	function holdClock() {
 		state.holding = true;
-		audio.pause();
+		player.pause();
 		state.suppressUntil = Date.now() + 500; // our own pause must not look like a user action
 		Spicetify.Player.pause();
 	}
@@ -2526,7 +3023,7 @@
 	function releaseClock() {
 		if (!state.holding) return;
 		state.holding = false;
-		const at = audio.currentTime;
+		const at = player.currentTime;
 		if (Math.abs(at - spotifyPosition()) > SYNC_TOLERANCE) seekSpotify(at);
 		Spicetify.Player.play();
 	}
@@ -2552,7 +3049,7 @@
 		}
 
 		if (!Spicetify.Player.isPlaying()) {
-			if (!audio.paused) audio.pause();
+			if (!player.paused) player.pause();
 			if (state.status !== "paused") {
 				state.status = "paused";
 				syncPlayerUi();
@@ -2561,15 +3058,15 @@
 		}
 
 		// Spotify runs. After the audio has ended, Spotify may still be inside the last seconds of its placeholder.
-		const tail = audio.ended && position >= audio.currentTime - 2;
-		if (!tail && Math.abs(audio.currentTime - position) > SYNC_TOLERANCE) {
+		const tail = player.ended && position >= player.currentTime - 2;
+		if (!tail && Math.abs(player.currentTime - position) > SYNC_TOLERANCE) {
 			if (!audioCanPlayAt(position)) {
 				holdClock();
 				return;
 			}
 			seekAudio(position);
 		}
-		if (audio.paused && !tail) audio.play().catch(() => {});
+		if (player.paused && !tail) player.play().catch(() => {});
 		if (state.status !== "playing") {
 			state.status = "playing";
 			syncPlayerUi();
@@ -2584,13 +3081,16 @@
 		return false;
 	}
 
-	// Audio element events
-	audio.addEventListener("ended", () => {
+	// The player (the audio element or the PCM engine) has played to the end.
+	function handlePlayerEnded() {
 		if (state.status === "idle" || state.holding || readSpotify().uri !== state.placeholderUri) return;
 		// Let Spotify run out its placeholder by itself, so that repeat and shuffle apply as usual.
 		const duration = Spicetify.Player.getDuration();
 		if (duration - spotifyPosition() * 1000 > 300) seekSpotify((duration - 150) / 1000);
-	});
+	}
+
+	// Audio element events
+	audio.addEventListener("ended", handlePlayerEnded);
 	for (const name of ["loadedmetadata", "canplay", "playing", "waiting", "stalled", "emptied", "abort"]) {
 		audio.addEventListener(name, () => {
 			if (audio.getAttribute("src")) debug("audio", `${name}: ${audioStateText(audio)}`);
@@ -2611,8 +3111,14 @@
 	// Keep the volume in sync with Spotify's volume slider.
 	function syncVolume() {
 		try {
-			audio.volume = Math.min(1, Math.max(0, Spicetify.Player.getVolume()));
-			audio.muted = Spicetify.Player.getMute();
+			const volume = Math.min(1, Math.max(0, Spicetify.Player.getVolume()));
+			const muted = Spicetify.Player.getMute();
+			audio.volume = volume;
+			audio.muted = muted;
+			if (player !== audio) {
+				player.volume = volume;
+				player.muted = muted;
+			}
 		} catch {
 			// ignore
 		}

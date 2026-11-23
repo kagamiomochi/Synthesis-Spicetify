@@ -149,7 +149,7 @@ On macOS and Windows, logs are written next to the wisp-js directory (`wisp-onde
 - SoundCloud is reached through the same proxy. The `client_id` that soundcloud.com's own web client uses is read from the site's scripts and cached in the browser's local storage (it is public, not tied to you).
 - This extension uses unofficial YouTube and SoundCloud APIs and may violate their Terms of Service (SoundCloud's API terms also forbid mixing its tracks with other services, and the official API is not used). Use it at your own risk.
 - Only tracks SoundCloud offers in full are shown. Previews, Go+ and encrypted streams are skipped.
-- SoundCloud serves AAC only, which the Chromium inside Spotify cannot decode. The AAC is therefore decoded in the extension with [FAAD2](https://github.com/knik0/faad2) compiled to WebAssembly (`@ohrstrom/faad2-wasm`, loaded from jsDelivr like libcurl.js) and played as WAV. A SoundCloud track starts after it has been downloaded and decoded, which takes a few seconds.
+- SoundCloud serves AAC only, which the Chromium inside Spotify cannot decode. The AAC is therefore decoded in the extension with [FAAD2](https://github.com/knik0/faad2) compiled to WebAssembly (`@ohrstrom/faad2-wasm`, loaded from jsDelivr like libcurl.js) and played through Web Audio while the rest of the track is still downloading and decoding, so a track starts after its first piece (about 10 seconds of audio). If Web Audio cannot be started, the track is played as a WAV file once it has been downloaded and decoded in full, which takes a few seconds.
 - Not affiliated with Spotify, Google, YouTube or SoundCloud.
 
 ---
