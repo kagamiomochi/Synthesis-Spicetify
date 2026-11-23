@@ -59,7 +59,10 @@
 	// ---------------------------------------------------------------------
 
 	/* VERSION */ const VERSION = "v0.7.0";
-	const WISP_SCRIPT_URL = "https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/main/wisp-launcher/portable/wisp_ondemand.py";
+	// The setup script is taken from the tag of the installed release, so the file that is downloaded and run
+	// does not change under the user's feet when main moves on.
+	const WISP_SCRIPT_REF = /^v\d+\.\d+\.\d+$/.test(VERSION) ? VERSION : "main";
+	const WISP_SCRIPT_URL = `https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/${WISP_SCRIPT_REF}/wisp-launcher/portable/wisp_ondemand.py`;
 	const LIBCURL_URL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.5/libcurl_full.mjs";
 	const YTJS_URL = "https://cdn.jsdelivr.net/npm/youtubei.js@18.3.0/bundle/browser.js";
 	const FAAD2_URL = "https://cdn.jsdelivr.net/npm/@ohrstrom/faad2-wasm@2.11.2-rc.4/faad2_wasm.mjs"; // AAC decoder (SoundCloud)
@@ -344,8 +347,6 @@
 		if (!Number.isFinite(ms) || ms <= 0) return "";
 		return mmss(Math.round(ms / 1000));
 	}
-
-	// Playback position of the player bar; an unknown value shows 0:00.
 
 	const setText = (el, text) => {
 		if (el.textContent !== text) el.textContent = text;
@@ -645,7 +646,9 @@
 	// through as-is makes InnerTube answer HTTP 400 INVALID_ARGUMENT.
 	function detectRegion() {
 		try {
-			const region = new Intl.Locale(navigator.language || "en-US").region;
+			const locale = new Intl.Locale(navigator.language || "en-US");
+			// "ja" has no region: use the likely one ("JP") rather than falling back to "US".
+			const region = locale.region ?? locale.maximize().region;
 			if (region && /^[A-Z]{2}$/.test(region)) return region;
 		} catch {
 			// Malformed locale tag: fall through to the default.
@@ -770,10 +773,12 @@
 			for (let i = 0; i < Math.max(0, ...lists.map((list) => list.length)); i++) {
 				for (const track of lists.map((list) => list[i])) {
 					if (!track) continue;
-					const key = `${normalizeText(track.title)}|${normalizeText(track.artists[0])}`;
-					if (seen.has(track.id) || seen.has(key)) continue;
+					// Without an artist the title alone says too little to call two results the same track.
+					const artist = normalizeText(track.artists?.[0]);
+					const key = artist ? `${normalizeText(track.title)}|${artist}` : null;
+					if (seen.has(track.id) || (key && seen.has(key))) continue;
 					seen.add(track.id);
-					seen.add(key);
+					if (key) seen.add(key);
 					merged.push(track);
 				}
 			}
@@ -1359,6 +1364,7 @@
 		const parts = [];
 		let started = false;
 		let pending = fetchPart(urls[0]);
+		pending.catch(() => {}); // it is awaited below, but not when the signal is already aborted at the first check
 		for (let i = 0; i < urls.length; i++) {
 			throwIfAborted(signal);
 			const current = pending;
@@ -1864,8 +1870,11 @@
 	const savedTracks = loadSaved(); // spotify:local: URI -> track (saved to a playlist, kept in localStorage)
 	const placeholderTracks = new Map(); // spotify:local: URI -> track (made for playing or queueing, memory only)
 
+	let savedTitleIndex = null; // placeholder title tag -> saved track, built on first use (see savedByTitle)
+
 	function rememberSaved(uri, track) {
 		savedTracks[uri] = track;
+		savedTitleIndex = null;
 		try {
 			localStorage.setItem(SAVED_KEY, JSON.stringify(savedTracks));
 		} catch (error) {
@@ -3289,8 +3298,15 @@
 	const displayFetchedAt = new Map(); // title tag -> time of the last lookup, so a failure is retried only rarely
 
 	function savedByTitle(title) {
-		for (const track of Object.values(savedTracks)) if (providers[track.provider] && placeholderTitle(track) === title) return track;
-		return null;
+		if (!savedTitleIndex) {
+			savedTitleIndex = new Map();
+			for (const track of Object.values(savedTracks)) {
+				if (!providers[track.provider]) continue;
+				const tag = placeholderTitle(track);
+				if (!savedTitleIndex.has(tag)) savedTitleIndex.set(tag, track);
+			}
+		}
+		return savedTitleIndex.get(title) ?? null;
 	}
 
 	// Display details of a placeholder's title tag, or null while they are still being looked up.

@@ -167,7 +167,7 @@ On macOS and Windows, logs are written next to the wisp-js directory (`wisp-onde
 The player request (client definitions, headers, cookies) is built the same way yt-dlp does it, because the
 request shape YouTube.js sends for app clients is currently rejected with "Sign in to confirm you're not a bot".
 
-Both libraries are loaded from jsDelivr on first use (pinned versions: libcurl.js 0.7.5, youtubei.js 18.3.0).
+The libraries are loaded from jsDelivr on first use (pinned versions: libcurl.js 0.7.5, youtubei.js 18.3.0, and for SoundCloud `@ohrstrom/faad2-wasm` 2.11.2-rc.4).
 
 ### Playback pipeline
 
@@ -388,7 +388,7 @@ Spotify のプロフィールメニューから「Synthesis Spicetify 設定」�
 
 プレイヤーリクエスト(クライアント定義、ヘッダー、Cookie)は yt-dlp と同じ方法で組み立てています。YouTube.js がアプリ系クライアント向けに送るリクエストの形は、現在「Sign in to confirm you're not a bot」で拒否されるためです。
 
-どちらのライブラリも初回利用時に jsDelivr から読み込みます (バージョン固定: libcurl.js 0.7.5、youtubei.js 18.3.0)。
+ライブラリは初回利用時に jsDelivr から読み込みます (バージョン固定: libcurl.js 0.7.5、youtubei.js 18.3.0、SoundCloud 用の `@ohrstrom/faad2-wasm` 2.11.2-rc.4)。
 
 ### 再生の仕組み
 
