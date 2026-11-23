@@ -49,6 +49,8 @@ LAUNCHD_LABEL = "io.github.kagamiomochi.synthesis-spicetify-wisp"
 WISP_PACKAGE = "@mercuryworkshop/wisp-js"
 WISP_VERSION = "0.5.3"  # pinned; bump deliberately
 HOST = "127.0.0.1"
+# After one side of a connection has closed, how long the other direction may still deliver its last bytes.
+HALF_CLOSE_GRACE = 5.0
 IS_WINDOWS = os.name == "nt"
 
 
@@ -317,6 +319,9 @@ async def pipe(reader, writer):
                 break
             writer.write(data)
             await writer.drain()
+        # Pass the EOF on as a half-close, so the peer can still send its last bytes (a WebSocket close frame).
+        if writer.can_write_eof():
+            writer.write_eof()
     except (OSError, asyncio.IncompleteReadError):
         pass
 
@@ -342,18 +347,24 @@ class Proxy:
     async def handle(self, reader, writer):
         self.active += 1
         backend_writer = None
+        tasks = []
         try:
             await self.backend.ensure_running()
             backend_reader, backend_writer = await asyncio.open_connection(HOST, self.backend_port)
             tasks = [asyncio.ensure_future(pipe(reader, backend_writer)),
                      asyncio.ensure_future(pipe(backend_reader, writer))]
-            # When either side closes, tear down both directions.
             _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
+            if pending:
+                # One side has closed. The other direction may still be delivering its last bytes, so give it a
+                # moment, but do not keep the connection (and with it the idle timer) open for ever.
+                await asyncio.wait(pending, timeout=HALF_CLOSE_GRACE)
         except Exception as exc:  # keep the launcher alive whatever happens to one connection
             logging.warning("connection failed: %s", exc)
         finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             self.active -= 1
             self.last_activity = time.monotonic()
             await close_writer(writer)
@@ -470,6 +481,20 @@ def macos_plist(args):
     }
 
 
+def macos_unload(domain):
+    """Unload the job if it is loaded, and wait until it is really gone."""
+    target = f"{domain}/{LAUNCHD_LABEL}"
+    quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    # SIGTERM lets the launcher stop the backend cleanly. The error is ignored when the job was not loaded.
+    subprocess.run(["launchctl", "bootout", target], **quiet)
+    # bootout can return before the job has been removed, and a bootstrap right after it then fails with
+    # "Input/output error".
+    for _ in range(50):
+        if subprocess.run(["launchctl", "print", target], **quiet).returncode != 0:
+            return
+        time.sleep(0.1)
+
+
 def install_macos(args):
     plist = macos_plist(args)
     path = macos_plist_path()
@@ -477,17 +502,18 @@ def install_macos(args):
     with open(path, "wb") as f:
         plistlib.dump(plist, f)
     domain = f"gui/{os.getuid()}"
-    # Reload if it was installed before; ignore the error when it was not loaded.
-    subprocess.run(["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    run_checked(["launchctl", "bootstrap", domain, path])
+    # Reload if it was installed before.
+    macos_unload(domain)
+    for _ in range(3):
+        if subprocess.run(["launchctl", "bootstrap", domain, str(path)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            return
+        time.sleep(0.5)
+    run_checked(["launchctl", "bootstrap", domain, path])  # last try, this time with its error shown
 
 
 def uninstall_macos(args):
-    domain = f"gui/{os.getuid()}"
-    # SIGTERM lets the launcher stop the backend cleanly.
-    subprocess.run(["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    macos_unload(f"gui/{os.getuid()}")
     macos_plist_path().unlink(missing_ok=True)
 
 

@@ -2654,6 +2654,7 @@
 	// Info header that carries the frame count, so the length is exact; TLEN repeats it for tag readers.
 	function makeSilentMp3({ artist, album, title, seconds }) {
 		const FRAME = 48; // 72 * 16000 / 24000 bytes, 576 samples = 24 ms per frame
+		const CHUNK_FRAMES = 20000; // about 1 MB
 		const frames = Math.ceil((seconds * 1000) / 24);
 		const frame = (id, body) => {
 			const out = new Uint8Array(10 + body.length);
@@ -2683,22 +2684,31 @@
 		const parts = [text("TIT2", title), text("TPE1", artist), text("TALB", album), numeric("TLEN", seconds * 1000)];
 		const tagSize = parts.reduce((n, p) => n + p.length, 0);
 		const header = new Uint8Array([0x49, 0x44, 0x33, 3, 0, 0, (tagSize >> 21) & 0x7f, (tagSize >> 14) & 0x7f, (tagSize >> 7) & 0x7f, tagSize & 0x7f]);
-		const mpeg = new Uint8Array(FRAME * (frames + 1));
+		// The first frame carries the Xing/Info header, all the others are silent (a frame header and zeros).
 		// Frame header: MPEG-2 Layer III, no CRC, bitrate index 2 (16 kbps), 24 kHz, mono.
 		// The bitrate index must match FRAME, otherwise decoders reject the file as unplayable.
-		for (let f = 0; f <= frames; f++) mpeg.set([0xff, 0xf3, 0x24, 0xc0], f * FRAME);
-		mpeg.set([0x49, 0x6e, 0x66, 0x6f], 13); // "Info"
-		new DataView(mpeg.buffer).setUint32(17, 1); // flags: frame count present
-		new DataView(mpeg.buffer).setUint32(21, frames);
-		const out = new Uint8Array(10 + tagSize + mpeg.length);
-		out.set(header, 0);
-		let pos = 10;
-		for (const p of parts) {
-			out.set(p, pos);
-			pos += p.length;
+		const silent = (count) => {
+			const bytes = new Uint8Array(FRAME * count);
+			for (let f = 0; f < count; f++) bytes.set([0xff, 0xf3, 0x24, 0xc0], f * FRAME);
+			return bytes;
+		};
+		const first = silent(1);
+		first.set([0x49, 0x6e, 0x66, 0x6f], 13); // "Info"
+		new DataView(first.buffer).setUint32(17, 1); // flags: frame count present
+		new DataView(first.buffer).setUint32(21, frames);
+		// A track of several hours is tens of megabytes, so the file is assembled as a Blob from one shared chunk
+		// instead of one huge array (plus a copy of it).
+		const blobParts = [header, ...parts, first];
+		let left = frames;
+		if (left >= CHUNK_FRAMES) {
+			const chunk = silent(CHUNK_FRAMES);
+			while (left >= CHUNK_FRAMES) {
+				blobParts.push(chunk);
+				left -= CHUNK_FRAMES;
+			}
 		}
-		out.set(mpeg, pos);
-		return out;
+		if (left > 0) blobParts.push(silent(left));
+		return new Blob(blobParts, { type: "audio/mpeg" });
 	}
 
 	// Escapes one URI field the way Spotify does for local files: A-Z a-z 0-9 - . _ ~ stay, a space becomes
