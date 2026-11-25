@@ -191,6 +191,8 @@
 			botHint: "共有Wispプロキシの出口IPがYouTubeに弾かれている可能性があります。自宅PCでローカルのWispサーバーを用意し、設定で「再生機能を有効化」をオンにしてください。",
 			playbackLabel: "再生機能を有効化",
 			playbackDesc: "オフの間は公開 Wisp だけを使い、検索結果の表示と「ブラウザで開く」のみ使えます。再生にはローカル Wisp サーバーが必要です。",
+			autoRecommendLabel: "自動再生",
+			autoRecommendDesc: "検索から再生した曲が終わったとき、または次へを押したときに、次の配信元のおすすめの曲を再生します。プレイリストやキューからの再生には影響しません。",
 			playbackOffNotice: "再生機能はオフです。検索結果の表示と「ブラウザで開く」のみ使えます。",
 			playbackDisabled: "再生機能がオフです。設定で「再生機能を有効化」をオンにしてください。",
 			playbackOnToast: "再生機能を有効にしました",
@@ -268,6 +270,8 @@
 			botHint: "The shared Wisp proxy's IP is probably flagged by YouTube. Set up a local Wisp server on your PC and turn on \"Enable playback\" in the settings.",
 			playbackLabel: "Enable playback",
 			playbackDesc: "While off, only public Wisp proxies are used: you can search and open results in the browser, but not play them. Playback needs a local Wisp server.",
+			autoRecommendLabel: "Autoplay",
+			autoRecommendDesc: "When a song played from a search ends, or when you tap Next, the next recommended song from that source will play. This does not affect playback from playlists or queues.",
 			playbackOffNotice: "Playback is off. You can search and open results in the browser.",
 			playbackDisabled: "Playback is off. Turn on \"Enable playback\" in the settings.",
 			playbackOnToast: "Playback enabled",
@@ -5138,6 +5142,27 @@
 		};
 	}
 
+	// The "Play a recommended track" switch. It applies at once. Returns the elements to show, and reset() which
+	// shows the saved state again.
+	function createRecommendSection() {
+		const input = h("input", { type: "checkbox" });
+		input.checked = config.autoRecommend;
+		input.addEventListener("change", () => {
+			saveConfig({ autoRecommend: input.checked });
+			// The active track started before the switch was on, so nothing has been looked up for it yet.
+			if (input.checked && state.status !== "idle" && state.current) prepareRecommendation(state.current);
+		});
+		return {
+			nodes: [
+				h("label", { class: "ss-toggle", style: "margin-top:16px" }, h("span", { class: "ss-switch" }, input, h("span", {})), t("autoRecommendLabel")),
+				h("div", { class: "ss-desc" }, t("autoRecommendDesc")),
+			],
+			reset() {
+				input.checked = config.autoRecommend;
+			},
+		};
+	}
+
 	function openSettings() {
 		const wisp = h("textarea", { rows: "3" });
 		wisp.value = config.wispServers.join("\n");
@@ -5184,6 +5209,7 @@
 		}
 
 		const playbackSection = createPlaybackSection();
+		const recommendSection = createRecommendSection();
 		const resetButton = createConfirmButton(t("resetSettings"), t("resetConfirm"), () => {
 			// Defaults have playback off, so stop the current track like the switch does.
 			if (config.playbackEnabled && state.status !== "idle") closeTrack();
@@ -5194,6 +5220,7 @@
 			output.style.display = "none";
 			output.textContent = "";
 			playbackSection.reset();
+			recommendSection.reset();
 			resetNetwork();
 			renderSearch();
 			notify(t("resetDone"));
@@ -5203,6 +5230,7 @@
 			"div",
 			{ class: "ss-settings" },
 			...playbackSection.nodes,
+			...recommendSection.nodes,
 			h("label", {}, t("wispLabel")),
 			wisp,
 			h("label", {}, t("clientsLabel")),
