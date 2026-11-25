@@ -86,6 +86,9 @@
 		clients: ["visionos", "tv_samsung"],
 		resultLimit: 20,
 		prefetchNext: true,
+		// When a track that was started on its own ends, play its service's next recommendation instead of
+		// letting Spotify move on to the next local file.
+		autoRecommend: true,
 	};
 
 	const CONFIG_VERSION = 6;
@@ -169,6 +172,7 @@
 			addedQueue: "キューに追加しました",
 			addedNext: "次に再生します",
 			playFailed: (m) => `再生に失敗しました: ${m}`,
+			recommendFailed: "おすすめの曲を取得できなかったため、再生を止めました",
 			tryPlay: "公開 Wisp で試しに再生 (ほぼ通らないです)",
 			trialSaved: "公開 Wisp で再生できたため、再生機能を有効のまま保存しました",
 			settingsTitle: "Synthesis Spicetify 設定",
@@ -245,6 +249,7 @@
 			addedQueue: "Added to queue",
 			addedNext: "Will play next",
 			playFailed: (m) => `Playback failed: ${m}`,
+			recommendFailed: "Could not get a recommended track, so playback was stopped",
 			tryPlay: "Try playing via public Wisp (often blocked)",
 			trialSaved: "Playback worked over the public Wisp, so it stays enabled",
 			settingsTitle: "Synthesis Spicetify settings",
@@ -810,6 +815,31 @@
 		return createYoutubeSearch(query).take(limit);
 	}
 
+	// The tracks YouTube Music plays after this one (its "Up next" list, or the automix when there is none).
+	// The list starts with the track itself. An entry is a PlaylistPanelVideo, or a wrapper around one in `primary`.
+	async function youtubeRecommend(track) {
+		const yt = await getInnertube();
+		const panel = await yt.music.getUpNext(track.id);
+		const tracks = [];
+		for (const node of Array.from(panel?.contents ?? [])) {
+			const video = node?.primary ?? node;
+			const title = video?.title?.toString?.() ?? "";
+			if (!video?.video_id || !title) continue;
+			const people = video.artists?.length ? video.artists.map((person) => person.name) : [video.author];
+			const thumbs = Array.from(video.thumbnail ?? []);
+			tracks.push({
+				provider: "youtube",
+				id: video.video_id,
+				title,
+				artists: people.filter(Boolean),
+				album: video.album?.name || "",
+				durationMs: (video.duration?.seconds ?? 0) * 1000,
+				thumbnail: resizeThumbnail(thumbs[thumbs.length - 1]?.url || thumbs[0]?.url),
+			});
+		}
+		return tracks;
+	}
+
 	const youtubeOpenUrl = (track) => `https://music.youtube.com/watch?v=${encodeURIComponent(track.id)}`;
 	const youtubeThumbnail = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
 
@@ -1239,6 +1269,12 @@
 	}
 
 	const soundcloudSearch = (query, limit) => createSoundcloudSearch(query).take(limit);
+
+	// The tracks SoundCloud lists as related to this one (the "Related tracks" of its web player).
+	async function soundcloudRecommend(track) {
+		const page = await soundcloudCall(`${SOUNDCLOUD_API}/tracks/${encodeURIComponent(track.id)}/related`, { limit: 20, linked_partitioning: 1 });
+		return (page?.collection ?? []).map(soundcloudToTrack).filter(Boolean);
+	}
 	const soundcloudOpenUrl = (track) => track.url || null;
 
 	async function soundcloudFetchDisplay(id) {
@@ -1866,6 +1902,7 @@
 	//   fetchAudio(track, hooks), streamable   download (see getAudioJob); streamable = reports onStart / onChunk
 	//   openUrl(track)         the track's page on the service
 	// Optional:
+	//   recommend(track)       the tracks the service itself would play next, best first (see queueRecommendation)
 	//   fetchDisplay(id)       title, artist, album and cover of an ID, for when no stored track data is left
 	//   fallbackThumbnail(id)  { url, letterbox } cover derived from the ID alone
 	//   resizeThumbnail(url, size) / upgradeThumbnail(url)   a cover URL at another size, or null if not this service's
@@ -1880,6 +1917,7 @@
 			idPattern: /^[\w-]{11}$/,
 			search: youtubeSearch,
 			createSearch: createYoutubeSearch,
+			recommend: youtubeRecommend,
 			fetchAudio: youtubeFetchAudio,
 			// fetchAudio reports onStart(mime) and onChunk(bytes) while downloading.
 			streamable: true,
@@ -1900,6 +1938,7 @@
 			idPattern: /^\d{1,20}$/,
 			search: soundcloudSearch,
 			createSearch: createSoundcloudSearch,
+			recommend: soundcloudRecommend,
 			fetchAudio: soundcloudFetchAudio,
 			// Reports bytes, or decoded PCM blocks for AAC (see PCM_STREAM_MIME).
 			streamable: true,
@@ -1966,6 +2005,7 @@
 		suppressUntil: 0, // ignore Spotify events until this timestamp
 		advancingUntil: 0, // Spotify is being moved to another item: what it does meanwhile is not a new start
 		holding: false, // we stopped Spotify's clock ourselves (loading, or the audio has not been downloaded that far yet)
+		autoChain: false, // the active track was started on its own (Local Files context) or came from a recommendation
 	};
 	let playToken = 0;
 
@@ -2917,6 +2957,7 @@
 			releaseClock();
 			syncPlayerUi();
 			prefetchNext();
+			prepareRecommendation(track);
 		} catch (error) {
 			if (token !== playToken || error?.name === "AbortError") return;
 			console.error("[Synthesis Spicetify] playback failed", error);
@@ -3081,9 +3122,181 @@
 		return false;
 	}
 
+	// ---- Recommendations: what plays after a track that was started on its own ----
+	// A track started from the search page runs in Spotify's Local Files context, so when its placeholder ends
+	// Spotify would move on to the next local file. Instead the service's own recommendation is put in front
+	// of Spotify's queue shortly before the end, and Spotify plays that placeholder next. The same goes for
+	// the recommendation itself, so the chain goes on until the user plays or queues something else.
+	const RECOMMEND_LEAD_SECONDS = 20; // how long before the end the recommendation is queued
+	const RECOMMEND_WAIT_MS = 4000; // how long the end of a track waits for a recommendation that is not ready yet
+	const RECENT_LIMIT = 100;
+	const recentKeys = []; // keys of the tracks played or recommended lately, so that a chain does not loop
+	let recommendation = null; // { key, promise } the lookup for the active track, resolves with { track, uri }
+	let queueJob = null; // { key, promise } putting that recommendation into Spotify's queue
+	let pendingAuto = null; // placeholder URI of a recommendation that sits in Spotify's queue
+	let localStartUri = null; // placeholder that was just started in the Local Files context
+
+	// The same song as a video and as an audio track has two IDs, so the title and first artist count too.
+	function recentKeysOf(track) {
+		const artist = normalizeText(track.artists?.[0]);
+		return [trackKey(track), artist ? `${normalizeText(track.title)}|${artist}` : null].filter(Boolean);
+	}
+
+	function rememberRecent(track) {
+		for (const key of recentKeysOf(track)) if (!recentKeys.includes(key)) recentKeys.push(key);
+		while (recentKeys.length > RECENT_LIMIT) recentKeys.shift();
+	}
+
+	// Looks up the recommendation of the track that has just started and makes its placeholder, so that it
+	// is ready by the time it is needed.
+	function prepareRecommendation(track) {
+		recommendation = null;
+		queueJob = null;
+		rememberRecent(track);
+		const provider = providers[track.provider];
+		if (!config.autoRecommend || !provider?.recommend) return;
+		const promise = (async () => {
+			const candidates = await provider.recommend(track);
+			const next = candidates.find((candidate) => !recentKeysOf(candidate).some((key) => recentKeys.includes(key)));
+			if (!next) throw new Error("no recommendation that was not played lately");
+			return { track: next, uri: await ensurePlaceholder(next) };
+		})();
+		promise.catch((error) => console.warn("[Synthesis Spicetify] recommendation failed", error));
+		recommendation = { key: trackKey(track), promise };
+	}
+
+	function inLocalFilesContext() {
+		const data = Spicetify.Player.data;
+		return /local-files/i.test(data?.context?.uri ?? data?.context_uri ?? data?.contextUri ?? "");
+	}
+
+	// URIs the user queued. Our own recommendation does not count.
+	function userQueueUris() {
+		const upcoming = Spicetify.Queue?.nextTracks;
+		if (!Array.isArray(upcoming)) return [];
+		return upcoming
+			.filter((entry) => entry?.provider === "queue")
+			.map((entry) => entry.contextTrack?.uri ?? entry.uri)
+			.filter((uri) => uri && uri !== pendingAuto);
+	}
+
+	function userQueueHasItems() {
+		return userQueueUris().length > 0;
+	}
+
+	// What the user had queued a moment ago. Spotify's queue has already moved on when songchange fires, so a
+	// jump to one of these is the user's own queue, not a skip into the Local Files context.
+	let userQueueSnapshot = new Set();
+	setInterval(() => {
+		userQueueSnapshot = new Set(userQueueUris());
+	}, 1000);
+
+	async function runQueueRecommendation(key) {
+		if (!config.autoRecommend || !recommendation || recommendation.key !== key) return "skip";
+		if (!(state.autoChain || inLocalFilesContext())) return "skip"; // a playlist, an album or a queue decides what follows
+		if (Spicetify.Player.getRepeat?.() > 0) return "skip"; // repeat is on
+		if (userQueueHasItems()) return "skip";
+		try {
+			const result = await Promise.race([recommendation.promise, sleep(RECOMMEND_WAIT_MS).then(() => null)]);
+			if (!result) throw new Error("the recommendation was not ready in time");
+			if (!state.current || trackKey(state.current) !== key) return "skip"; // another track took over meanwhile
+			await queuePlaceholder(result.uri, true);
+			pendingAuto = result.uri;
+			rememberRecent(result.track);
+			debug("recommend", `queued ${trackKey(result.track)} "${result.track.title}" after ${key}`);
+			return "queued";
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] could not queue the recommendation", error);
+			return "failed";
+		}
+	}
+
+	// Puts the recommendation of the active track in front of Spotify's queue, once per track.
+	// Resolves with "queued", "skip" (Spotify decides what follows) or "failed".
+	function queueRecommendation() {
+		const key = state.current && trackKey(state.current);
+		if (!key) return Promise.resolve("skip");
+		if (queueJob?.key !== key) queueJob = { key, promise: runQueueRecommendation(key) };
+		return queueJob.promise;
+	}
+
+	// Shortly before the end of a track the recommendation goes into Spotify's queue. Doing it this early leaves
+	// time for the queue API, which is slower than the last second of the placeholder.
+	setInterval(() => {
+		if (state.status !== "playing" || !state.current || state.holding) return;
+		if (queueJob?.key === trackKey(state.current)) return;
+		const remaining = trackDurationSec() - spotifyPosition();
+		if (remaining > 0 && remaining <= RECOMMEND_LEAD_SECONDS) queueRecommendation();
+	}, 1000);
+
+	// ---- Skipping (Spotify's own next button, media keys) ----
+	// Spotify moves to the next local file on its own, and songchange tells us afterwards. So when our active track
+	// is left for another placeholder that nobody queued, that placeholder is stopped and the recommendation is
+	// played instead.
+	function isSkipIntoLocalFiles(prev, now) {
+		if (!config.autoRecommend || state.status === "idle" || !state.current || prev.uri !== state.placeholderUri) return false;
+		if (!recommendation || recommendation.key !== trackKey(state.current)) return false;
+		if (!(state.autoChain || inLocalFilesContext())) return false;
+		if (Spicetify.Player.getRepeat?.() > 0) return false;
+		return now.uri !== pendingAuto && !userQueueSnapshot.has(now.uri);
+	}
+
+	// True when Spotify went back to the track that was playing before (the previous button), not forward.
+	function movedBackTo(prevUri) {
+		const next = Spicetify.Queue?.nextTracks?.[0];
+		return (next?.contextTrack?.uri ?? next?.uri) === prevUri;
+	}
+
+	async function redirectSkipToRecommendation(prev) {
+		const job = recommendation;
+		const token = playToken;
+		// The next local file is a silent placeholder: keep it from running while this is sorted out.
+		state.suppressUntil = Date.now() + 500;
+		state.advancingUntil = Date.now() + RECOMMEND_WAIT_MS + 2500;
+		Spicetify.Player.pause();
+		await sleep(250); // Spotify's queue needs a moment to show which way it moved
+		if (token !== playToken) return;
+		if (movedBackTo(prev.uri)) {
+			// The previous button: nothing to redirect, play what Spotify went back to.
+			state.advancingUntil = 0;
+			startFromPlaceholder();
+			return;
+		}
+		let result = null;
+		try {
+			result = await Promise.race([job.promise, sleep(RECOMMEND_WAIT_MS).then(() => null)]);
+		} catch {
+			// reported by prepareRecommendation
+		}
+		if (token !== playToken) return;
+		state.advancingUntil = 0;
+		state.suppressUntil = 0; // the songchange of the recommendation must not be ignored
+		stopTrack(false);
+		if (!result) {
+			notify(t("recommendFailed"), true); // Spotify stays paused on the local file
+			return;
+		}
+		rememberRecent(result.track);
+		debug("recommend", `skip: playing ${trackKey(result.track)} "${result.track.title}" instead of ${prev.uri}`);
+		try {
+			await playPlaceholder(result.uri, placeholderTitle(result.track));
+		} catch (error) {
+			reportPlaceholderError(error);
+		}
+	}
+
 	// The player (the audio element or the PCM engine) has played to the end.
-	function handlePlayerEnded() {
+	async function handlePlayerEnded() {
 		if (state.status === "idle" || state.holding || readSpotify().uri !== state.placeholderUri) return;
+		const token = playToken;
+		const outcome = await queueRecommendation();
+		if (token !== playToken || state.status === "idle") return; // another track took over while waiting
+		if (outcome === "failed") {
+			// Letting Spotify move on would play an arbitrary local file, so stop here instead.
+			notify(t("recommendFailed"), true);
+			closeTrack();
+			return;
+		}
 		// Let Spotify run out its placeholder by itself, so that repeat and shuffle apply as usual.
 		const duration = Spicetify.Player.getDuration();
 		if (duration - spotifyPosition() * 1000 > 300) seekSpotify((duration - 150) / 1000);
@@ -3584,9 +3797,13 @@
 	// real track (see startFromPlaceholder).
 	async function playPlaceholder(uri, title) {
 		// A local file can only be played inside the Local Files context, so start that context at the placeholder.
+		localStartUri = uri; // startFromPlaceholder reads this: such a track is followed by a recommendation
 		for (const attempt of [
 			() => Spicetify.Player.playUri(LOCAL_FILES_CONTEXT, {}, { skipTo: { uri } }),
-			() => Spicetify.Player.playUri(uri),
+			() => {
+				localStartUri = null;
+				return Spicetify.Player.playUri(uri);
+			},
 		]) {
 			try {
 				await attempt();
@@ -3737,6 +3954,11 @@
 		if (Spicetify.Player.data?.item?.uri !== uri) return; // Spotify moved on while we were searching
 
 		state.placeholderUri = uri;
+		// Started on its own in the Local Files context, or it is the recommendation that was queued: either way a
+		// recommendation follows. A track that comes from a playlist or from the user's queue keeps that order.
+		state.autoChain = uri === localStartUri || uri === pendingAuto;
+		if (uri === localStartUri) localStartUri = null;
+		if (uri === pendingAuto) pendingAuto = null;
 		state.holding = true; // Spotify stays paused on the placeholder until the audio is ready (see releaseClock)
 		playTrack({ ...track });
 	}
@@ -3779,7 +4001,8 @@
 
 		// One of our placeholders started: stream the real track instead.
 		if (isPlaceholderItem()) {
-			startFromPlaceholder();
+			if (isSkipIntoLocalFiles(prev, now)) redirectSkipToRecommendation(prev);
+			else startFromPlaceholder();
 			return;
 		}
 
