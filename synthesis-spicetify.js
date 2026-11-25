@@ -89,6 +89,8 @@
 		// When a track that was started on its own ends, play its service's next recommendation instead of
 		// letting Spotify move on to the next local file.
 		autoRecommend: true,
+		// Delete placeholder files that no playlist, queue or session uses any more (see cleanupPlaceholders).
+		autoCleanup: true,
 	};
 
 	const CONFIG_VERSION = 6;
@@ -193,6 +195,16 @@
 			playbackDesc: "オフの間は公開 Wisp だけを使い、検索結果の表示と「ブラウザで開く」のみ使えます。再生にはローカル Wisp サーバーが必要です。",
 			autoRecommendLabel: "自動再生",
 			autoRecommendDesc: "検索から再生した曲が終わったとき、または次へを押したときに、次の配信元のおすすめの曲を再生します。プレイリストやキューからの再生には影響しません。",
+			cleanupLabel: "ダミー曲を自動整理",
+			cleanupDesc: "起動してしばらく後に、どのプレイリスト・キューからも使われていない古いダミー曲ファイル(24時間以上前のもの)を削除します。プレイリストに入っている曲は消しません。",
+			cleanupNow: "今すぐ整理",
+			cleanupDone: (n, mb) => `ダミー曲を ${n} 件整理しました(${mb} MB)`,
+			cleanupNothing: "整理できるダミー曲はありませんでした",
+			cleanupNoFolder: "ダミー曲のフォルダがまだ選ばれていません。曲を一度再生するか保存すると選べます。",
+			cleanupPermission: "ダミー曲フォルダへのアクセスが許可されませんでした",
+			cleanupUnsafe: "プレイリストの内容を確認できなかったため、整理を中止しました(何も削除していません)",
+			cleanupBusy: "ダミー曲を作成中のため、あとでもう一度お試しください",
+			cleanupFailed: "ダミー曲の整理に失敗しました",
 			playbackOffNotice: "再生機能はオフです。検索結果の表示と「ブラウザで開く」のみ使えます。",
 			playbackDisabled: "再生機能がオフです。設定で「再生機能を有効化」をオンにしてください。",
 			playbackOnToast: "再生機能を有効にしました",
@@ -272,6 +284,16 @@
 			playbackDesc: "While off, only public Wisp proxies are used: you can search and open results in the browser, but not play them. Playback needs a local Wisp server.",
 			autoRecommendLabel: "Autoplay",
 			autoRecommendDesc: "When a song played from a search ends, or when you tap Next, the next recommended song from that source will play. This does not affect playback from playlists or queues.",
+			cleanupLabel: "Tidy up placeholders automatically",
+			cleanupDesc: "Shortly after startup, deletes old placeholder files (older than 24 hours) that no playlist or queue uses. Songs that are in a playlist are never deleted.",
+			cleanupNow: "Tidy up now",
+			cleanupDone: (n, mb) => `Removed ${n} placeholder file(s) (${mb} MB)`,
+			cleanupNothing: "No placeholder files to remove",
+			cleanupNoFolder: "No placeholder folder has been chosen yet. It can be chosen when a song is first played or saved.",
+			cleanupPermission: "Access to the placeholder folder was not granted",
+			cleanupUnsafe: "Could not read the playlists, so the cleanup was cancelled (nothing was deleted)",
+			cleanupBusy: "A placeholder is being made right now. Try again in a moment.",
+			cleanupFailed: "Could not tidy up the placeholders",
 			playbackOffNotice: "Playback is off. You can search and open results in the browser.",
 			playbackDisabled: "Playback is off. Turn on \"Enable playback\" in the settings.",
 			playbackOnToast: "Playback enabled",
@@ -3627,7 +3649,8 @@
 		const { uri: expected, seconds } = pickLocalUri(track, knownSeconds(track) ?? base);
 
 		// A placeholder that Spotify already lists is reused as it is. No file access is needed then.
-		let uri = await findIndexedUri(expected);
+		// (a file that the cleanup deleted may still be listed for a while, so it is written again)
+		let uri = recentlyDeleted.has(title) ? null : await findIndexedUri(expected);
 		if (!uri) {
 			if (busyText) notify(busyText);
 			const dir = await getPlaceholderDir();
@@ -3637,6 +3660,7 @@
 			const writable = await handle.createWritable();
 			await writable.write(makeSilentMp3({ artist, album: PLACEHOLDER_ALBUM, title, seconds }));
 			await writable.close();
+			recentlyDeleted.delete(title);
 			uri = await waitForLocalUri(expected, { artist, title, seconds });
 			if (!uri) throw new Error(t("saveNotIndexed"));
 		}
@@ -3665,6 +3689,142 @@
 		await Spicetify.Platform.PlaylistAPI.add(playlist.uri, [uri], { after: "end" });
 		rememberSaved(uri, snapshotTrack(track));
 		notify(t("savedToPlaylist", playlist.name));
+	}
+
+	// ---- Placeholder cleanup: removing placeholder files that nothing refers to any more ----
+	// Every played or queued track leaves a silent MP3 behind in the placeholder folder. A file is only needed
+	// while something still points at it, so the ones that no playlist, queue or session uses are deleted.
+	// Anything that cannot be ruled out as "in use" is kept: a failed lookup cancels the whole cleanup.
+
+	const CLEANUP_MIN_AGE_MS = 24 * 60 * 60 * 1000; // newer files may still be in a queue that is being built
+	const recentlyDeleted = new Set(); // title tags of files deleted this session: Spotify's index may still list them
+	let cleanupJob = null;
+
+	// The title tag inside a spotify:local:<artist>:<album>:<title>:<seconds> URI, or null.
+	function titleOfLocalUri(uri) {
+		const parts = String(uri ?? "").split(":");
+		if (parts[0] !== "spotify" || parts[1] !== "local" || parts.length < 6) return null;
+		try {
+			return decodeURIComponent(parts[4].replace(/\+/g, " "));
+		} catch {
+			return null;
+		}
+	}
+
+	// Title tags of every placeholder that may still be needed. Throws when that cannot be determined for sure.
+	async function collectProtectedTitles() {
+		const used = new Set();
+		const add = (title) => {
+			if (title && parsePlaceholderTitle(title)) used.add(String(title).trim());
+		};
+		const addItem = (item) => {
+			const uri = item?.uri;
+			if (typeof uri !== "string" || !uri.startsWith("spotify:local:")) return;
+			add(titleOfLocalUri(uri));
+			add(item.name);
+		};
+
+		// Made or saved by this extension (saved ones are a second line of defence in case the playlist read is incomplete)
+		for (const track of [...placeholderTracks.values(), ...Object.values(savedTracks)]) {
+			if (providers[track?.provider]) add(placeholderTitle(track));
+		}
+		// What Spotify is playing or about to play
+		addItem({ uri: Spicetify.Player.data?.item?.uri, name: Spicetify.Player.data?.item?.name });
+		addItem({ uri: state.placeholderUri });
+		for (const entry of Spicetify.Queue?.nextTracks ?? []) addItem(entry?.contextTrack);
+
+		// Every playlist of the library
+		const rootlist = Spicetify.Platform?.RootlistAPI;
+		const playlistApi = Spicetify.Platform?.PlaylistAPI;
+		if (typeof rootlist?.getContents !== "function" || typeof playlistApi?.getContents !== "function") {
+			throw new Error("playlist APIs are not available");
+		}
+		for (const playlist of await listPlaylists()) {
+			const contents = await playlistApi.getContents(playlist.uri);
+			const items = contents?.items;
+			if (!Array.isArray(items)) throw new Error(`unreadable playlist ${playlist.uri}`);
+			const total = contents.totalLength ?? contents.total;
+			if (typeof total === "number" && items.length < total) throw new Error(`truncated playlist ${playlist.uri}`);
+			items.forEach(addItem);
+		}
+		return used;
+	}
+
+	// The stored folder handle with write permission, or null. Only `interactive` calls (made from a click) may
+	// show the permission prompt; the folder picker is never opened here.
+	async function getCleanupDir(interactive) {
+		const dir = await handleStore("readonly", (store) => store.get("dir"));
+		if (!dir) return { status: "nofolder" };
+		let permission = await dir.queryPermission({ mode: "readwrite" });
+		if (permission !== "granted" && interactive) permission = await dir.requestPermission({ mode: "readwrite" });
+		return permission === "granted" ? { dir } : { status: "permission" };
+	}
+
+	async function runCleanup(interactive) {
+		if (placeholderJobs.size) return { status: "busy" };
+		const folder = await getCleanupDir(interactive);
+		if (!folder.dir) return { status: folder.status };
+		const { dir } = folder;
+
+		let used;
+		try {
+			used = await collectProtectedTitles();
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] placeholder cleanup cancelled: could not tell which files are in use", error);
+			return { status: "unsafe" };
+		}
+
+		const stale = [];
+		for await (const [name, handle] of dir.entries()) {
+			if (handle.kind !== "file") continue;
+			// Only files named like the ones makePlaceholder writes ("<title>-<seconds>.mp3") are touched
+			const match = /^(.+)-(\d+)\.mp3$/.exec(name);
+			const parsed = match && parsePlaceholderTitle(match[1]);
+			if (!parsed || used.has(match[1])) continue;
+			const file = await handle.getFile();
+			if (Date.now() - file.lastModified < CLEANUP_MIN_AGE_MS) continue;
+			stale.push({ name, title: match[1], size: file.size });
+		}
+
+		let removed = 0;
+		let bytes = 0;
+		for (const { name, title, size } of stale) {
+			if (placeholderJobs.size) break; // a placeholder is being made: stop and leave the rest for next time
+			try {
+				await dir.removeEntry(name);
+				recentlyDeleted.add(title);
+				removed++;
+				bytes += size;
+			} catch (error) {
+				console.warn(`[Synthesis Spicetify] could not delete ${name}`, error);
+			}
+		}
+		return { status: "done", removed, bytes };
+	}
+
+	// Runs one cleanup at a time. Never throws; the result tells what happened.
+	function cleanupPlaceholders({ interactive = false } = {}) {
+		cleanupJob ??= runCleanup(interactive)
+			.catch((error) => {
+				console.warn("[Synthesis Spicetify] placeholder cleanup failed", error);
+				return { status: "failed" };
+			})
+			.finally(() => {
+				cleanupJob = null;
+			});
+		return cleanupJob;
+	}
+
+	function reportCleanup(result, interactive) {
+		if (result.status === "done") {
+			if (result.removed) notify(t("cleanupDone", result.removed, (result.bytes / 1048576).toFixed(1)));
+			else if (interactive) notify(t("cleanupNothing"));
+			return;
+		}
+		// A background run stays quiet unless something was actually removed
+		if (!interactive) return;
+		const keys = { nofolder: "cleanupNoFolder", permission: "cleanupPermission", unsafe: "cleanupUnsafe", busy: "cleanupBusy" };
+		notify(t(keys[result.status] ?? "cleanupFailed"), result.status !== "nofolder" && result.status !== "busy");
 	}
 
 	// ---- Playlist picker (small popup next to the save button) ----
@@ -5163,6 +5323,40 @@
 		};
 	}
 
+	// The "Tidy up placeholders" switch (applies at once) and a button that runs the cleanup now.
+	function createCleanupSection() {
+		const input = h("input", { type: "checkbox" });
+		input.checked = config.autoCleanup;
+		input.addEventListener("change", () => saveConfig({ autoCleanup: input.checked }));
+		const button = h(
+			"button",
+			{
+				class: "ss-secondary",
+				style: "margin-top:8px",
+				// Made from a click, so the folder permission prompt is allowed here
+				onClick: async () => {
+					button.disabled = true;
+					try {
+						reportCleanup(await cleanupPlaceholders({ interactive: true }), true);
+					} finally {
+						button.disabled = false;
+					}
+				},
+			},
+			t("cleanupNow")
+		);
+		return {
+			nodes: [
+				h("label", { class: "ss-toggle", style: "margin-top:16px" }, h("span", { class: "ss-switch" }, input, h("span", {})), t("cleanupLabel")),
+				h("div", { class: "ss-desc" }, t("cleanupDesc")),
+				button,
+			],
+			reset() {
+				input.checked = config.autoCleanup;
+			},
+		};
+	}
+
 	function openSettings() {
 		const wisp = h("textarea", { rows: "3" });
 		wisp.value = config.wispServers.join("\n");
@@ -5210,6 +5404,7 @@
 
 		const playbackSection = createPlaybackSection();
 		const recommendSection = createRecommendSection();
+		const cleanupSection = createCleanupSection();
 		const resetButton = createConfirmButton(t("resetSettings"), t("resetConfirm"), () => {
 			// Defaults have playback off, so stop the current track like the switch does.
 			if (config.playbackEnabled && state.status !== "idle") closeTrack();
@@ -5221,6 +5416,7 @@
 			output.textContent = "";
 			playbackSection.reset();
 			recommendSection.reset();
+			cleanupSection.reset();
 			resetNetwork();
 			renderSearch();
 			notify(t("resetDone"));
@@ -5231,6 +5427,7 @@
 			{ class: "ss-settings" },
 			...playbackSection.nodes,
 			...recommendSection.nodes,
+			...cleanupSection.nodes,
 			h("label", {}, t("wispLabel")),
 			wisp,
 			h("label", {}, t("clientsLabel")),
@@ -5287,6 +5484,12 @@
 				.catch((error) => console.warn(`[Synthesis Spicetify] ${provider.label} warm-up failed`, error));
 		}
 	});
+
+	// Tidy up leftover placeholder files a while after startup, once Spotify's playlists and queue can be read.
+	setTimeout(() => {
+		if (!config.autoCleanup || !config.playbackEnabled || !config.placeholderFolder) return;
+		cleanupPlaceholders().then((result) => reportCleanup(result, false));
+	}, 30000);
 
 	window.SynthesisSpicetify = { version: VERSION, state, get config() { return config; }, providers, runDiagnostics };
 	console.log(`[Synthesis Spicetify] ${VERSION} loaded`);
