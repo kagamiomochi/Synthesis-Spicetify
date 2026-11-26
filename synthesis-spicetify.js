@@ -2803,13 +2803,15 @@
 		const url = peekAudioUrl(track);
 		if (!url || token !== playToken) return false;
 		const wasPlaying = !player.paused;
+		const switchedAt = performance.now();
 		detachStream();
 		audio.src = url;
 		audio.addEventListener(
 			"loadedmetadata",
 			() => {
 				if (token !== playToken) return;
-				audio.currentTime = position;
+				// Spotify's clock keeps running while the Blob loads, so resuming at the old position would rewind.
+				audio.currentTime = wasPlaying ? position + (performance.now() - switchedAt) / 1000 : position;
 				if (wasPlaying) audio.play().catch(() => {});
 			},
 			{ once: true }
@@ -3063,6 +3065,9 @@
 	}
 
 	const SYNC_TOLERANCE = 0.4; // seconds the audio may be off Spotify's position before it is moved
+	const REWIND_CONFIRM_MAX = 5; // a rewind of up to this many seconds is treated as possible clock jitter first
+	const REWIND_CONFIRM_MS = 600; // ...and is only followed when it lasts this long
+	let rewindSince = 0; // when the audio first got ahead of Spotify's clock (0 = not ahead)
 	const RESUME_MARGIN = 1.5; // seconds that must be downloaded beyond a position before the clock runs from there
 
 	// True when the audio can play from this position right now (it is downloaded far enough).
@@ -3126,11 +3131,23 @@
 
 		// Spotify runs. After the audio has ended, Spotify may still be inside the last seconds of its placeholder.
 		const tail = player.ended && position >= player.currentTime - 2;
-		if (!tail && Math.abs(player.currentTime - position) > SYNC_TOLERANCE) {
+		const drift = player.currentTime - position; // > 0: the audio is ahead of Spotify's clock
+		let follow = !tail && Math.abs(drift) > SYNC_TOLERANCE;
+		if (follow && drift > 0 && drift < REWIND_CONFIRM_MAX) {
+			// Spotify's position is only extrapolated from its last state update, so it can dip for a moment.
+			// Following such a dip rewinds the audio, so a small rewind has to last before it is followed.
+			rewindSince ||= Date.now();
+			if (Date.now() - rewindSince < REWIND_CONFIRM_MS) follow = false;
+		} else {
+			rewindSince = 0;
+		}
+		if (follow) {
 			if (!audioCanPlayAt(position)) {
 				holdClock();
 				return;
 			}
+			debug("sync", `seek audio ${player.currentTime.toFixed(2)} -> ${position.toFixed(2)} (drift ${drift.toFixed(2)}s)`);
+			rewindSince = 0;
 			seekAudio(position);
 		}
 		if (player.paused && !tail) player.play().catch(() => {});
