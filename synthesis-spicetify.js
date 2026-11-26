@@ -91,6 +91,8 @@
 		autoRecommend: true,
 		// Delete placeholder files that no playlist, queue or session uses any more (see cleanupPlaceholders).
 		autoCleanup: true,
+		// At startup, bring back the track that was playing last (paused, at its saved position; see restoreLastTrack).
+		restoreOnStart: true,
 	};
 
 	const CONFIG_VERSION = 6;
@@ -195,6 +197,8 @@
 			playbackDesc: "オフの間は公開 Wisp だけを使い、検索結果の表示と「ブラウザで開く」のみ使えます。再生にはローカル Wisp サーバーが必要です。",
 			autoRecommendLabel: "自動再生",
 			autoRecommendDesc: "検索から再生した曲が終わったとき、または次へを押したときに、次の配信元のおすすめの曲を再生します。プレイリストやキューからの再生には影響しません。",
+			restoreLabel: "前回の曲を復元",
+			restoreDesc: "起動時に、前回再生していた曲を一時停止の状態で、保存した位置に戻します。再生ボタンを押すとそこから再生します。",
 			cleanupLabel: "ダミー曲を自動整理",
 			cleanupDesc: "起動してしばらく後に、どのプレイリスト・キューからも使われていない古いダミー曲ファイル(24時間以上前のもの)を削除します。プレイリストに入っている曲は消しません。",
 			cleanupNow: "今すぐ整理",
@@ -284,6 +288,8 @@
 			playbackDesc: "While off, only public Wisp proxies are used: you can search and open results in the browser, but not play them. Playback needs a local Wisp server.",
 			autoRecommendLabel: "Autoplay",
 			autoRecommendDesc: "When a song played from a search ends, or when you tap Next, the next recommended song from that source will play. This does not affect playback from playlists or queues.",
+			restoreLabel: "Restore the last track",
+			restoreDesc: "At startup, puts the track that was playing last back, paused at its saved position. Press play to continue from there.",
 			cleanupLabel: "Tidy up placeholders automatically",
 			cleanupDesc: "Shortly after startup, deletes old placeholder files (older than 24 hours) that no playlist or queue uses. Songs that are in a playlist are never deleted.",
 			cleanupNow: "Tidy up now",
@@ -2063,6 +2069,38 @@
 		}
 	}
 
+	// ---- The track that was playing last, so that it can be brought back when Spotify is opened again ----
+	// Spotify does not restore a local file (our placeholder) by itself, so the track, its placeholder URI and the
+	// position are kept in localStorage. A regular Spotify track that is played later removes the record again,
+	// because Spotify restores that one on its own.
+	const LAST_KEY = "synthesis-spicetify:last";
+
+	function loadLastPlayed() {
+		try {
+			const last = JSON.parse(localStorage.getItem(LAST_KEY) || "null");
+			if (!last?.track?.provider || !last.track.id || typeof last.uri !== "string") return null;
+			return last;
+		} catch {
+			return null;
+		}
+	}
+
+	function saveLastPlayed(track, uri, seconds) {
+		try {
+			localStorage.setItem(LAST_KEY, JSON.stringify({ track: snapshotTrack(track), uri, position: Math.max(0, Math.floor(seconds || 0)), savedAt: Date.now() }));
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] failed to store the last track", error);
+		}
+	}
+
+	function clearLastPlayed() {
+		try {
+			localStorage.removeItem(LAST_KEY);
+		} catch {
+			// Nothing to do: the record is only a convenience.
+		}
+	}
+
 	const displayInfo = new Map(); // placeholder title tag (see placeholderTitle) -> { title, artist, album, thumbnail, letterbox }
 
 	// What Spotify's rows show for a track's placeholder. Without a stored cover, the service's own thumbnail for
@@ -2936,7 +2974,7 @@
 
 	// Streams the real track. Only called once Spotify has started a placeholder (see startFromPlaceholder), and
 	// Spotify has already been paused on it by then.
-	async function playTrack(track) {
+	async function playTrack(track, startAt = 0) {
 		const token = ++playToken;
 		const previous = state.current;
 		// A download that is still running (also while it is streamed) is dropped when another track takes over.
@@ -2980,9 +3018,14 @@
 				if (token !== playToken) return;
 			}
 
+			// Continuing a restored track: the audio waits until the download has reached the saved position.
+			if (startAt >= 1) await seekWhenBuffered(startAt, token);
+			if (token !== playToken) return;
+
 			state.status = "playing";
 			consecutiveFailures = 0;
 			releaseClock();
+			persistLastPlayed();
 			syncPlayerUi();
 			prefetchNext();
 			prepareRecommendation(track);
@@ -3001,6 +3044,34 @@
 			stopTrack(true);
 		}
 	}
+
+	// Moves the audio to a position that has not been downloaded yet, once it has been. The audio is paused meanwhile,
+	// and Spotify's clock stays held (see startFromPlaceholder), so nothing is heard from the start of the track.
+	async function seekWhenBuffered(seconds, token) {
+		const duration = trackDurationSec();
+		if (duration > 0 && seconds > duration - 3) return; // the track had practically ended: play it from the start
+		player.pause();
+		const deadline = Date.now() + 30000;
+		while (token === playToken && !audioCanPlayAt(seconds) && Date.now() < deadline) await sleep(200);
+		// A switch from the stream to the finished Blob (see switchToBlob) may put the old position back once
+		// its metadata has loaded, so the position is checked and set again when it did not hold.
+		for (let i = 0; i < 10 && token === playToken; i++) {
+			seekAudio(seconds);
+			await sleep(250);
+			if (Math.abs(player.currentTime - seconds) < 1) break;
+		}
+		if (token === playToken) player.play().catch(() => {});
+	}
+
+	// Remembers the active track and its position (Spotify's clock) as the track to bring back at the next start.
+	function persistLastPlayed() {
+		if (!config.restoreOnStart || !state.current || !state.placeholderUri) return;
+		if (state.status !== "playing" && state.status !== "paused") return;
+		if (readSpotify().uri !== state.placeholderUri) return;
+		saveLastPlayed(state.current, state.placeholderUri, spotifyPosition());
+	}
+	setInterval(persistLastPlayed, 3000);
+	window.addEventListener("beforeunload", persistLastPlayed);
 
 	// Downloads the next item of Spotify's queue ahead of time when it is one of our placeholders, so that
 	// it starts without a wait. The queue API is internal, so this is best effort only.
@@ -3756,6 +3827,9 @@
 		for (const track of [...placeholderTracks.values(), ...Object.values(savedTracks)]) {
 			if (providers[track?.provider]) add(placeholderTitle(track));
 		}
+		// The track that is brought back at the next start
+		const last = loadLastPlayed();
+		if (last && providers[last.track.provider]) add(placeholderTitle(last.track));
 		// What Spotify is playing or about to play
 		addItem({ uri: Spicetify.Player.data?.item?.uri, name: Spicetify.Player.data?.item?.name });
 		addItem({ uri: state.placeholderUri });
@@ -3989,6 +4063,7 @@
 	// real track (see startFromPlaceholder).
 	async function playPlaceholder(uri, title) {
 		// A local file can only be played inside the Local Files context, so start that context at the placeholder.
+		pendingResume = null; // a track chosen now starts from the beginning
 		localStartUri = uri; // startFromPlaceholder reads this: such a track is followed by a recommendation
 		startingUri = uri; // songchange reads this: leaving the active track for it is not a skip
 		setTimeout(() => {
@@ -4106,8 +4181,26 @@
 		const item = Spicetify.Player.data?.item;
 		const uri = item?.uri;
 		if (!uri || (state.status !== "idle" && uri === state.placeholderUri)) return; // already handling it
+		if (parking) return; // the restored placeholder is being parked: Spotify's own start events are not a play press
 		state.suppressUntil = Date.now() + 500; // our own pause must not look like a user action
 		Spicetify.Player.pause();
+
+		// The placeholder of the track from the last session: leave Spotify paused at the saved position. Nothing is
+		// downloaded until play is pressed, which comes back here and continues from where Spotify's clock is.
+		if (restoreHold && (uri === restoreHold.uri || item.name === restoreHold.title)) {
+			const { seconds } = restoreHold;
+			restoreHold = null;
+			debug("restore", "parking Spotify", { uri, seconds });
+			pendingResume = { uri, seconds, parked: false };
+			parkAt(seconds);
+			return;
+		}
+		// Continue where Spotify's clock was parked (the user may have moved it); when parking did not succeed, at the saved position.
+		const resume = pendingResume?.uri === uri ? pendingResume : null;
+		const resumeAt = resume ? (resume.parked ? spotifyPosition() : resume.seconds) : 0;
+		debug("restore", "start from placeholder", { resumeAt, resumed: Boolean(resume) });
+		pendingResume = null;
+
 		let track = savedTracks[uri] ?? placeholderTracks.get(uri);
 		// No stored mapping (for example the extension data was cleared): the title tag names the service and
 		// the ID, and playback only needs those.
@@ -4156,7 +4249,94 @@
 		if (uri === localStartUri) localStartUri = null;
 		if (uri === pendingAuto) pendingAuto = null;
 		state.holding = true; // Spotify stays paused on the placeholder until the audio is ready (see releaseClock)
-		playTrack({ ...track });
+		playTrack({ ...track }, resumeAt);
+	}
+
+	let restoreHold = null; // { uri, title, seconds } the restored placeholder that startFromPlaceholder is to park
+	let pendingResume = null; // { uri } the placeholder Spotify is parked on: its next start continues at Spotify's position
+	let restoreSettled = false; // the start-up restore is over (until then Spotify's own start-up events say nothing)
+	let parking = false; // Spotify is being put on the saved position (see parkAt)
+
+	// Puts Spotify's clock at a position while it is paused.
+	async function parkAt(seconds) {
+		parking = true;
+		try {
+			for (let i = 0; i < 6; i++) {
+				state.suppressUntil = Date.now() + 500;
+				if (Spicetify.Player.isPlaying()) Spicetify.Player.pause();
+				seekSpotify(seconds);
+				await sleep(300);
+				if (Math.abs(spotifyPosition() - seconds) < 2) {
+					if (pendingResume) pendingResume.parked = true;
+					break;
+				}
+			}
+			debug("restore", "parked", { wanted: seconds, at: spotifyPosition(), playing: Spicetify.Player.isPlaying() });
+			// Spotify's own start of the placeholder may still send events: keep it paused until they are over.
+			for (let i = 0; i < 4; i++) {
+				state.suppressUntil = Date.now() + 500;
+				if (Spicetify.Player.isPlaying()) Spicetify.Player.pause();
+				await sleep(300);
+			}
+		} finally {
+			parking = false;
+		}
+	}
+
+	// The URI Spotify's local file index has for the placeholder of the last track, or null while it is not listed.
+	async function findRestorableUri(last) {
+		const api = Spicetify.Platform?.LocalFilesAPI;
+		if (typeof api?.getTracks !== "function") return last.uri;
+		try {
+			const tracks = (await api.getTracks()) ?? [];
+			const title = placeholderTitle(last.track);
+			const found = tracks.find((track) => track.uri === last.uri) ?? tracks.find((track) => track.name === title && track.album?.name === PLACEHOLDER_ALBUM);
+			return found?.uri ?? null;
+		} catch (error) {
+			console.warn("[Synthesis Spicetify] local files index not readable", error);
+			return null;
+		}
+	}
+
+	// Brings back the track of the last session: Spotify is moved onto its placeholder and left paused at the saved
+	// position. The track itself is only streamed once play is pressed. Nothing is restored while playback is off,
+	// while something is already playing, or when the placeholder file is gone (the folder dialog needs a click).
+	async function restoreLastTrack() {
+		try {
+			debug("restore", "start", { playbackEnabled: config.playbackEnabled, restoreOnStart: config.restoreOnStart });
+			if (!config.restoreOnStart) return debug("restore", "skipped: the setting is off");
+			if (!config.playbackEnabled) return debug("restore", "skipped: playback is switched off");
+			const last = loadLastPlayed();
+			if (!last || !providers[last.track.provider]) return debug("restore", "skipped: no usable record", last);
+			await sleep(3000); // Spotify's player and the local files index need a moment after the start
+			let uri = null;
+			for (const deadline = Date.now() + 30000; Date.now() < deadline; await sleep(1000)) {
+				// isPlaying() is also true while Spotify has no item at all, so only an item that is playing counts.
+				const playingItem = Boolean(Spicetify.Player.data?.item) && Spicetify.Player.isPlaying();
+				if (playingItem || state.status !== "idle") {
+					return debug("restore", "skipped: something is already playing", { item: Spicetify.Player.data?.item?.uri, status: state.status });
+				}
+				uri = await findRestorableUri(last);
+				if (uri) break;
+			}
+			if (!uri) {
+				debug("restore", "the placeholder of the last track is not listed, nothing is restored");
+				return;
+			}
+			const title = placeholderTitle(last.track);
+			placeholderTracks.set(uri, snapshotTrack(last.track));
+			displayInfo.set(title, displayInfoOf(last.track));
+			debug("restore", "placing Spotify on the placeholder", { uri, seconds: last.position });
+			restoreHold = { uri, title, seconds: last.position };
+			setTimeout(() => (restoreHold = null), 10000); // it must not catch a track that is chosen much later
+			await playPlaceholder(uri, title);
+			debug("restore", "Spotify is on the placeholder", { item: Spicetify.Player.data?.item?.uri, parked: restoreHold === null });
+		} catch (error) {
+			restoreHold = null;
+			console.warn("[Synthesis Spicetify] could not restore the last track", error);
+		} finally {
+			restoreSettled = true;
+		}
 	}
 
 	let lastSpotify = readSpotify();
@@ -4196,6 +4376,7 @@
 		lastSpotify = now;
 		lastContext = playerContextUri();
 		if (!now.uri || now.uri === prev.uri) return;
+		if (pendingResume && now.uri !== pendingResume.uri) pendingResume = null;
 		if (Date.now() < state.suppressUntil) return;
 
 		// One of our placeholders started: stream the real track instead.
@@ -4205,7 +4386,9 @@
 			return;
 		}
 
-		// Spotify moved on to a regular track, or the user started something else: our track is over.
+		// Spotify moved on to a regular track, or the user started something else: our track is over, and Spotify
+		// itself restores what it plays now at the next start.
+		if (restoreSettled) clearLastPlayed();
 		if (state.status !== "idle") stopTrack(false);
 	});
 
@@ -5358,6 +5541,26 @@
 		};
 	}
 
+	// The "Restore the last track" switch. It applies at once: turning it off also deletes the saved track.
+	function createRestoreSection() {
+		const input = h("input", { type: "checkbox" });
+		input.checked = config.restoreOnStart;
+		input.addEventListener("change", () => {
+			saveConfig({ restoreOnStart: input.checked });
+			if (input.checked) persistLastPlayed(); // a track that is active right now is remembered from here on
+			else clearLastPlayed();
+		});
+		return {
+			nodes: [
+				h("label", { class: "ss-toggle", style: "margin-top:16px" }, h("span", { class: "ss-switch" }, input, h("span", {})), t("restoreLabel")),
+				h("div", { class: "ss-desc" }, t("restoreDesc")),
+			],
+			reset() {
+				input.checked = config.restoreOnStart;
+			},
+		};
+	}
+
 	// The "Tidy up placeholders" switch (applies at once) and a button that runs the cleanup now.
 	function createCleanupSection() {
 		const input = h("input", { type: "checkbox" });
@@ -5439,6 +5642,7 @@
 
 		const playbackSection = createPlaybackSection();
 		const recommendSection = createRecommendSection();
+		const restoreSection = createRestoreSection();
 		const cleanupSection = createCleanupSection();
 		const resetButton = createConfirmButton(t("resetSettings"), t("resetConfirm"), () => {
 			// Defaults have playback off, so stop the current track like the switch does.
@@ -5451,6 +5655,7 @@
 			output.textContent = "";
 			playbackSection.reset();
 			recommendSection.reset();
+			restoreSection.reset();
 			cleanupSection.reset();
 			resetNetwork();
 			renderSearch();
@@ -5462,6 +5667,7 @@
 			{ class: "ss-settings" },
 			...playbackSection.nodes,
 			...recommendSection.nodes,
+			...restoreSection.nodes,
 			...cleanupSection.nodes,
 			h("label", {}, t("wispLabel")),
 			wisp,
@@ -5520,12 +5726,15 @@
 		}
 	});
 
+	// Bring back the track of the last session (paused, at its saved position).
+	restoreLastTrack();
+
 	// Tidy up leftover placeholder files a while after startup, once Spotify's playlists and queue can be read.
 	setTimeout(() => {
 		if (!config.autoCleanup || !config.playbackEnabled || !config.placeholderFolder) return;
 		cleanupPlaceholders().then((result) => reportCleanup(result, false));
 	}, 30000);
 
-	window.SynthesisSpicetify = { version: VERSION, state, get config() { return config; }, providers, runDiagnostics };
+	window.SynthesisSpicetify = { version: VERSION, state, get config() { return config; }, providers, runDiagnostics, restoreLastTrack };
 	console.log(`[Synthesis Spicetify] ${VERSION} loaded`);
 })();

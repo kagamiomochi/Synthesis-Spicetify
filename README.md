@@ -15,6 +15,7 @@ A [Spicetify](https://spicetify.app/) extension that brings **YouTube Music** an
 - Search results get extra tabs ("Spotify", "YouTube Music", "SoundCloud"); the selected tab is kept while you change the query
 - Play, play next, add to queue, or save to a Spotify playlist
 - Non-Spotify tracks behave like normal Spotify tracks: Spotify's own player bar, queue, playlists, seek bar, previous / next, repeat and shuffle all work (see [How it plays](#how-it-plays))
+- Restores the track you were listening to when Spotify is opened again (paused, at the position where you left off)
 - Playback is opt-in. Without the local Wisp server you can still search and open results in the browser.
 
 ## Installation
@@ -61,6 +62,15 @@ More options and details: [Local Wisp launcher](#local-wisp-launcher).
 3. Queued tracks appear in Spotify's own queue panel, where you can reorder or remove them.
 4. While a non-Spotify track is active, Spotify's play button toggles its play/pause. Next / previous move to the next / previous item of the queue or playlist, Spotify track or not.
 
+### Restoring the last track
+
+Spotify does not bring back a local file when it starts, so a non-Spotify track would be gone after a restart. The extension therefore remembers the track you were playing and its position (every few seconds) and puts it back at the next start: Spotify is moved onto the track's placeholder and left **paused** at the saved position. Nothing is downloaded until you press play, which then continues from that position (for a long track it can take a few seconds until the download has reached it). You can move the seek bar before pressing play.
+
+- The saved record is replaced as soon as you play something else, and removed when you play a regular Spotify track, because Spotify restores those itself.
+- Nothing is restored while playback is off, when something is already playing, or when the track's placeholder file no longer exists (for example after the automatic tidy-up of an unused file; the file of the last track is kept).
+- The playlist or album the track came from is not restored: the track starts on its own, so its service's recommendation follows it (see Autoplay).
+- It can be turned off in [Settings](#settings). Turning it off deletes the saved record.
+
 ### How it plays
 
 Spotify's player, queue and playlists can only hold Spotify tracks and local files. So the extension creates a **silent local file** for every track you play, queue or save (artist "YouTube" or "SoundCloud", album "Synthesis", the track ID as the title) and hands it to Spotify like any local track. When Spotify starts it, the extension pauses Spotify and streams the real track instead. When the track ends, Spotify moves on to whatever follows. The extension rewrites the displayed title, artist and cover in Spotify's rows, queue, now playing panel and player bar; the files and Spotify's data are not changed.
@@ -80,6 +90,7 @@ Open the profile menu in Spotify and choose "Synthesis Spicetify settings". Chan
 | --- | --- |
 | **Enable playback** | Off by default. Turning it on shows the setup steps and checks `ws://localhost:6001/`. Turning it off stops the current track. |
 | **Autoplay** | When a track played from search ends (or you press Next), play the next recommendation from its service. Does not affect playlists or the queue. On by default. |
+| **Restore the last track** | At startup, put the track that was playing last back, paused at its saved position. Turning it off deletes the saved record. On by default. See [Restoring the last track](#restoring-the-last-track). |
 | **Tidy up placeholders automatically** | Shortly after startup, delete placeholder files older than 24 hours that no playlist or queue uses. **Tidy up now** runs it immediately. On by default. |
 | **Public Wisp proxies** | One per line, tried in order. Default: `wss://wisp.mercurywork.shop/`. While playback is enabled, the local server `ws://localhost:6001/` is tried first. |
 | **InnerTube clients** | `visionos`, `tv_samsung`, tried in order. The defaults work without a PO token. |
@@ -105,6 +116,7 @@ Run the **Connection test** in the settings first; it shows which step fails.
 
 - Requests go through a Wisp proxy. Until you enable playback this is a shared public server, which sees the hostnames you connect to (TLS is terminated inside Spotify). With a local server it is your own machine.
 - YouTube session cookies are kept in memory only.
+- The last track (its service, ID, title, artists, album, cover URL, placeholder URI and position) is kept in the browser's local storage so it can be restored at the next start. It stays on your PC, and is deleted when you turn off "Restore the last track".
 - SoundCloud's `client_id` is read from soundcloud.com's own scripts and cached in the browser's local storage. It is public and not tied to you.
 - This extension uses unofficial YouTube and SoundCloud APIs and may violate their Terms of Service (SoundCloud's API terms also forbid mixing its tracks with other services). Use it at your own risk.
 - Only tracks SoundCloud offers in full are shown. Previews, Go+ and encrypted streams are skipped.
