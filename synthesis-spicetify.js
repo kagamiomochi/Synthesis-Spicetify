@@ -3161,6 +3161,7 @@
 	let queueJob = null; // { key, promise } putting that recommendation into Spotify's queue
 	let pendingAuto = null; // placeholder URI of a recommendation that sits in Spotify's queue
 	let localStartUri = null; // placeholder that was just started in the Local Files context
+	let startingUri = null; // placeholder that playPlaceholder asked Spotify for: a choice, not a skip
 
 	// The same song as a video and as an audio track has two IDs, so the title and first artist count too.
 	function recentKeysOf(track) {
@@ -3191,9 +3192,13 @@
 		recommendation = { key: trackKey(track), promise };
 	}
 
-	function inLocalFilesContext() {
+	function playerContextUri() {
 		const data = Spicetify.Player.data;
-		return /local-files/i.test(data?.context?.uri ?? data?.context_uri ?? data?.contextUri ?? "");
+		return data?.context?.uri ?? data?.context_uri ?? data?.contextUri ?? "";
+	}
+
+	function inLocalFilesContext() {
+		return /local-files/i.test(playerContextUri());
 	}
 
 	// URIs the user queued. Our own recommendation does not count.
@@ -3259,8 +3264,14 @@
 	// Spotify moves to the next local file on its own, and songchange tells us afterwards. So when our active track
 	// is left for another placeholder that nobody queued, that placeholder is stopped and the recommendation is
 	// played instead.
-	function isSkipIntoLocalFiles(prev, now) {
+	function isSkipIntoLocalFiles(prev, now, prevContext) {
 		if (!config.autoRecommend || state.status === "idle" || !state.current || prev.uri !== state.placeholderUri) return false;
+		// Starting a track on the search page while another one is active also leaves the active placeholder
+		// for another one, but that is the user's choice and must play as asked.
+		if (now.uri === startingUri) return false;
+		// Another playlist, album or queue was started in Spotify itself.
+		const context = playerContextUri();
+		if (prevContext && context && prevContext !== context) return false;
 		if (!recommendation || recommendation.key !== trackKey(state.current)) return false;
 		if (!(state.autoChain || inLocalFilesContext())) return false;
 		if (Spicetify.Player.getRepeat?.() > 0) return false;
@@ -3962,6 +3973,10 @@
 	async function playPlaceholder(uri, title) {
 		// A local file can only be played inside the Local Files context, so start that context at the placeholder.
 		localStartUri = uri; // startFromPlaceholder reads this: such a track is followed by a recommendation
+		startingUri = uri; // songchange reads this: leaving the active track for it is not a skip
+		setTimeout(() => {
+			if (startingUri === uri) startingUri = null;
+		}, 3000);
 		for (const attempt of [
 			() => Spicetify.Player.playUri(LOCAL_FILES_CONTEXT, {}, { skipTo: { uri } }),
 			() => {
@@ -4128,6 +4143,7 @@
 	}
 
 	let lastSpotify = readSpotify();
+	let lastContext = playerContextUri();
 
 	// Spotify is playing a placeholder that none of our tracks belongs to yet (it was started again after
 	// our track had been stopped, or an event was missed): stream the real track.
@@ -4159,13 +4175,15 @@
 	Spicetify.Player.addEventListener("songchange", () => {
 		const now = readSpotify();
 		const prev = lastSpotify;
+		const prevContext = lastContext;
 		lastSpotify = now;
+		lastContext = playerContextUri();
 		if (!now.uri || now.uri === prev.uri) return;
 		if (Date.now() < state.suppressUntil) return;
 
 		// One of our placeholders started: stream the real track instead.
 		if (isPlaceholderItem()) {
-			if (isSkipIntoLocalFiles(prev, now)) redirectSkipToRecommendation(prev);
+			if (isSkipIntoLocalFiles(prev, now, prevContext)) redirectSkipToRecommendation(prev);
 			else startFromPlaceholder();
 			return;
 		}
