@@ -58,7 +58,7 @@
 	// Constants and configuration
 	// ---------------------------------------------------------------------
 
-	/* VERSION */ const VERSION = "v0.7.3";
+	/* VERSION */ const VERSION = "v0.7.4";
 	// The setup script is taken from the tag of the installed release, so the file that is downloaded and run
 	// does not change under the user's feet when main moves on.
 	const WISP_SCRIPT_REF = /^v\d+\.\d+\.\d+$/.test(VERSION) ? VERSION : "main";
