@@ -4655,9 +4655,16 @@
 	// The cover often cannot be placed on the first try (the row or panel is not laid out yet), so a few
 	// retries follow the first attempt. The last failure is reported in the console.
 
+	// While the takeover is on, Spotify's own now playing widget is hidden with display: none and our own
+	// cover is shown instead (see syncTakeover), so there is no visible slot to put a cover on.
+	function isHiddenByTakeover(node) {
+		return document.body.classList.contains("ss-takeover") && Boolean(node.parentElement?.closest("[data-ss-host]"));
+	}
+
 	function retryArt(node, last) {
 		const entry = rewritten.get(node);
 		if (!entry || entry.art || !node.isConnected || node.nodeValue !== entry.title || !entry.scope.isConnected) return;
+		if (isHiddenByTakeover(node)) return;
 		entry.art = placeArt(node, entry.scope, entry.info);
 		if (entry.art || !last) return;
 		let root = node.parentElement;
@@ -4696,10 +4703,11 @@
 
 		const info = lookupDisplay(title);
 		if (!info) return;
-		const entry = { title: info.title, art: placeArt(node, scope, info), scope, info };
+		const hidden = isHiddenByTakeover(node);
+		const entry = { title: info.title, art: hidden ? null : placeArt(node, scope, info), scope, info };
 		node.nodeValue = info.title;
 		rewritten.set(node, entry);
-		if (!entry.art) {
+		if (!entry.art && !hidden) {
 			ART_RETRY_DELAYS.forEach((delay, i) => setTimeout(() => retryArt(node, i === ART_RETRY_DELAYS.length - 1), delay));
 		}
 		if (info.artist) artistNode.nodeValue = info.artist;
