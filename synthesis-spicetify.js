@@ -2982,6 +2982,7 @@
 
 		detachStream();
 		audio.pause();
+		startupUntil = 0;
 		state.current = track;
 		state.status = "loading";
 		state.progress = 0;
@@ -3099,6 +3100,7 @@
 		audio.pause();
 		audio.removeAttribute("src");
 		audio.load();
+		startupUntil = 0;
 		state.current = null;
 		state.status = "idle";
 		state.progress = 0;
@@ -3139,6 +3141,13 @@
 	const REWIND_CONFIRM_MAX = 5; // a rewind of up to this many seconds is treated as possible clock jitter first
 	const REWIND_CONFIRM_MS = 600; // ...and is only followed when it lasts this long
 	let rewindSince = 0; // when the audio first got ahead of Spotify's clock (0 = not ahead)
+	// Right after Spotify is released, its position is only extrapolated and gets corrected a moment later (by up
+	// to about a second, in either direction). Pulling the audio along with that is heard as a rewind or a skip,
+	// so for this long after the release Spotify is moved to the audio instead.
+	const STARTUP_FOLLOW_MS = 4000;
+	const STARTUP_SEEK_COOLDOWN_MS = 800; // Spotify's position needs a moment to show a seek
+	let startupUntil = 0; // until when Spotify follows the audio
+	let startupSeekAt = 0; // when Spotify was last moved to the audio
 	const RESUME_MARGIN = 1.5; // seconds that must be downloaded beyond a position before the clock runs from there
 
 	// True when the audio can play from this position right now (it is downloaded far enough).
@@ -3162,12 +3171,14 @@
 	}
 
 	// The track has loaded while Spotify was held on its placeholder: bring Spotify's clock to the audio and
-	// let it run. The audio keeps following it from here on.
+	// let it run. The audio keeps following it from here on, except during the start (see STARTUP_FOLLOW_MS).
 	function releaseClock() {
 		if (!state.holding) return;
 		state.holding = false;
 		const at = player.currentTime;
 		if (Math.abs(at - spotifyPosition()) > SYNC_TOLERANCE) seekSpotify(at);
+		startupUntil = Date.now() + STARTUP_FOLLOW_MS;
+		startupSeekAt = 0;
 		Spicetify.Player.play();
 	}
 
@@ -3204,7 +3215,15 @@
 		const tail = player.ended && position >= player.currentTime - 2;
 		const drift = player.currentTime - position; // > 0: the audio is ahead of Spotify's clock
 		let follow = !tail && Math.abs(drift) > SYNC_TOLERANCE;
-		if (follow && drift > 0 && drift < REWIND_CONFIRM_MAX) {
+		if (follow && Date.now() < startupUntil) {
+			if (Date.now() - startupSeekAt > STARTUP_SEEK_COOLDOWN_MS) {
+				startupSeekAt = Date.now();
+				debug("sync", `start: Spotify ${position.toFixed(2)} -> audio ${player.currentTime.toFixed(2)} (drift ${drift.toFixed(2)}s)`);
+				seekSpotify(player.currentTime);
+			}
+			follow = false;
+			rewindSince = 0;
+		} else if (follow && drift > 0 && drift < REWIND_CONFIRM_MAX) {
 			// Spotify's position is only extrapolated from its last state update, so it can dip for a moment.
 			// Following such a dip rewinds the audio, so a small rewind has to last before it is followed.
 			rewindSince ||= Date.now();
