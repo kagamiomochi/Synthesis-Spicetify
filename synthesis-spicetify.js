@@ -59,10 +59,14 @@
 	// ---------------------------------------------------------------------
 
 	/* VERSION */ const VERSION = "v0.7.4";
-	// The setup script is taken from the tag of the installed release, so the file that is downloaded and run
-	// does not change under the user's feet when main moves on.
-	const WISP_SCRIPT_REF = /^v\d+\.\d+\.\d+$/.test(VERSION) ? VERSION : "main";
-	const WISP_SCRIPT_URL = `https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/${WISP_SCRIPT_REF}/setup-wisp.mjs`;
+	// The setup script is taken from main: a release tag can predate the file and then the URL is a 404.
+	const WISP_SCRIPT_URL = "https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/main/setup-wisp.mjs";
+	// One command for Linux, macOS and Windows (PowerShell 7+ or CMD). Node.js is a requirement anyway, so it does
+	// the download: `curl` is an Invoke-WebRequest alias in PowerShell and `curl.exe` does not exist elsewhere.
+	// Keep it free of double quotes, `$`, `!` and `%` so that sh, PowerShell and CMD all pass it through unchanged.
+	const WISP_SETUP_COMMAND =
+		`node -e "fetch('${WISP_SCRIPT_URL}').then(r=>r.ok?r.text():Promise.reject(Error('HTTP '+r.status)))` +
+		`.then(s=>require('fs').writeFileSync('setup-wisp.mjs',s))" && node setup-wisp.mjs install`;
 	const LIBCURL_URL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.5/libcurl_full.mjs";
 	const YTJS_URL = "https://cdn.jsdelivr.net/npm/youtubei.js@18.3.0/bundle/browser.js";
 	const FAAD2_URL = "https://cdn.jsdelivr.net/npm/@ohrstrom/faad2-wasm@2.11.2-rc.4/faad2_wasm.mjs"; // AAC decoder (SoundCloud)
@@ -217,7 +221,7 @@
 			guideTitle: "ローカル Wisp サーバーのセットアップ",
 			guideIntro: (url) => `再生機能は、自分の PC 上の Wisp サーバー (${url}) を経由して動きます。次の手順で用意してください。`,
 			guideStep1: "Node.js 22.12 以上 (npm 付属) を用意します。nodejs.org から入手でき、「node --version」で確認できます。Linux は systemd も必要です。",
-			guideStep2: "ターミナルで次のコマンドを実行します (クリックでコピーできます)。セットアップスクリプトをダウンロードしてインストールを行います。完了したらダウンロードしたファイルは削除しても構いません。",
+			guideStep2: "ターミナルで次のコマンドを実行します (クリックでコピーできます)。Linux / macOS / Windows 共通です。Windows では PowerShell 7 以上かコマンドプロンプト (CMD) を使ってください (Windows PowerShell 5.1 は不可)。セットアップスクリプトをダウンロードしてインストールを行います。完了したらダウンロードしたファイルは削除しても構いません。",
 			guideStep3: "終わったら、下のボタンで接続を確認します。確認できると再生機能が有効になります。",
 			guideCheck: "接続を確認",
 			guideReadme: "詳しい手順 (README)",
@@ -308,7 +312,7 @@
 			guideTitle: "Setting up the local Wisp server",
 			guideIntro: (url) => `Playback goes through a Wisp server on your own PC (${url}). Set it up with these steps.`,
 			guideStep1: "Get Node.js 22.12+ (npm comes with it) from nodejs.org; check it with \"node --version\". Linux also needs systemd.",
-			guideStep2: "Run the following command in the terminal (you can click to copy it). Download the setup script and run the installation. Once complete, you may delete the downloaded file.",
+			guideStep2: "Run the following command in the terminal (you can click to copy it). It is the same on Linux, macOS and Windows; on Windows use PowerShell 7+ or CMD (not Windows PowerShell 5.1). It downloads the setup script and runs the installation. Once complete, you may delete the downloaded file.",
 			guideStep3: "When it is done, check the connection with the button below. Playback is enabled once the check succeeds.",
 			guideCheck: "Check connection",
 			guideReadme: "Detailed steps (README)",
@@ -5437,8 +5441,7 @@
 					"li",
 					{},
 					t("guideStep2"),
-					commandBlock("Linux / macOS", `curl -fsSLO ${WISP_SCRIPT_URL} && node setup-wisp.mjs install`),
-					commandBlock("Windows (PowerShell)", `curl.exe -fsSLO ${WISP_SCRIPT_URL}; node setup-wisp.mjs install`)
+					commandBlock(null, WISP_SETUP_COMMAND)
 				),
 				h("li", {}, t("guideStep3"))
 			),
