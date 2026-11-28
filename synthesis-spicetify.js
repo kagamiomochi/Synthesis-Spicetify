@@ -58,7 +58,7 @@
 	// Constants and configuration
 	// ---------------------------------------------------------------------
 
-	/* VERSION */ const VERSION = "v0.7.4";
+	/* VERSION */ const VERSION = "v0.7.5";
 	// The setup script is taken from main: a release tag can predate the file and then the URL is a 404.
 	const WISP_SCRIPT_URL = "https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/main/setup-wisp.mjs";
 	// One command for Linux, macOS and Windows (PowerShell 7+ or CMD). Node.js is a requirement anyway, so it does
