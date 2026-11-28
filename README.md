@@ -33,24 +33,18 @@ spicetify apply
 
 Playback is **off by default**. YouTube rejects the shared public Wisp proxies, so you need to run a small proxy (Wisp) on your own PC ([why?](#why-a-local-wisp-server)).
 
-1. Install the requirements: Python 3.9+, Node.js 22.18+ (or 24.11+) and npm. Linux also needs systemd (with `systemd-socket-proxyd`).
+1. Install the requirements: Node.js 22.12+ (npm comes with it). Linux also needs systemd.
 2. In Spotify, open the settings and turn on **Enable playback**. The extension shows the setup steps (a one-line command pinned to your installed version) and checks the connection. Playback is enabled once the check succeeds.
 
    Or install by hand: clone this repository and run
 
    ```sh
-   # Linux / macOS
-   python3 wisp-launcher/portable/wisp_ondemand.py install
-   ```
-
-   ```bat
-   :: Windows
-   py -3 wisp-launcher\portable\wisp_ondemand.py install
+   node setup-wisp.mjs install
    ```
 
 3. To remove it, run the same command with `uninstall`.
 
-The server starts on demand and stops after 5 idle minutes. The Node.js path is recorded at install time, so run `install` again after moving or replacing Node.js.
+The server starts at login. The Node.js path is recorded at install time, so run `install` again after moving or replacing Node.js.
 More options and details: [Local Wisp launcher](#local-wisp-launcher).
 
 > If playback is off, the result rows have a "Try playing via public Wisp" button. It is often blocked, but if it works the playback stays enabled without a local server.
@@ -154,31 +148,23 @@ libcurl.js sends its traffic through a Wisp proxy. TLS is terminated inside Spot
 <details id="local-wisp-launcher">
 <summary>Local Wisp launcher</summary>
 
-`wisp-launcher/portable/wisp_ondemand.py` listens on `127.0.0.1:6001`, starts the Wisp server ([wisp-js](https://github.com/MercuryWorkshop/wisp-js), pinned version) on `127.0.0.1:6002` at the first connection, forwards the connection, and stops the server after 5 idle minutes. wisp-js is installed into `~/.local/share/synthesis-spicetify/wisp-js` (Windows: `%LOCALAPPDATA%\synthesis-spicetify\wisp-js`).
+`setup-wisp.mjs` installs the Wisp server ([wisp-js](https://github.com/MercuryWorkshop/wisp-js), pinned version) with npm into `~/.local/share/synthesis-spicetify/wisp-js` (Windows: `%LOCALAPPDATA%\\synthesis-spicetify\\wisp-js`) and registers it to start at login on `127.0.0.1:6001`. The script is not needed after the install.
 
-**Commands:** `install`, `uninstall`, `setup` (only install wisp-js with npm) and `run` (run the launcher in the foreground; works on every OS, so use it on Linux without systemd).
-
-**Install options:**
-
-- `--install-dir PATH`: install location
-- `--node PATH`: Node.js binary to use
-- `--idle-minutes N`: idle time before stopping
-- `--resident` (macOS): keep a resident launcher instead of socket activation
+**Commands:** `install` and `uninstall`. `install --port N` changes the port (also set the local Wisp URL in the settings).
 
 **What gets registered:**
 
-| OS | Registered as | Resident process |
+| OS | Registered as | Logs |
 | --- | --- | --- |
-| Linux | systemd user units (socket activation) | None. systemd owns port 6001 and starts the Wisp server on the first connection. |
-| macOS | LaunchAgent (launchd socket activation) | None. launchd owns port 6001, and the launcher exits again when idle. |
-| Windows | Scheduled task that runs at login | A small launcher process. Only the Wisp server runs on demand. |
+| Linux | systemd user unit `synthesis-spicetify-wisp.service` | `journalctl --user -u synthesis-spicetify-wisp.service` |
+| macOS | LaunchAgent | `wisp.log` next to the wisp-js directory |
+| Windows | Scheduled task that runs at login (hidden PowerShell window) | None. Run the command from `install` yourself to see errors. |
 
-**Test status:** the proxy, on-demand start and idle stop were tested on Linux. The macOS socket activation was only simulated on Linux (the `launch_activate_socket` call itself needs macOS), and the macOS and Windows autostart steps have not been tested on real machines.
+Without systemd, `install` only installs wisp-js and prints the command to start it from your own autostart.
 
-**Migrating from older versions:**
+**Test status:** the install, the generated systemd unit and the server start were tested on Linux. The macOS and Windows autostart registration has not been tested on real machines.
 
-- Older versions used the Python Wisp server from libcurl.js. Run `install` again to switch to wisp-js; the old `libcurl.js` directory is no longer used and can be deleted.
-- If you enabled the always-on `synthesis-spicetify-wisp.service`, disable it first with `systemctl --user disable --now synthesis-spicetify-wisp.service`. It uses port 6001 too, and the installer stops with a message when it finds it.
+**Migrating from older versions:** run `install` again. It removes the old systemd units (proxy, backend and the always-on `synthesis-spicetify-wisp.service` of old READMEs is replaced) and the old launcher files, and replaces the macOS and Windows entries. The old `libcurl.js` directory is no longer used and can be deleted.
 
 </details>
 

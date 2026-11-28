@@ -33,24 +33,18 @@ spicetify apply
 
 再生機能は**既定でオフ**です。共有の公開 Wisp プロキシは YouTube に弾かれるため、自分の PC 上で小さなプロキシサーバー(Wisp)を動かす必要があります([理由](#ローカル-wisp-が必要な理由))。
 
-1. 必要なものを用意します: Python 3.9 以上、Node.js 22.18 以上(または 24.11 以上)、npm。Linux では加えて systemd(`systemd-socket-proxyd` を含む)も必要です。
+1. 必要なものを用意します: Node.js 22.12 以上(npm が付属します)。Linux では加えて systemd も必要です。
 2. Spotify の設定で「再生機能を有効化」をオンにします。拡張がセットアップ手順(インストール済みバージョンに固定された 1 行のコマンド)を表示し、接続を確認します。確認できると再生機能が有効になります。
 
    手動で入れる場合は、このリポジトリを clone して次を実行します。
 
    ```sh
-   # Linux / macOS
-   python3 wisp-launcher/portable/wisp_ondemand.py install
-   ```
-
-   ```bat
-   :: Windows
-   py -3 wisp-launcher\portable\wisp_ondemand.py install
+   node setup-wisp.mjs install
    ```
 
 3. 削除は、同じコマンドの `install` を `uninstall` に変えて実行します。
 
-サーバーは必要になったときに起動し、5 分間アイドルになると止まります。Node.js のパスはインストール時に記録されるので、Node.js を移動・入れ替えたらもう一度 `install` を実行してください。
+サーバーはログイン時に起動します。Node.js のパスはインストール時に記録されるので、Node.js を移動・入れ替えたらもう一度 `install` を実行してください。
 オプションなどの詳細は[ローカル Wisp ランチャー](#ローカル-wisp-ランチャー)を見てください。
 
 > 再生機能がオフのとき、結果の行に「公開 Wisp で試しに再生」ボタンが出ます。ほぼ弾かれますが、通った場合はローカルサーバー無しで再生機能がオンのままになります。
@@ -154,31 +148,23 @@ libcurl.js は Wisp プロキシ経由で通信します。TLS は Spotify 内�
 <details id="ローカル-wisp-ランチャー">
 <summary>ローカル Wisp ランチャー</summary>
 
-`wisp-launcher/portable/wisp_ondemand.py` は `127.0.0.1:6001` で待ち受け、最初の接続で Wisp サーバー([wisp-js](https://github.com/MercuryWorkshop/wisp-js)、バージョン固定)を `127.0.0.1:6002` に起動して接続を転送し、5 分間アイドルになるとサーバーを止めます。wisp-js は `~/.local/share/synthesis-spicetify/wisp-js`(Windows は `%LOCALAPPDATA%\synthesis-spicetify\wisp-js`)にインストールされます。
+`setup-wisp.mjs` は、Wisp サーバー([wisp-js](https://github.com/MercuryWorkshop/wisp-js)、バージョン固定)を npm で `~/.local/share/synthesis-spicetify/wisp-js`(Windows は `%LOCALAPPDATA%\\synthesis-spicetify\\wisp-js`)にインストールし、ログイン時に `127.0.0.1:6001` で起動するよう登録します。インストール後、このスクリプトは不要です。
 
-**コマンド:** `install`、`uninstall`、`setup`(wisp-js の npm でのインストールだけ)、`run`(ランチャーをフォアグラウンドで実行。どの OS でも使えるので、systemd を使わない Linux ではこれを使います)。
+**コマンド:** `install` と `uninstall`。`install --port 番号` でポートを変えられます(設定のローカル Wisp URL も合わせて変更してください)。
 
-**インストールのオプション:**
+**登録されるもの:**
 
-- `--install-dir パス`: インストール先
-- `--node パス`: 使う Node.js
-- `--idle-minutes 分`: 停止までのアイドル時間
-- `--resident` (macOS): ソケットアクティベーションではなく常駐型のランチャーにする
-
-**登録される内容:**
-
-| OS | 登録先 | 常駐プロセス |
+| OS | 登録先 | ログ |
 | --- | --- | --- |
-| Linux | systemd のユーザーユニット (ソケットアクティベーション) | なし。6001 番ポートは systemd が保持し、最初の接続で Wisp サーバーを起動します。 |
-| macOS | LaunchAgent (launchd のソケットアクティベーション) | なし。6001 番ポートは launchd が保持し、アイドルになるとランチャーも終了します。 |
-| Windows | ログイン時に実行するタスクスケジューラのタスク | 小さなランチャーのプロセス。Wisp サーバーだけがオンデマンドで動きます。 |
+| Linux | systemd のユーザーユニット `synthesis-spicetify-wisp.service` | `journalctl --user -u synthesis-spicetify-wisp.service` |
+| macOS | LaunchAgent | wisp-js ディレクトリの隣の `wisp.log` |
+| Windows | ログイン時に実行するタスクスケジューラのタスク(非表示の PowerShell) | なし。エラーを見たいときは `install` で表示されるコマンドを自分で実行してください。 |
 
-**動作確認の状況:** 転送、オンデマンド起動、アイドル停止は Linux で確認しています。macOS のソケットアクティベーションは Linux 上で模擬しただけで(`launch_activate_socket` の呼び出し自体は macOS が必要です)、macOS と Windows の自動起動の登録は実機では確認していません。
+systemd が無い Linux では、`install` は wisp-js のインストールだけを行い、自分の自動起動に登録するためのコマンドを表示します。
 
-**旧バージョンからの移行:**
+**動作確認の状況:** インストール、生成される systemd ユニット、サーバーの起動は Linux で確認しています。macOS と Windows の自動起動の登録は実機では確認していません。
 
-- 以前のバージョンは libcurl.js 付属の Python 製 Wisp サーバーを使っていました。wisp-js に切り替えるには、もう一度 `install` を実行してください。古い `libcurl.js` ディレクトリは使われなくなるので削除して構いません。
-- 常時起動サービス `synthesis-spicetify-wisp.service` を有効にしている場合は、先に `systemctl --user disable --now synthesis-spicetify-wisp.service` で無効にしてください。同じ 6001 番ポートを使うため、インストーラーは見つけるとメッセージを出して止まります。
+**古いバージョンからの移行:** もう一度 `install` を実行してください。古い systemd ユニット(プロキシとバックエンド)と旧ランチャーのファイルを削除し、常時起動の `synthesis-spicetify-wisp.service`(古い README の例)は置き換え、macOS と Windows の登録も置き換えます。古い `libcurl.js` ディレクトリは使われなくなるので削除して構いません。
 
 </details>
 

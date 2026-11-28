@@ -62,7 +62,7 @@
 	// The setup script is taken from the tag of the installed release, so the file that is downloaded and run
 	// does not change under the user's feet when main moves on.
 	const WISP_SCRIPT_REF = /^v\d+\.\d+\.\d+$/.test(VERSION) ? VERSION : "main";
-	const WISP_SCRIPT_URL = `https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/${WISP_SCRIPT_REF}/wisp-launcher/portable/wisp_ondemand.py`;
+	const WISP_SCRIPT_URL = `https://raw.githubusercontent.com/kagamiomochi/Synthesis-Spicetify/${WISP_SCRIPT_REF}/setup-wisp.mjs`;
 	const LIBCURL_URL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.5/libcurl_full.mjs";
 	const YTJS_URL = "https://cdn.jsdelivr.net/npm/youtubei.js@18.3.0/bundle/browser.js";
 	const FAAD2_URL = "https://cdn.jsdelivr.net/npm/@ohrstrom/faad2-wasm@2.11.2-rc.4/faad2_wasm.mjs"; // AAC decoder (SoundCloud)
@@ -216,7 +216,7 @@
 			showGuide: "セットアップ手順を見る",
 			guideTitle: "ローカル Wisp サーバーのセットアップ",
 			guideIntro: (url) => `再生機能は、自分の PC 上の Wisp サーバー (${url}) を経由して動きます。次の手順で用意してください。`,
-			guideStep1: "Python 3.9 以上、Node.js 22.18 以上 (または 24.11 以上)、npm を用意します (Linux は systemd も必要)。",
+			guideStep1: "Node.js 22.12 以上と npm を用意します (Linux は systemd も必要)。",
 			guideStep2: "ターミナルで次のコマンドを実行します (クリックでコピーできます)。セットアップスクリプトをダウンロードしてインストールを行います。完了したらダウンロードしたファイルは削除しても構いません。",
 			guideStep3: "終わったら、下のボタンで接続を確認します。確認できると再生機能が有効になります。",
 			guideCheck: "接続を確認",
@@ -307,7 +307,7 @@
 			showGuide: "Show setup steps",
 			guideTitle: "Setting up the local Wisp server",
 			guideIntro: (url) => `Playback goes through a Wisp server on your own PC (${url}). Set it up with these steps.`,
-			guideStep1: "Get Python 3.9+, Node.js 22.18+ (or 24.11+) and npm (Linux also needs systemd).",
+			guideStep1: "Get Node.js 22.12+ and npm (Linux also needs systemd).",
 			guideStep2: "Run the following command in the terminal (you can click to copy it). Download the setup script and run the installation. Once complete, you may delete the downloaded file.",
 			guideStep3: "When it is done, check the connection with the button below. Playback is enabled once the check succeeds.",
 			guideCheck: "Check connection",
@@ -5437,8 +5437,8 @@
 					"li",
 					{},
 					t("guideStep2"),
-					commandBlock("Linux / macOS", `curl -fsSLO ${WISP_SCRIPT_URL} && python3 wisp_ondemand.py install`),
-					commandBlock("Windows (PowerShell)", `curl.exe -fsSLO ${WISP_SCRIPT_URL}; py -3 wisp_ondemand.py install`)
+					commandBlock("Linux / macOS", `curl -fsSLO ${WISP_SCRIPT_URL} && node setup-wisp.mjs install`),
+					commandBlock("Windows (PowerShell)", `curl.exe -fsSLO ${WISP_SCRIPT_URL}; node setup-wisp.mjs install`)
 				),
 				h("li", {}, t("guideStep3"))
 			),
