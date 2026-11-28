@@ -33,7 +33,7 @@ spicetify apply
 
 Playback is **off by default**. YouTube rejects the shared public Wisp proxies, so you need to run a small proxy (Wisp) on your own PC ([why?](#why-a-local-wisp-server)).
 
-1. Install the requirements: Node.js 22.12+ (npm comes with it). Linux also needs systemd.
+1. Install the requirements: [Node.js](https://nodejs.org/) 22.12+ (npm comes with it; check with `node --version`). Linux also needs systemd.
 2. In Spotify, open the settings and turn on **Enable playback**. The extension shows the setup steps (a one-line command pinned to your installed version) and checks the connection. Playback is enabled once the check succeeds.
 
    Or install by hand: clone this repository and run
